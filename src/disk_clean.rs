@@ -1256,7 +1256,9 @@ pub fn empty_bins(files: &DiskFiles, runs: &[BinRun], presample_secs: u32, start
         all.push(rec.clone());
         let _ = files.save_watches(&all);
         if start_watcher {
-            spawn_watcher(&rec.id);
+            if let Some(pid) = spawn_watcher(&rec.id) {
+                let _ = files.update_watch(&rec.id, |w| w.watcher_pid = w.watcher_pid.max(pid));
+            }
         }
         watches.push(rec);
     }
@@ -1282,6 +1284,91 @@ pub fn recent_cleanups(files: &DiskFiles, n: usize) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// What the tray's disk poll does with the cleanup records.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Housekeeping {
+    /// Measured results not shown yet: (title, body).
+    pub measured: Vec<(String, String)>,
+    /// What the bin holds per drive: (`D:\`, bytes of files).
+    pub bins: Vec<(String, u64)>,
+    /// A child was started to empty bin runs past `hold_hours`.
+    pub expiring: bool,
+}
+
+static LAST_EXPIRE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The tray's part, run on its 60-second disk poll (a worker thread): hand over measured
+/// results once, restart a watcher whose process is gone, and empty bin runs older than
+/// `hold_hours` in a hidden child (at most once an hour). Never empties anything else.
+pub fn housekeeping(files: &DiskFiles, hold_hours: f64, live_pids: &[u32]) -> Housekeeping {
+    let mut hk = Housekeeping::default();
+    let mut all = files.watches();
+    let mut changed = false;
+    let now = unix_now();
+    for w in all.iter_mut() {
+        match &w.measured {
+            Some(m) if !w.toasted => {
+                let vol = w.volume_root.trim_end_matches('\\').to_string();
+                hk.measured.push(measured_words(&vol, w.predicted, m, w.fs.eq_ignore_ascii_case("ReFS")));
+                w.toasted = true;
+                changed = true;
+            }
+            None if now.saturating_sub(w.started_unix) < WATCH_MAX_SEC && now.saturating_sub(w.started_unix) > 20 && !live_pids.contains(&w.watcher_pid) => {
+                if let Some(pid) = spawn_watcher(&w.id) {
+                    w.watcher_pid = pid;
+                    changed = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if changed {
+        let _ = files.save_watches(&all);
+    }
+    let runs = bin_runs(files, &fixed_roots());
+    for r in &runs {
+        match hk.bins.iter_mut().find(|(root, _)| root.eq_ignore_ascii_case(&r.volume_root)) {
+            Some(b) => b.1 += r.holds,
+            None => hk.bins.push((r.volume_root.clone(), r.holds)),
+        }
+    }
+    let last = LAST_EXPIRE.load(std::sync::atomic::Ordering::Relaxed);
+    if !expired(&runs, hold_hours, now).is_empty() && now.saturating_sub(last) > 3600 && !cfg!(test) {
+        LAST_EXPIRE.store(now, std::sync::atomic::Ordering::Relaxed);
+        hk.expiring = spawn_cli_hidden(&["disk", "bin", "--expired", "--yes", "--json"]);
+    }
+    hk
+}
+
+/// Start `memguard.exe <args>` hidden and detached (the tray never deletes files itself).
+pub fn spawn_cli_hidden(args: &[&str]) -> bool {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const BELOW_NORMAL: u32 = 0x4000;
+    let Some(exe) = crate::disk_scan::cli_exe() else { return false };
+    std::process::Command::new(exe)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW | BELOW_NORMAL)
+        .spawn()
+        .is_ok()
+}
+
+/// Run `memguard.exe <args>` hidden and wait for its JSON on stdout (the checkup window's
+/// cleanup and "Empty the bin" run the CLI, so the tray process never walks or deletes).
+pub fn run_cli_json(args: &[&str], timeout: Duration) -> Result<Value, String> {
+    let exe = crate::disk_scan::cli_exe().ok_or("memguard.exe was not found")?;
+    match run_with_timeout(&exe, args, timeout) {
+        Ok((_, out)) => serde_json::from_slice(&out).map_err(|_| format!("memguard {} gave no result", args.first().copied().unwrap_or(""))),
+        Err(RunError::TimedOut) => Err("it took too long and was stopped".into()),
+        Err(RunError::NotFound) => Err("memguard.exe was not found".into()),
+        Err(RunError::Other(e)) => Err(e),
+    }
 }
 
 // ---------------------------------------------------------------- the measured result (pure)
@@ -1430,6 +1517,10 @@ pub fn watch(files: &DiskFiles, id: &str, say: &mut dyn FnMut(&str)) -> Option<M
         return Some(m);
     }
     let me = std::process::id();
+    // Another live watcher on it already: leave it to that one.
+    if rec.watcher_pid != 0 && rec.watcher_pid != me && crate::win::list_processes().iter().any(|p| p.pid == rec.watcher_pid && p.name.to_ascii_lowercase().starts_with("memguard")) {
+        return None;
+    }
     let _ = files.update_watch(id, |w| w.watcher_pid = me);
     let mut m = Measure::new(rec.free_before, rec.predicted, rec.pre_motion);
     loop {
@@ -1472,15 +1563,16 @@ pub fn watch(files: &DiskFiles, id: &str, say: &mut dyn FnMut(&str)) -> Option<M
 }
 
 /// Start the watcher for `id` in its own hidden, detached process (`memguard disk watch-child`).
-pub fn spawn_watcher(id: &str) -> bool {
+/// Returns its process id.
+pub fn spawn_watcher(id: &str) -> Option<u32> {
     if cfg!(test) {
-        return false;
+        return None;
     }
     use std::os::windows::process::CommandExt;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const BELOW_NORMAL: u32 = 0x4000;
-    let Some(exe) = crate::disk_scan::cli_exe() else { return false };
+    let exe = crate::disk_scan::cli_exe()?;
     std::process::Command::new(exe)
         .args(["disk", "watch-child", id])
         .stdin(std::process::Stdio::null())
@@ -1488,7 +1580,8 @@ pub fn spawn_watcher(id: &str) -> bool {
         .stderr(std::process::Stdio::null())
         .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW | BELOW_NORMAL)
         .spawn()
-        .is_ok()
+        .ok()
+        .map(|c| c.id())
 }
 
 /// Free space on `root` read `n` times a second apart: (last reading, max - min).
@@ -1876,7 +1969,9 @@ pub fn clean(cfg: &crate::config::Config, files: &DiskFiles, plan: &PlanRecord, 
             all.push(rec);
             let _ = files.save_watches(&all);
             if opts.start_watcher {
-                spawn_watcher(&wid);
+                if let Some(pid) = spawn_watcher(&wid) {
+                    let _ = files.update_watch(&wid, |w| w.watcher_pid = w.watcher_pid.max(pid));
+                }
             }
             vp.watch_id = Some(wid);
         }

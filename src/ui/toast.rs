@@ -876,6 +876,39 @@ pub mod catalog {
         }
     }
 
+    /// After a disk cleanup: what actually came back, from the drive's free space (the words
+    /// come from `disk_clean::measured_words`, labelled measured). Never shown before the space
+    /// shows up or the 30-minute watch ends.
+    pub fn disk_measured(title: &str, body: &str) -> Toast {
+        let kind = if title.starts_with("Space is back") { ToastKind::Info } else { ToastKind::Warning };
+        toast(kind, title.to_string(), body.to_string())
+    }
+
+    /// A drive became critical and Ather MemGuard's bin holds something there: ask, never empty
+    /// it unasked (that would take back the undo it promised).
+    pub fn disk_bin_ask(volume: &str, holds_gb: f64) -> Toast {
+        let body = format!(
+            "The bin holds {} GB on {}. Emptying it gives that space back, but what's in it can't be put back afterwards.",
+            gb(holds_gb),
+            volume
+        );
+        keyed(with(toast(ToastKind::Warning, format!("Empty the bin on {}?", volume), body), "Empty the bin", Command::EmptyDiskBin), "disk-bin")
+    }
+
+    /// The bin was emptied (after the person asked).
+    pub fn disk_bin_emptied(volume: &str, predicted_gb: Option<f64>, problem: Option<&str>) -> Toast {
+        match problem {
+            Some(p) => keyed(toast(ToastKind::Warning, format!("Couldn't empty all of the bin on {}", volume), sentence(p)), "disk-bin"),
+            None => {
+                let body = match predicted_gb {
+                    Some(g) => format!("Predicted to free {} GB. You'll get another notification when the space has shown up (measured).", gb(g)),
+                    None => "You'll get another notification when the space has shown up (measured).".to_string(),
+                };
+                keyed(toast(ToastKind::Info, format!("Emptied the bin on {}", volume), body), "disk-bin")
+            }
+        }
+    }
+
     /// "disk:D" for "D:", "disk" for a drive without a letter.
     pub fn disk_key(volume: &str) -> &'static str {
         const KEYS: [&str; 26] = [
@@ -1049,6 +1082,16 @@ pub mod catalog {
             ("guard-closed", guard_closed("Steam")),
             ("checkup-undone", checkup_undone(&[])),
             ("ram-speed", ram_below_rated(4800, 6000, "EXPO")),
+            ("disk-measured", disk_measured("Space is back on D:", "Freed 16.4 GB on D: (measured). Predicted 16.4 GB.")),
+            (
+                "disk-measured-late",
+                disk_measured(
+                    "Space hasn't come back yet on D:",
+                    "After 30 minutes, about 0.2 GB has come back on D: (measured). Predicted 16.4 GB. This drive can return deleted space much later; memguard disk shows the free space now.",
+                ),
+            ),
+            ("disk-bin-ask", disk_bin_ask("D:", 16.0)),
+            ("disk-bin-emptied", disk_bin_emptied("D:", Some(16.0), None)),
             (
                 "ram-problem",
                 ram_problem(

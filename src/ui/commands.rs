@@ -37,6 +37,9 @@ pub enum Command {
     /// The flyout's Unreal menu: end Unreal helpers whose editor, build or cook has exited
     /// (after a confirmation).
     EndUnrealLeftovers,
+    /// "Empty the bin" on the toast that asks when a drive is critical: empty Ather MemGuard's
+    /// bin on that drive (the tray remembers which one).
+    EmptyDiskBin,
 }
 
 /// What a flyout row menu asks for. Most are plain commands; the rest name the group or app
@@ -54,7 +57,7 @@ pub enum UiAction {
 
 impl Command {
     /// Every command, in a fixed order (their ids).
-    pub const ALL: [Command; 20] = [
+    pub const ALL: [Command; 21] = [
         Command::FreeMemory,
         Command::Pause30,
         Command::PauseUntilResumed,
@@ -75,6 +78,7 @@ impl Command {
         Command::FreeWindowsCache,
         Command::ShowDriverReport,
         Command::EndUnrealLeftovers,
+        Command::EmptyDiskBin,
     ];
 
     /// A small non-zero number for menu item ids and window messages.
@@ -100,6 +104,7 @@ impl Command {
             Command::FreeWindowsCache => 18,
             Command::ShowDriverReport => 19,
             Command::EndUnrealLeftovers => 20,
+            Command::EmptyDiskBin => 21,
         }
     }
 
@@ -120,7 +125,7 @@ mod tests {
             assert_eq!(Command::from_id(c.id()), Some(c));
             seen.insert(c.id());
         }
-        assert_eq!(seen.len(), 20, "every variant has its own id");
+        assert_eq!(seen.len(), 21, "every variant has its own id");
         assert_eq!(Command::from_id(0), None);
         assert_eq!(Command::from_id(99), None);
     }
