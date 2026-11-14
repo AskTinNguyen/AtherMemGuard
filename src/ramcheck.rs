@@ -1181,7 +1181,7 @@ fn build_steps(
                 .unwrap_or_else(|| b.path.clone())
                 .replace("{profile}", &r.profile_kind);
             steps.push(format!(
-                "{} and pick {}. If there's a choice of profiles, Profile 1 is the kit's rated speed ({}).",
+                "{} and pick {}. If there's a choice of profiles, Profile 1 is the kit's rated speed: {}.",
                 path, profile, spec
             ));
         }
@@ -1193,7 +1193,7 @@ fn build_steps(
                 " Many ready-made PCs don't offer it; if yours doesn't, there's nothing more to do."
             };
             steps.push(format!(
-                "Look for XMP, EXPO, DOCP or Memory Profile, often under an Advanced, Overclocking or Memory section, and turn on {}. Profile 1 is the kit's rated speed ({}).{}",
+                "Look for XMP, EXPO, DOCP or Memory Profile, often under an Advanced, Overclocking or Memory section, and turn on {}. Profile 1 is the kit's rated speed: {}.{}",
                 profile, spec, note
             ));
         }
@@ -1221,7 +1221,7 @@ fn build_steps(
     let cautions: Vec<String> = findings
         .iter()
         .filter(|f| f.id == "ram:cpu" || f.id == "ram:microcode")
-        .map(|f| format!("{}: {}", f.title, f.detail))
+        .map(|f| f.detail.clone())
         .collect();
     if !cautions.is_empty() {
         steps.push(format!("For this CPU: {}", cautions.join(" ")));
@@ -1247,7 +1247,7 @@ fn words(
             (
                 format!("Your RAM is running at {}. The kit is rated for {}.", cur, mhz(r.speed_mhz)),
                 format!(
-                    "The kit's fast profile ({}) is switched off in the BIOS, so the memory runs at its slower default. Turning it on takes about five minutes and is safe to try: if it doesn't work, the BIOS goes back by itself. The steps below say how.",
+                    "The kit's fast profile ({}) looks switched off in the BIOS, so the memory runs at its slower default. Turning it on takes about five minutes and is safe to try: if it doesn't work, the BIOS goes back by itself. The steps below say how.",
                     r.profile_kind
                 ),
             )

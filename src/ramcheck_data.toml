@@ -398,7 +398,7 @@ platform = "Intel Core Ultra 200"
   id = "ram:cpu"
   severity = "caution"
   title = "Keep System Agent voltage at or under about 1.25 V"
-  detail = "On Core Ultra 200 CPUs, a memory profile can raise System Agent (SA) voltage on some boards. Check it stays at or under about 1.25 V, and stay under that if you set it by hand."
+  detail = "On Core Ultra 200 CPUs, a memory profile can raise System Agent (SA) voltage on some boards. Keep it at or under about 1.25 V, also if you set it by hand."
 
 [[cpu]]
 id = "amd_am5"
