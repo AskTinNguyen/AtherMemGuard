@@ -250,6 +250,11 @@ impl Canvas {
         self.apply_clip();
     }
 
+    /// The current clip, `None` when drawing anywhere.
+    pub fn clip(&self) -> Option<Rect> {
+        self.clips.last().copied()
+    }
+
     pub fn pop_clip(&mut self) {
         self.clips.pop();
         self.apply_clip();

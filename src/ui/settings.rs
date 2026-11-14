@@ -1524,8 +1524,30 @@ pub fn hotkey_text(m: Mods, win: bool, vk: u16) -> Option<String> {
     Some(parts.join("+"))
 }
 
+impl SettingsWindow {
+    /// The search bar across the top, where the caret blinks (device pixels).
+    fn search_bar(&self) -> Rect {
+        Rect::new(0, 0, self.size.0, self.scale.s(60.0) + self.scale.px1(1.0))
+    }
+
+    /// Can the search caret be on screen now?
+    fn caret_visible(&self) -> bool {
+        self.editing.is_none() && self.recording.is_none() && self.confirm.is_none()
+    }
+}
+
 impl Surface for SettingsWindow {
     fn paint(&mut self, c: &mut Canvas) {
+        // A caret blink invalidates the search bar only: draw just that.
+        if self.size == (c.width(), c.height()) && self.scale == c.scale && self.dialog().is_none() {
+            let bar = self.search_bar();
+            if let Some(clip) = c.clip() {
+                if clip.x >= bar.x && clip.y >= bar.y && clip.right() <= bar.right() && clip.bottom() <= bar.bottom() {
+                    self.paint_search(c);
+                    return;
+                }
+            }
+        }
         self.scale = c.scale;
         self.size = (c.width(), c.height());
         self.layout(c);
@@ -1563,15 +1585,23 @@ impl Surface for SettingsWindow {
                 host.invalidate();
             }
             Event::Timer(TIMER_REFRESH) => {
-                self.status = self.host.status.latest();
-                // Status-derived values (group usage, GB units) change every tick, and the store
-                // revision catches edits made on disk: rebuild the page model either way.
-                self.reload();
-                host.invalidate();
+                // Status-derived values (group usage, GB units) change with each engine tick,
+                // and the store revision catches edits made on disk. Rebuild the page model
+                // and repaint only when one of them (or the update row) changed.
+                let status = self.host.status.latest();
+                let update = (self.host.update_state)();
+                let stamp = |s: &Option<Status>| s.as_ref().map(|s| (s.time.clone(), s.paused));
+                if stamp(&status) != stamp(&self.status) || self.host.store.revision() != self.revision || update != self.update {
+                    self.status = status;
+                    self.reload();
+                    host.invalidate();
+                }
             }
             Event::Timer(TIMER_CARET) => {
                 self.caret_on = !self.caret_on;
-                host.invalidate();
+                if self.caret_visible() {
+                    host.invalidate_rect(self.search_bar());
+                }
             }
             Event::MouseMove(p) => {
                 self.mouse = Some(p);
@@ -1938,6 +1968,48 @@ mod interaction_tests {
         w.event(Event::Key(VK_LEFT, Mods::default()), &mut host);
         w.event(Event::Key(VK_NEXT, Mods::default()), &mut host);
         assert_eq!(value(&w, "group.Browsers.ue.trim_above_pct"), Some(Value::Float(23.9)));
+    }
+
+    #[test]
+    fn caret_blink_repaints_only_the_search_bar() {
+        let mut w = sample_settings();
+        let mut c = painted(&mut w);
+        let mut host = Host::detached((900, 2400), Scale(1.0));
+        w.event(Event::Timer(TIMER_CARET), &mut host);
+        assert_eq!(host.invalidations(), (0, 1));
+        assert!(!w.caret_on);
+        let bar = w.search_bar();
+        let before: Vec<Rgb> = (0..bar.h).flat_map(|y| (0..bar.w).map(move |x| (x, y))).map(|(x, y)| c.pixel(x, y)).collect();
+        c.push_clip(bar);
+        w.paint(&mut c);
+        c.pop_clip();
+        // The partial frame is exactly what a full repaint draws, and the caret did go off.
+        let full = painted(&mut w);
+        let mut changed = 0;
+        for y in (0..2400).step_by(3) {
+            for x in 0..900 {
+                assert_eq!(c.pixel(x, y), full.pixel(x, y), "({}, {})", x, y);
+            }
+        }
+        for (i, px) in before.iter().enumerate() {
+            let (x, y) = (i as i32 % bar.w, i as i32 / bar.w);
+            assert_eq!(c.pixel(x, y), full.pixel(x, y));
+            changed += (*px != c.pixel(x, y)) as usize;
+        }
+        assert!(changed > 0);
+    }
+
+    #[test]
+    fn refresh_timer_repaints_only_when_something_changed() {
+        let mut w = sample_settings();
+        painted(&mut w);
+        let mut host = Host::detached((900, 2400), Scale(1.0));
+        w.event(Event::Timer(TIMER_REFRESH), &mut host);
+        w.event(Event::Timer(TIMER_REFRESH), &mut host);
+        assert_eq!(host.invalidations(), (0, 0), "same status, same settings");
+        w.status.as_mut().unwrap().time = "2000-01-01 00:00:00".into(); // a newer status arrives
+        w.event(Event::Timer(TIMER_REFRESH), &mut host);
+        assert_eq!(host.invalidations(), (1, 0));
     }
 
     #[test]

@@ -113,6 +113,7 @@ pub enum Cursor {
 
 enum Request {
     Invalidate,
+    InvalidateRect(Rect),
     Close,
     Capture(bool),
     Timer(usize, u32),
@@ -148,6 +149,13 @@ impl Host {
     pub fn detached(size: (i32, i32), scale: Scale) -> Host {
         Host { hwnd: null_mut(), scale, size, cursor: None, requests: Vec::new() }
     }
+    /// Repaints asked for so far: (whole window, part of it) (tests).
+    #[cfg(test)]
+    pub(crate) fn invalidations(&self) -> (usize, usize) {
+        let whole = self.requests.iter().filter(|r| matches!(r, Request::Invalidate)).count();
+        let part = self.requests.iter().filter(|r| matches!(r, Request::InvalidateRect(_))).count();
+        (whole, part)
+    }
     /// What `shell_open` was asked to open so far (tests).
     #[cfg(test)]
     pub(crate) fn shell_targets(&self) -> Vec<String> {
@@ -155,6 +163,12 @@ impl Host {
     }
     pub fn invalidate(&mut self) {
         self.requests.push(Request::Invalidate);
+    }
+    /// Repaint only `r` (client device pixels). The surface's `paint` runs with the
+    /// canvas clipped to the area Windows asks for; the rest of the canvas keeps the last
+    /// frame.
+    pub fn invalidate_rect(&mut self, r: Rect) {
+        self.requests.push(Request::InvalidateRect(r));
     }
     pub fn close(&mut self) {
         self.requests.push(Request::Close);
@@ -245,6 +259,8 @@ struct WinData {
     edit_font: HFONT,
     edit_brush: HBRUSH,
     swallow_syschar: bool,
+    /// The canvas holds a whole frame at its current size and scale.
+    painted: bool,
 }
 
 type Cell = RefCell<WinData>;
@@ -403,6 +419,7 @@ pub fn open(spec: WindowSpec, surface: Box<dyn Surface>) -> HWND {
         let data = Box::new(RefCell::new(WinData {
             surface,
             canvas: Canvas::new(rect.w.max(1), rect.h.max(1), scale),
+            painted: false,
             scale,
             kind: spec.kind,
             min_size: spec.min_size,
@@ -506,6 +523,10 @@ fn apply(hwnd: HWND, requests: Vec<Request>) {
             match r {
                 Request::Invalidate => {
                     InvalidateRect(hwnd, null(), 0);
+                }
+                Request::InvalidateRect(r) => {
+                    let rc = r.to_win();
+                    InvalidateRect(hwnd, &rc, 0);
                 }
                 Request::Close => {
                     DestroyWindow(hwnd);
@@ -708,9 +729,25 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 let mut rc: RECT = zeroed();
                 GetClientRect(hwnd, &mut rc);
                 let d = &mut *d;
+                let kept = d.painted
+                    && d.canvas.width() == rc.right.max(1)
+                    && d.canvas.height() == rc.bottom.max(1)
+                    && d.canvas.scale == d.scale;
                 d.canvas.resize(rc.right, rc.bottom);
                 d.canvas.set_scale(d.scale);
+                // Only part of the window is invalid (a blinking caret) and the canvas still
+                // holds the last frame: redraw just that part.
+                let p = ps.rcPaint;
+                let dirty = Rect::ltrb(p.left, p.top, p.right, p.bottom);
+                let partial = kept && dirty != d.canvas.bounds() && !dirty.is_empty();
+                if partial {
+                    d.canvas.push_clip(dirty);
+                }
                 d.surface.paint(&mut d.canvas);
+                if partial {
+                    d.canvas.pop_clip();
+                }
+                d.painted = true;
                 d.canvas.blit(hdc, 0, 0);
             }
             EndPaint(hwnd, &ps);
