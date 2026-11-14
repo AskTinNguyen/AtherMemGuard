@@ -435,12 +435,16 @@ impl Canvas {
 
     /// Like `measure`, with `extra` pixels added after every character.
     pub fn measure_spaced(&self, s: &str, f: Font, extra: i32) -> (i32, i32) {
-        let w: Vec<u16> = s.encode_utf16().collect();
+        // NUL-terminated so the pointer is valid even for an empty string.
+        let w: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+        let n = (w.len() - 1) as i32;
         unsafe {
             let old = SelectObject(self.dc, self.font(f));
             let prev = SetTextCharacterExtra(self.dc, extra);
             let mut sz = SIZE { cx: 0, cy: 0 };
-            GetTextExtentPoint32W(self.dc, w.as_ptr(), w.len() as i32, &mut sz);
+            if n > 0 {
+                GetTextExtentPoint32W(self.dc, w.as_ptr(), n, &mut sz);
+            }
             let mut tm: TEXTMETRICW = zeroed();
             GetTextMetricsW(self.dc, &mut tm);
             SetTextCharacterExtra(self.dc, prev);
@@ -455,12 +459,18 @@ impl Canvas {
     }
 
     unsafe fn draw(&self, r: Rect, s: &str, f: Font, c: Rgb, flags: u32, extra: i32) {
-        let w: Vec<u16> = s.encode_utf16().collect();
+        // Nothing to draw. DrawTextW with an empty buffer (and DT_END_ELLIPSIS) faults, so
+        // never hand it one; an empty rectangle has nothing to draw either.
+        if s.is_empty() || r.w <= 0 || r.h <= 0 {
+            return;
+        }
+        let w: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+        let n = (w.len() - 1) as i32;
         let old = SelectObject(self.dc, self.font(f));
         let prev = SetTextCharacterExtra(self.dc, extra);
         SetTextColor(self.dc, self.col(c).colorref());
         let mut rc: RECT = r.to_win();
-        DrawTextW(self.dc, w.as_ptr(), w.len() as i32, &mut rc, flags | DT_NOPREFIX);
+        DrawTextW(self.dc, w.as_ptr(), n, &mut rc, flags | DT_NOPREFIX);
         SetTextCharacterExtra(self.dc, prev);
         SelectObject(self.dc, old);
     }
@@ -685,6 +695,24 @@ mod tests {
         assert!(w > 20 && h > 10);
         let big = Canvas::new(10, 10, Scale(1.5));
         assert!(big.measure("Hello", F_BODY).0 > w);
+    }
+
+    #[test]
+    fn empty_text_draws_nothing() {
+        let mut c = Canvas::new(120, 40, Scale(1.0));
+        c.fill_rect(c.bounds(), BG);
+        let r = Rect::new(0, 0, 120, 40);
+        for align in [Align::Left, Align::Center, Align::Right] {
+            c.text(r, "", F_BODY, ACCENT, align);
+            c.text_top(r, "", F_BODY, ACCENT, align);
+            c.spaced_text(r, "", F_BODY, ACCENT, 3, align);
+        }
+        c.text(Rect::new(0, 0, 0, 0), "x", F_BODY, ACCENT, Align::Left);
+        assert_eq!(c.pixel(60, 20), BG);
+        assert_eq!(c.measure("", F_BODY).0, 0);
+        assert!(c.measure("", F_BODY).1 > 0, "an empty line still has a height");
+        assert_eq!(c.wrap_lines("", F_HINT, 100, 2), vec![String::new()]);
+        assert_eq!(c.ellipsize("", F_HINT, 100), "");
     }
 
     #[test]
