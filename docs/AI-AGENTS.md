@@ -5,7 +5,8 @@ as tools. It is an MCP server over **stdio**: the agent starts `memguard mcp` it
 and talks to it over stdin and stdout. There is no port, no token and nothing to turn on in the app.
 
 The tools do the same things as the `memguard` commands in the README (`memguard_doctor` is the
-read-only checkup, `memguard doctor --json`) and return the same JSON as
+read-only checkup, `memguard doctor --json`; `memguard_ram` the read-only RAM and BIOS check,
+`memguard ram --json`) and return the same JSON as
 their `--json` output. Without the background app running, `memguard_status` still works (it reports
 `daemon: false`), and priming and waiting still work; only the continuous enforcement is missing.
 
@@ -288,6 +289,60 @@ Example result (shortened):
 More than 720 samples are thinned evenly: `step` says every how many samples one is kept, and the
 newest sample is always included. An empty `samples` list means nothing was recorded for that span
 (the background app wasn't running, or history is off in settings).
+
+### `memguard_ram`
+
+Read-only RAM and BIOS check: whether this PC's memory runs below the speed its kit is rated for (the
+XMP / EXPO profile is switched off in the BIOS), whether two sticks are in the right slots, whether the
+BIOS may be out of date, and CPU-specific cautions. Same as `memguard ram --json`. No arguments. It reads
+the firmware's SMBIOS tables and the CPU's microcode version, and **changes nothing**: only the person can
+change BIOS settings.
+
+```json
+{ "name": "memguard_ram", "arguments": {} }
+```
+
+Example result (shortened; a PC whose kit runs below its rated speed):
+
+```json
+{
+  "verdict": "below_rated",
+  "headline": "Your RAM is running at 4800 MHz. The kit is rated for 6000 MHz.",
+  "summary": "The kit's fast profile (EXPO) is switched off in the BIOS, so the memory runs at its slower default. ...",
+  "sticks": [
+    { "slot": "DIMM_A2", "populated": true, "size_gb": 16.0, "kind": "DDR5", "form": "DIMM", "manufacturer": "G.Skill",
+      "part_number": "F5-6000J3038F16G", "module_mhz": 4800, "configured_mhz": 4800, "voltage": 1.1, "rated_mhz": 6000, "...": "..." },
+    { "slot": "DIMM_A1", "populated": false, "...": "..." }
+  ],
+  "slots_total": 4,
+  "rated": { "speed_mhz": 6000, "cl": 30, "timings": "30-38-38", "voltage": 1.35, "voltage_is_typical": true,
+             "profile_kind": "EXPO", "confidence": "part_number" },
+  "current_mhz": 4800,
+  "board": { "maker": "ASUS", "model": "ROG STRIX B650E-F GAMING WIFI", "bios_version": "1813", "bios_date": "2023-10-05", "bios_age_months": 37 },
+  "cpu": { "name": "AMD Ryzen 7 7800X3D 8-Core Processor", "vendor": "AMD", "microcode": null },
+  "findings": [
+    { "id": "ram:speed", "severity": "problem", "title": "Your RAM is running below its rated speed", "detail": "..." },
+    { "id": "ram:bios", "severity": "caution", "title": "The BIOS may be out of date", "detail": "..." },
+    { "id": "ram:cpu", "severity": "caution", "title": "Keep SoC voltage at or under 1.3 V", "detail": "..." }
+  ],
+  "steps": [ "Before you start: save your work ...", "Restart the PC and press Del or F2 ...", "..." ],
+  "fallback_mhz": 5600,
+  "fingerprint": "..."
+}
+```
+
+Verdicts: `below_rated` (at least 200 MHz under the rated speed: worth acting on), `at_rated`, `no_profile`
+(standard-speed or soldered memory: nothing to turn on), `mixed_kit` (sticks don't match), `unknown` (the kit
+couldn't be identified; the finding says what to look up), `not_applicable` (virtual machine, or no memory
+reported). `rated.confidence` says where the rated speed came from: `part_number` (decoded) or
+`module_reported` (what the modules tell the BIOS). A voltage with `voltage_is_typical: true` is the usual value
+for kits like this, not this kit's specification. Findings: `ram:speed`, `ram:mixed`, `ram:slots`, `ram:bios`,
+`ram:microcode`, `ram:cpu`, each `problem`, `caution` or `info`.
+
+A good relay is the headline plus one line: "Your RAM is running at 4800 MHz; the kit is rated for 6000.
+Turning on EXPO in the BIOS takes about five minutes. Want the steps?" Then give `steps` as they are (they
+name this board's menus and this kit's values). Never say you changed anything, and don't invent BIOS settings
+the steps don't mention.
 
 ## Troubleshooting
 

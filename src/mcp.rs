@@ -39,7 +39,8 @@ Before starting a local Unreal build, cook or packaging run, call memguard_wait 
 workload (build or cook); start the job only when it returns ready: true. Call memguard_advise to pick \
 -MaxParallelActions for UnrealBuildTool. Call memguard_status when memory looks tight or a build failed \
 with out-of-memory errors. When the person asks what is using memory or how to free more, call memguard_doctor \
-and relay its findings; it changes nothing, and you should ask the person before running `memguard doctor --fix`.";
+and relay its findings; it changes nothing, and you should ask the person before running `memguard doctor --fix`. \
+When the person asks whether their RAM runs at full speed, call memguard_ram; only the person can change BIOS settings.";
 
 /// Settings source. The real server reads settings.toml on every call (so edits apply
 /// at once); tests pass the built-in defaults.
@@ -234,6 +235,11 @@ impl Server {
             "memguard_doctor" => {
                 check_keys(args, &[])?;
                 to_value(&crate::doctor::scan(&(self.load_config)()))
+            }
+            // ---- Part G: RAM and BIOS check (report only; the BIOS is the person's to change)
+            "memguard_ram" => {
+                check_keys(args, &[])?;
+                to_value(&crate::ramcheck::check())
             }
             "memguard_history" => {
                 check_keys(args, &["hours"])?;
@@ -489,6 +495,20 @@ to see whether the editor keeps growing (a leak), or to check how long memory ha
             },
             "annotations": { "readOnlyHint": true, "openWorldHint": false },
         }),
+        // ---- Part G: RAM and BIOS check
+        json!({
+            "name": "memguard_ram",
+            "title": "RAM and BIOS check",
+            "description": "Read-only RAM and BIOS check: whether this PC's memory runs below the speed its kit \
+is rated for (XMP / EXPO switched off in the BIOS), whether the sticks are in the right slots, whether the BIOS \
+may be out of date, and CPU-specific cautions. Returns the verdict (below_rated, at_rated, no_profile, mixed_kit, \
+unknown, not_applicable), a headline, a summary, the sticks and slots, the rated speed with its source \
+(confidence), findings with severity, and numbered BIOS steps for this board when there is something to do. It \
+changes nothing. Relay the headline in one or two lines and offer the steps; only the person can change BIOS \
+settings, so never claim to have changed anything, and don't paraphrase the steps into different settings.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false },
+        }),
     ]
 }
 
@@ -514,7 +534,7 @@ pub fn agent_setup_text(exe: &std::path::Path) -> String {
         s.push('\n');
     };
     line("Ather MemGuard for AI agents: an MCP server your agent starts by itself (no port, nothing to enable).");
-    line("Tools: memguard_status, memguard_prime, memguard_wait, memguard_advise, memguard_doctor, memguard_history.");
+    line("Tools: memguard_status, memguard_prime, memguard_wait, memguard_advise, memguard_doctor, memguard_history, memguard_ram.");
     line("");
     line("Claude Code, for all your projects:");
     line(&format!("  claude mcp add --scope user ather-memguard -- \"{}\" mcp", exe));
@@ -604,7 +624,7 @@ mod tests {
         let r = one(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#);
         let tools = r["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["memguard_status", "memguard_prime", "memguard_wait", "memguard_advise", "memguard_doctor", "memguard_history"]);
+        assert_eq!(names, ["memguard_status", "memguard_prime", "memguard_wait", "memguard_advise", "memguard_doctor", "memguard_history", "memguard_ram"]);
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
             assert!(t["inputSchema"]["properties"].is_object());
@@ -666,6 +686,30 @@ mod tests {
         assert!(doctor["description"].as_str().unwrap().contains("ask before acting"));
         let t = tool_error_text(&one(&call(16, "memguard_doctor", json!({ "fix": true }))));
         assert!(t.contains("fix"), "{}", t);
+    }
+
+    // ---- Part G: RAM and BIOS check. Read-only: reads the firmware tables and changes nothing.
+    #[test]
+    fn ram_call_returns_the_report() {
+        let r = one(&call(17, "memguard_ram", json!({})));
+        let res = &r["result"];
+        assert_eq!(res["isError"], false, "{}", r);
+        let s = &res["structuredContent"];
+        for key in ["verdict", "headline", "summary", "sticks", "slots_total", "rated", "current_mhz", "board", "cpu", "findings", "steps", "fallback_mhz", "fingerprint"] {
+            assert!(s.get(key).is_some(), "ram report lacks {}", key);
+        }
+        let verdicts = ["below_rated", "at_rated", "no_profile", "mixed_kit", "unknown", "not_applicable"];
+        assert!(verdicts.contains(&s["verdict"].as_str().unwrap()), "{}", s["verdict"]);
+        assert!(!s["headline"].as_str().unwrap().is_empty());
+        let text: Value = serde_json::from_str(res["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(&text, s);
+        let tools = one(r#"{"jsonrpc":"2.0","id":18,"method":"tools/list"}"#);
+        let ram = tools["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == "memguard_ram").unwrap().clone();
+        assert_eq!(ram["annotations"]["readOnlyHint"], true);
+        let d = ram["description"].as_str().unwrap();
+        assert!(d.contains("headline") && d.contains("only the person can change BIOS"), "{}", d);
+        let t = tool_error_text(&one(&call(19, "memguard_ram", json!({ "apply": true }))));
+        assert!(t.contains("apply"), "{}", t);
     }
 
     fn sample(unix: i64) -> Sample {
