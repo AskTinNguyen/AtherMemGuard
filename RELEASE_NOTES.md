@@ -29,10 +29,16 @@
 - **0.1 settings:** an untouched 0.1 file is replaced by the new template (kept as `.bak`); one you edited keeps working.
 
 ### Checkup
-- **Run a checkup** from the tray: what is using memory that Unreal doesn't need (launchers, music, overlays, apps that start with Windows, big tools you might not be using, unknown apps, Unreal leftovers), how much could be freed, and one click to clean up what you tick. Apps are asked to close, never forced; anything unsaved stays. **Undo last cleanup** reverses it.
+- **Run a checkup** from the tray: what is using memory that Unreal doesn't need (launchers, music, overlays, apps that start with Windows, big tools you might not be using, unknown apps, Unreal leftovers), how much could be freed, and one click to clean up what you tick. Apps are asked to close, never forced; anything unsaved stays. Ending an app is only ever your pick, and always asks first. **Undo last cleanup** reverses it.
 - **A nudge when Unreal starts:** if 4 GB or more could be freed, a toast says so, at most once a day.
 - **Keep apps closed while Unreal runs:** apps on that list are asked to close when they start during Unreal work, with **Allow this time** on the toast.
 - `memguard doctor` is the same checkup for the command line and agents.
+
+### RAM and BIOS check
+- **Is your RAM as fast as you paid for?** Memory kits ship with their fast profile (XMP or EXPO) switched off, and many PCs run for years at the slower default. Ather MemGuard reads the PC's firmware tables and says whether the RAM runs below its rated speed, whether the sticks are in the right slots, whether the BIOS may be out of date, and which cautions apply to your CPU.
+- **It only reports.** Nothing in the BIOS, the registry or a driver is changed, and no admin rights are needed. **Show me how** opens a page with steps for your board's BIOS, your PC's numbers filled in, what to do if it doesn't start, and how to check it worked.
+- **Told once:** a toast a few minutes after start if the RAM runs below its rated speed (or a problem such as old Intel microcode), and again only when the situation changes. The checkup shows it under **This PC**.
+- `memguard ram` prints the report and the steps; agents get it from the read-only `memguard_ram` MCP tool. Turn it off in Settings › General › **Check memory speed**.
 
 ### Memory history and smarter freeing
 - **Memory history** window: Unreal's memory, RAM free and commit free over 1 hour to 7 days, with tight and critical spells, memory freed and editor starts marked. Recorded to a CSV file per day.
@@ -40,7 +46,7 @@
 - **Editor alerts:** a toast when the editor passes its restart hint or keeps growing fast, with how long until memory runs out.
 
 ### For agents
-- **MCP server:** `memguard mcp` gives Claude Code, Codex and other agents MemGuard as tools (status, prime, wait, advise, history and a read-only checkup). **Copy setup** in Settings, or `memguard agent-setup`, gives the text to paste. See `docs/AI-AGENTS.md`.
+- **MCP server:** `memguard mcp` gives Claude Code, Codex and other agents MemGuard as tools (status, prime, wait, advise, history, and a read-only checkup and RAM check). **Copy setup** in Settings, or `memguard agent-setup`, gives the text to paste. See `docs/AI-AGENTS.md`.
 
 ## Checksums
 

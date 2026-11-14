@@ -91,13 +91,41 @@ apps that start with Windows, big tools you might not be using, unknown apps wor
 held back, Unreal leftovers, and notes about this PC. Tick what you want, pick what happens to each (close,
 don't start with Windows, close whenever Unreal is running, hold back, leave it) and click **CLEAN UP**.
 Nothing changes without a tick and that click. Apps that ask to save stay open and offer **End it anyway**,
-which asks first. **Undo last cleanup** reverses it.
+which asks first. Ending anything always asks first: if a ticked row ends an app or Unreal's leftover
+helpers, **CLEAN UP** lists them and waits for **End them**. **Undo last cleanup** reverses it.
 
 When Unreal work starts and a checkup finds at least 4 GB to free, a toast says so (at most once a day), with a
 **Review** button. Apps you put on the "close whenever Unreal is running" list are asked to close when they
 start during Unreal work; the toast has **Allow this time**.
 
 The same checkup is on the command line as `memguard doctor`; see [Checkup (doctor)](#checkup-doctor).
+
+## RAM and BIOS check
+
+Memory kits are sold with a fast profile (XMP on Intel, EXPO or DOCP on AMD) that stays off until someone
+turns it on in the BIOS, so many PCs run for years at the slower default. For Unreal work that costs compile,
+shader and cook time. Ather MemGuard reads the PC's firmware tables and tells you:
+
+- whether the RAM runs below the speed the kit is rated for (worked out from the sticks' part numbers, or
+  what the modules report), or is already as fast as it's made to run;
+- whether the sticks are in the right slots (two sticks on one memory channel halve the bandwidth);
+- whether the BIOS may be out of date, and the cautions for your CPU (old microcode on Intel Core 13th and
+  14th gen, safe System Agent and SoC voltages).
+
+It only reports. It never changes the BIOS, the registry or a driver, and needs no admin rights: you make
+the change yourself, following steps written for your board's BIOS, with this PC's numbers filled in, what
+to do if it doesn't start, and how to check it worked.
+
+- `memguard ram` prints the report and the steps (`--json` for scripts, `--html <file>` for the page).
+  Agents get the same from the read-only `memguard_ram` MCP tool.
+- **Toast:** about three minutes after the tray starts, if the RAM runs below its rated speed, a toast says
+  so once, with **Show me how**. It speaks again only when the situation changes (different sticks, speed
+  or BIOS version). A problem that isn't about speed, such as old Intel microcode, gets a toast of its own.
+- **Checkup:** the same shows as a row under **This PC**, with **Show me how**, and in `memguard doctor`.
+- **Show me how** writes the report page to `%APPDATA%\AtherMemGuard\ram-report.html` and opens it in your
+  browser.
+- Settings › General › **Check memory speed** turns all of it off (`[general] check_ram_speed = false`).
+  `memguard ram` still works.
 
 ## Memory history
 
@@ -167,6 +195,7 @@ memguard run --cap-gb 48 [--per-process-cap-gb N] [--priority low] [--cpu below]
 memguard advise [--json]            suggested -MaxParallelActions for the memory available now
 memguard history [--hours 1] [--json]    memory history the background app recorded
 memguard doctor [--json] [--fix ...] [--undo]   the checkup; see Checkup (doctor)
+memguard ram [--json] [--html <file>]    is the RAM running at its rated speed, and the BIOS steps if not
 memguard mcp | agent-setup          MCP server for agents, and setup text to paste; see AI agents
 memguard config show | set | reset | export | import | team    see Settings
 memguard stop | daemon | config [--check | --reset] | install | uninstall
@@ -185,7 +214,7 @@ The tray app also writes `%APPDATA%\AtherMemGuard\status.json` every interval, w
 
 `memguard mcp` is an MCP server over stdio, so Claude Code, Codex and other coding agents can call
 MemGuard as tools: `memguard_status`, `memguard_prime`, `memguard_wait`, `memguard_advise`,
-`memguard_history` and `memguard_doctor` (read-only). The agent
+`memguard_history`, `memguard_doctor` and `memguard_ram` (both read-only). The agent
 starts it by itself; there is no port and nothing to enable. Run `memguard agent-setup` for ready-to-paste
 setup, or add it to Claude Code with:
 
@@ -226,7 +255,8 @@ What it reports:
   MemGuard group yet.
 - **Unreal**: leftover helper processes from a closed editor, several editors open, an editor past its
   restart hint. **This PC**: small page file, low commit, a leaking driver, a git pile-up, MemGuard not
-  running.
+  running, RAM running below its rated speed (see [RAM and BIOS check](#ram-and-bios-check); run
+  `memguard ram` for the steps).
 
 Actions: `close` asks the app to close (as if you clicked its X) and waits up to 10 seconds; an app with
 unsaved work shows its own prompt and the result is "still open", never a forced kill. `end` needs
@@ -288,6 +318,7 @@ preset = "balanced"            # gentle | balanced | aggressive
 notifications = true           # toasts for pressure changes, updates and hints
 auto_prime = true              # trim every group the moment a build or cook starts
 prime_hotkey = "Ctrl+Alt+M"    # empty = no hotkey
+check_ram_speed = true         # say once if the RAM runs below its rated speed; see RAM and BIOS check
 
 [updates]
 check_automatically = true
