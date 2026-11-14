@@ -17,6 +17,7 @@
 #   processes    executable names without .exe; a trailing * is a wildcard; case doesn't matter
 #   description  one line, second person: what it is and why Unreal doesn't need it
 #   group        hold_back only: the MemGuard group it belongs in
+#   family       true for a family of separate apps: each is shown on its own, by exe name
 #
 # Be conservative: when unsure, use review rather than close. Exact names win over
 # wildcards, and longer wildcards over shorter ones.
@@ -267,6 +268,7 @@ description = "Music player. Not used by Unreal."
 
 [[app]]
 name = "Music streaming apps"
+family = true
 verdict = "close"
 category = "Music"
 processes = ["TIDAL", "Deezer", "Amazon Music", "Amazon Music Helper", "YouTube Music Desktop App", "Cider"]
@@ -274,6 +276,7 @@ description = "Music player. Not used by Unreal."
 
 [[app]]
 name = "Music players"
+family = true
 verdict = "close"
 category = "Music"
 processes = ["foobar2000", "AIMP", "MusicBee", "winamp", "Plexamp"]
@@ -281,6 +284,7 @@ description = "Music player. Not used by Unreal."
 
 [[app]]
 name = "Video players"
+family = true
 verdict = "close"
 category = "Video"
 processes = ["vlc", "PotPlayerMini64", "PotPlayerMini", "mpc-hc64", "mpc-be64", "mpv", "kodi", "Plex", "Microsoft.Media.Player", "Video.UI"]
@@ -504,7 +508,7 @@ description = "Stream Deck, camera or audio app. You may rely on it while you wo
 name = "Seagate Toolkit"
 verdict = "review"
 category = "Backup"
-processes = ["Seagate.Dashboard*", "SeagateToolkit"]
+processes = ["Seagate.Dashboard*", "SeagateToolkit", "DBAgent"]
 description = "Drive backup tool. Closing it pauses backups."
 
 [[app]]
@@ -573,6 +577,7 @@ group = "Background"
 
 [[app]]
 name = "Other cloud sync"
+family = true
 verdict = "hold_back"
 category = "Cloud sync"
 processes = ["MEGAsync", "pCloud", "Box", "BoxUI", "nextcloud", "owncloud", "SynologyDrive*", "Resilio Sync", "bzbui", "bztray"]
@@ -623,6 +628,7 @@ group = "Chat"
 
 [[app]]
 name = "Messaging apps"
+family = true
 verdict = "hold_back"
 category = "Chat"
 processes = ["Telegram", "WhatsApp", "WhatsApp.Root", "Signal", "Messenger", "Skype", "Viber", "Element", "Mattermost", "Rocket.Chat", "Guilded"]
@@ -631,6 +637,7 @@ group = "Chat"
 
 [[app]]
 name = "Zalo, Lark and other messengers"
+family = true
 verdict = "hold_back"
 category = "Chat"
 processes = ["Zalo", "ZaloCall", "Lark", "Feishu", "DingTalk", "WeChat", "Weixin", "QQ", "KakaoTalk", "LINE"]
@@ -639,6 +646,7 @@ group = "Chat"
 
 [[app]]
 name = "Email apps"
+family = true
 verdict = "hold_back"
 category = "Email"
 processes = ["olk", "OUTLOOK", "thunderbird", "Mailbird", "eM Client", "MailClient"]
@@ -655,6 +663,7 @@ group = "Chat"
 
 [[app]]
 name = "Notes and planning apps"
+family = true
 verdict = "hold_back"
 category = "Productivity"
 processes = ["Notion", "Obsidian", "Linear", "ClickUp", "Todoist", "Miro", "Trello", "Evernote", "Loom", "Granola", "Raycast"]
@@ -697,6 +706,7 @@ group = "Browsers"
 
 [[app]]
 name = "Other browsers"
+family = true
 verdict = "hold_back"
 category = "Browser"
 processes = ["brave", "opera", "opera_gx", "vivaldi", "Arc", "thorium", "chromium", "DuckDuckGo", "Comet", "Dia", "iexplore"]
@@ -731,6 +741,7 @@ group = "Agents"
 
 [[app]]
 name = "Other AI assistants"
+family = true
 verdict = "hold_back"
 category = "Agent app"
 processes = ["Perplexity", "Gemini", "Paseo", "Superwhisper", "Msty", "Poe", "agents-connector"]
@@ -739,6 +750,7 @@ group = "Agents"
 
 [[app]]
 name = "Local AI models"
+family = true
 verdict = "heavy_tool"
 category = "Local AI"
 processes = ["ollama", "ollama app", "ollama_llama_server", "LM Studio", "lms", "Jan", "koboldcpp", "llama-server"]
@@ -797,6 +809,7 @@ description = "Texturing app. Close it if you're not using it."
 
 [[app]]
 name = "Other 3D tools"
+family = true
 verdict = "heavy_tool"
 category = "3D"
 processes = ["Marvelous Designer*", "SpeedTree*", "Rhino", "Fusion360", "SketchUp", "RizomUV", "toolbag", "Cascadeur", "CharacterCreator", "iClone", "Gaea", "WorldCreator", "InstaMAT*", "Plasticity", "Modo"]
@@ -811,6 +824,7 @@ description = "Image editor. Close it if you're not using it."
 
 [[app]]
 name = "Adobe creative apps"
+family = true
 verdict = "heavy_tool"
 category = "Creative"
 processes = ["Illustrator", "AfterFX", "Adobe Premiere Pro", "Adobe Media Encoder", "Audition", "Lightroom", "Adobe Animate*", "InDesign"]
@@ -832,6 +846,7 @@ description = "PDF reader. Not used by Unreal."
 
 [[app]]
 name = "Image and paint apps"
+family = true
 verdict = "heavy_tool"
 category = "Image editing"
 processes = ["krita", "gimp-2.10", "gimp-3*", "Affinity*", "PureRef", "Aseprite", "clipstudiopaint"]
@@ -853,6 +868,7 @@ description = "Recording and streaming. Close it if you're not recording."
 
 [[app]]
 name = "Music production"
+family = true
 verdict = "heavy_tool"
 category = "Audio"
 processes = ["reaper", "Ableton Live*", "FL64", "FL", "Cubase*", "StudioOne", "Bitwig Studio"]
@@ -876,6 +892,7 @@ description = "The Linux virtual machine keeps memory until it shuts down. Run `
 
 [[app]]
 name = "Virtual machines"
+family = true
 verdict = "heavy_tool"
 category = "Virtualisation"
 processes = ["VirtualBoxVM", "VirtualBox", "VBoxSVC", "vmware", "vmware-vmx", "vmware-tray", "qemu-system-x86_64", "vmconnect", "prl_client_app"]
@@ -883,6 +900,7 @@ description = "A virtual machine holds its memory while it runs. Close it if you
 
 [[app]]
 name = "Android emulators"
+family = true
 verdict = "heavy_tool"
 category = "Virtualisation"
 processes = ["qemu-system-x86_64-headless", "emulator", "HD-Player", "BlueStacks*", "Nox", "LDPlayer", "MEmu"]
@@ -920,6 +938,7 @@ description = "Another game engine. Close it if you're not using it."
 
 [[app]]
 name = "Other engines"
+family = true
 verdict = "heavy_tool"
 category = "Game engine"
 processes = ["GameMaker", "O3DE", "Editor.Bin", "CryEngine*", "Defold", "Cocos*", "Stride.GameStudio"]
@@ -1078,7 +1097,7 @@ category = "Driver"
 processes = [
     "NVDisplay.Container", "nvcontainer", "NVIDIA Broadcast", "RtkAudUService64", "RAVBg64", "RtkNGUI64", "igfxEM", "igfxTray",
     "igfxCUIService", "WavesSvc64", "WavesSysSvc64", "ipf_helper", "ipf_uf", "SynTPEnh", "ETDCtrl", "AsusOSD", "audiodg",
-    "FanControl", "FocusriteControl*", "Focusrite*", "UAD*", "DeviceAgent", "DBAgent", "IntelCpHDCPSvc", "jhi_service",
+    "FanControl", "FocusriteControl*", "Focusrite*", "UAD*", "IntelCpHDCPSvc", "jhi_service",
 ]
 description = "Keeps your hardware working."
 

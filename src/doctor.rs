@@ -302,6 +302,10 @@ pub struct CatalogApp {
     pub description: String,
     #[serde(default)]
     pub group: Option<String>,
+    /// A family of separate apps (music players, other browsers): each app is its own
+    /// finding, titled by its executable name, rather than one finding for the entry.
+    #[serde(default)]
+    pub family: bool,
 }
 
 #[derive(Deserialize)]
@@ -639,6 +643,7 @@ struct AppAcc<'a> {
     visible: usize,
     candidates: usize,
     in_self_tree: bool,
+    members: Vec<&'a Proc>,
 }
 
 fn combine(a: Option<Verdict>, b: Option<Verdict>) -> Option<Verdict> {
@@ -695,12 +700,15 @@ pub fn build_report(
         }
         let (verdict, entry) = classify(ds, cat, &p.name);
         let key = match entry {
-            Some(e) => format!("app:{}", slug(&e.name)),
-            None => format!("app:{}", slug(&p.name)),
+            Some(e) if !e.family => format!("app:{}", slug(&e.name)),
+            _ => format!("app:{}", slug(&p.name)),
         };
         let acc = apps.entry(key).or_default();
         if acc.title.is_empty() {
-            acc.title = entry.map_or_else(|| p.name.clone(), |e| e.name.clone());
+            acc.title = match entry {
+                Some(e) if !e.family => e.name.clone(),
+                _ => p.name.clone(),
+            };
             acc.entry = entry;
             acc.verdict = verdict;
         } else {
@@ -714,6 +722,7 @@ pub fn build_report(
         acc.visible += w.visible;
         acc.candidates += w.candidates;
         acc.in_self_tree |= input.self_tree.contains(&p.pid);
+        acc.members.push(p);
     }
 
     let enabled_startup: Vec<&startup::Entry> = input.startup.iter().filter(|e| e.enabled).collect();
@@ -721,8 +730,10 @@ pub fn build_report(
         |names: &BTreeSet<String>| enabled_startup.iter().any(|e| names.iter().any(|n| n.eq_ignore_ascii_case(&e.exe)));
 
     for (id, acc) in &apps {
-        let committed_mb = acc.committed / MB;
-        let ram_mb = acc.ram / MB;
+        let mut committed_mb = acc.committed / MB;
+        let mut ram_mb = acc.ram / MB;
+        let mut names: Vec<String> = acc.names.iter().cloned().collect();
+        let mut pids = acc.pids.clone();
         let auto = acc.verdict.is_none();
         let verdict = match acc.verdict {
             Some(Verdict::Keep) => continue,
@@ -735,9 +746,16 @@ pub fn build_report(
         if committed_mb < ds.ignore_below_mb && !worth_switching_off {
             continue;
         }
-        let names: Vec<String> = acc.names.iter().cloned().collect();
-        if verdict == Verdict::HoldBack && names.iter().all(|n| group_has(cfg, n)) {
-            continue; // already held back by a group
+        if verdict == Verdict::HoldBack {
+            // Only the processes no group holds back yet compete with Unreal.
+            let loose: Vec<&Proc> = acc.members.iter().copied().filter(|p| !group_has(cfg, &p.name)).collect();
+            committed_mb = loose.iter().map(|p| p.committed).sum::<u64>() / MB;
+            if loose.is_empty() || committed_mb < ds.ignore_below_mb {
+                continue;
+            }
+            ram_mb = loose.iter().map(|p| p.ram).sum::<u64>() / MB;
+            names = loose.iter().map(|p| p.name.clone()).collect::<BTreeSet<_>>().into_iter().collect();
+            pids = loose.iter().map(|p| p.pid).collect();
         }
         let desc = acc.entry.map(|e| e.description.clone()).unwrap_or_default();
         let mut detail = match verdict {
@@ -798,14 +816,14 @@ pub fn build_report(
             && acc.candidates > 0
             && actions.first().map(|a| a.kind) == Some(ActionKind::Close);
         let mut f = Finding::new(id.clone(), FindingKind::App, verdict, acc.title.clone(), detail.trim().to_string());
-        f.processes = acc.pids.len();
+        f.processes = pids.len();
         f.ram_mb = ram_mb;
         f.committed_mb = committed_mb;
         f.actions = actions;
         f.recommended = recommended;
         f.category = acc.entry.map(|e| e.category.clone()).unwrap_or_default();
         f.names = names;
-        f.pids = acc.pids.clone();
+        f.pids = pids;
         f.has_window = acc.visible > 0;
         f.group = group;
         findings.push(f);
@@ -872,7 +890,11 @@ pub fn build_report(
             FindingKind::Unreal,
             Verdict::Close,
             format!("{} leftover Unreal helper{}", orphans.len(), if orphans.len() == 1 { "" } else { "s" }),
-            "Still running after the editor, build or cook that started them closed. Nothing is using them.".into(),
+            if orphans.len() == 1 {
+                "Still running after the editor, build or cook that started it closed. Nothing is using it.".into()
+            } else {
+                "Still running after the editor, build or cook that started them closed. Nothing is using them.".into()
+            },
         );
         f.processes = orphans.len();
         f.ram_mb = orphans.iter().map(|p| p.ram).sum::<u64>() / MB;
@@ -2032,7 +2054,7 @@ mod tests {
         assert_eq!(blender.verdict, Verdict::HeavyTool);
         assert!(!blender.recommended);
 
-        let notion = r.finding("app:notes-and-planning-apps").unwrap();
+        let notion = r.finding("app:notion").unwrap();
         assert_eq!(notion.verdict, Verdict::HoldBack);
         assert_eq!(notion.group.as_deref(), Some("Chat"));
         assert_eq!(notion.actions.iter().map(|a| a.kind).collect::<Vec<_>>(), vec![ActionKind::HoldBack]);
@@ -2041,7 +2063,29 @@ mod tests {
         let pos = |id: &str| ids.iter().position(|i| *i == id).unwrap();
         assert!(pos("app:steam") < pos("app:blender"));
         assert!(pos("app:blender") < pos("app:mysteryapp"));
-        assert!(pos("app:mysteryapp") < pos("app:notes-and-planning-apps"));
+        assert!(pos("app:mysteryapp") < pos("app:notion"));
+    }
+
+    #[test]
+    fn hold_back_counts_only_processes_no_group_holds() {
+        let inp = input(vec![
+            proc(10, 1, "chrome", 4000),             // in Browsers
+            proc(11, 10, "chrome-native-host", 5),   // not in a group, but tiny
+            proc(20, 1, "codex", 300),               // in Agents
+            proc(21, 20, "codex-computer-use-swift", 400), // not in a group
+            proc(30, 1, "agents-connector", 430),    // family entry: its own finding
+            proc(31, 1, "Perplexity", 200),
+        ]);
+        let r = report(&inp, &DoctorSettings::default());
+        assert!(r.finding("app:google-chrome").is_none());
+        let codex = r.finding("app:codex").unwrap();
+        assert_eq!((codex.processes, codex.committed_mb), (1, 400));
+        assert_eq!(codex.names, vec!["codex-computer-use-swift".to_string()]);
+        assert_eq!(codex.group.as_deref(), Some("Agents"));
+        let a = r.finding("app:agents-connector").unwrap();
+        assert_eq!(a.title, "agents-connector");
+        assert_eq!(a.category, "Agent app");
+        assert!(r.finding("app:perplexity").is_some());
     }
 
     #[test]
