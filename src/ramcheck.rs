@@ -715,6 +715,13 @@ pub fn check() -> RamReport {
     check_from(&table, &name, microcode, today())
 }
 
+/// `check()` once per process: the firmware tables and the memory speed don't change while
+/// Windows runs, so the checkup, the tray toast and "Show me how" share one reading.
+pub fn check_cached() -> &'static RamReport {
+    static CACHE: OnceLock<RamReport> = OnceLock::new();
+    CACHE.get_or_init(check)
+}
+
 /// The check over given facts: pure, for tests. `cpu_name` may be empty (the SMBIOS
 /// processor name is used then); `today` is (year, month, day).
 pub fn check_from(sm: &Smbios, cpu_name: &str, microcode: Option<u32>, today: (i32, u32, u32)) -> RamReport {

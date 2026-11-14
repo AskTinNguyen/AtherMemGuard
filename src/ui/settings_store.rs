@@ -238,6 +238,7 @@ impl FakeStore {
         put("general.auto_prime", Value::Bool(true));
         put("general.notifications", Value::Bool(true));
         put("general.prime_hotkey", t("Ctrl+Alt+M"));
+        put("general.check_ram_speed", Value::Bool(true));
         put("updates.check_automatically", Value::Bool(true));
         put("history.enabled", Value::Bool(true));
         put("history.keep_days", Value::Int(7));

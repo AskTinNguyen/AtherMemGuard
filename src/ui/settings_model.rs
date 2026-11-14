@@ -301,6 +301,8 @@ pub fn build(input: &ModelInput) -> Vec<Block> {
         },
     );
     b.push(r);
+    let r = b.toggle("Check memory speed", "Tells you once if your RAM is running slower than it was sold to run.", "general.check_ram_speed");
+    b.push(r);
 
     // ---------------------------------------------------------------- APP GROUPS
     b.section("App groups");

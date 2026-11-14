@@ -17,6 +17,7 @@ use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
 use super::canvas::{Align, Canvas};
+use super::commands::Command;
 use super::geom::{Pt, Rect};
 use super::kit::{format_gb, Button, ButtonStyle, Dialog, Pill, Scroll, WState};
 use super::setup::{indeterminate_bar, paint_link, wake, wrap_hard};
@@ -112,6 +113,20 @@ pub struct Finding {
     pub company: String,
     /// Addition: where "How to fix" goes for THIS PC rows.
     pub help_url: Option<String>,
+    /// Addition: a THIS PC row whose link runs a command instead ("Show me how" on the RAM
+    /// check rows writes and opens the RAM report). Wins over `help_url`.
+    pub help_command: Option<Command>,
+}
+
+/// The link a THIS PC row shows, if any.
+pub fn help_link(f: &Finding) -> Option<&'static str> {
+    if f.help_command.is_some() {
+        Some("Show me how")
+    } else if f.help_url.is_some() {
+        Some("How to fix")
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,6 +337,15 @@ impl DoctorModel {
         !self.picks().is_empty()
     }
 
+    /// Checked rows whose pick ends processes ("End it", "End them"). CLEAN UP asks before
+    /// running these: anything unsaved in them is lost.
+    pub fn ending_rows(&self) -> Vec<usize> {
+        (0..self.rows.len())
+            .filter(|&i| self.rows[i].checked && self.selectable(i))
+            .filter(|&i| self.chosen(i).is_some_and(|c| c.picks.contains(&ActionKind::End)))
+            .collect()
+    }
+
     /// Mark the checked rows as running and return their picks.
     pub fn begin_apply(&mut self) -> Vec<(String, ActionKind)> {
         let picks = self.picks();
@@ -448,6 +472,7 @@ impl FakeDoctor {
             needs_admin: false,
             company: String::new(),
             help_url: None,
+            help_command: None,
         };
         use ActionKind as A;
         use FindingKind as K;
@@ -461,7 +486,7 @@ impl FakeDoctor {
             f("app:epicgameslauncher", K::App, V::Close, "Epic Games Launcher", "Game launcher. Unreal doesn't need it running to open or build a project.", 4, 980, &[A::DisableStartup, A::Close], true),
             f("app:spotify", K::App, V::Close, "Spotify", "Music player. Not used by Unreal.", 5, 640, &[A::Close, A::BlockWhileUnreal], false),
             f("app:widgets", K::App, V::Close, "Widgets", "News and weather panel. It comes back when you open it.", 3, 410, &[A::Close], true),
-            f("app:icue", K::App, V::Close, "iCUE", "Lighting and fan software. Your devices keep their last settings.", 4, 560, &[A::Close, A::DisableStartup], false),
+            f("app:icue", K::App, V::Close, "iCUE", "Lighting and fan software. Your devices keep their last settings.", 4, 560, &[A::Close, A::DisableStartup, A::End], false),
             f("startup:hkcu:Steam", K::Startup, V::Close, "Steam", "", 0, 1270, &[A::DisableStartup], true),
             f("startup:hkcu:Spotify", K::Startup, V::Close, "Spotify", "", 0, 640, &[A::DisableStartup], true),
             f("startup:hklm:iCUE", K::Startup, V::Close, "iCUE", "", 0, 560, &[], false),
@@ -471,10 +496,22 @@ impl FakeDoctor {
             f("app:dropbox", K::App, V::HoldBack, "Dropbox", "Cloud sync. Held back so syncing doesn't compete with Unreal.", 3, 420, &[A::HoldBack], false),
             f("ue:orphans", K::Unreal, V::Close, "3 leftover Unreal helpers from a closed editor", "ShaderCompileWorker processes with no editor left to use them.", 3, 1230, &[A::End], false),
             f("sys:pagefile", K::System, V::Keep, "The page file is small for this much RAM.", "Windows can only promise apps 144 GB. Big cooks can fail even with RAM free.", 0, 0, &[], false),
+            f(
+                "sys:ram",
+                K::System,
+                V::Review,
+                "Your RAM is running at 4800 MHz. The kit is rated for 6000 MHz.",
+                "The kit's fast profile (EXPO) looks switched off in the BIOS, so the memory runs at its slower default. Turning it on takes about five minutes and is safe to try: if it doesn't work, the BIOS goes back by itself.",
+                0,
+                0,
+                &[],
+                false,
+            ),
         ];
         findings[7].needs_admin = true;
         findings[9].company = "Northwind Systems".into();
         findings[13].help_url = Some("https://github.com/AskTinNguyen/AtherMemGuard/blob/main/docs/PAGEFILE.md".into());
+        findings[14].help_command = Some(Command::ShowRamReport);
         let reclaim: u64 = findings.iter().filter(|f| f.kind == K::App || f.kind == K::Unreal).filter(|f| f.verdict != V::HoldBack).map(|f| f.ram_mb).sum();
         Report { time: "2026-11-14 14:02:11".into(), system, findings, reclaimable_ram_gb: reclaim as f64 / 1024.0, reclaimable_commit_gb: reclaim as f64 * 1.25 / 1024.0 }
     }
@@ -598,7 +635,33 @@ enum Job {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Confirm {
+    /// "End it anyway" on a row that stayed open.
     End(usize),
+    /// CLEAN UP with rows that end processes checked: these rows, before anything runs.
+    CleanUp(Vec<usize>),
+}
+
+/// "Spotify, iCUE and 3 leftover Unreal helpers"
+fn and_list(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {}", rest.join(", "), last),
+    }
+}
+
+/// The confirmation's words: (title, body, OK button). One app reads like "End it anyway";
+/// one row that covers several processes (Unreal leftovers) says "them".
+pub fn confirm_words(names: &[String], one_row_is_many: bool) -> (String, String, String) {
+    match names {
+        [one] if one_row_is_many => (format!("End {}?", one), "Anything unsaved in them is lost.".into(), "End them".into()),
+        [one] => (format!("End {}?", one), "Anything unsaved in it is lost.".into(), "End it".into()),
+        _ => (
+            format!("End {} apps?", names.len()),
+            format!("Anything unsaved in them is lost.\n{}.", and_list(names)),
+            "End them".into(),
+        ),
+    }
 }
 
 pub struct DoctorWindow {
@@ -620,11 +683,14 @@ pub struct DoctorWindow {
     anim: f32,
     items: Vec<Item>,
     menu_row: Option<usize>,
+    /// Where commands from rows go (the tray's dispatcher); a no-op by default.
+    commands: Box<dyn Fn(Command)>,
 }
 
 impl DoctorWindow {
     pub fn new(source: Box<dyn DoctorSource>) -> DoctorWindow {
         DoctorWindow {
+            commands: Box::new(|_| {}),
             source: Arc::new(Mutex::new(source)),
             model: None,
             confirm: None,
@@ -644,6 +710,12 @@ impl DoctorWindow {
             items: Vec::new(),
             menu_row: None,
         }
+    }
+
+    /// Send commands from rows ("Show me how") to `commands`.
+    pub fn with_commands(mut self, commands: Box<dyn Fn(Command)>) -> DoctorWindow {
+        self.commands = commands;
+        self
     }
 
     pub fn items(&self) -> &[Item] {
@@ -689,9 +761,25 @@ impl DoctorWindow {
         self.run(|s| Job::Scanned(s.scan(), s.can_undo()), host);
     }
 
-    /// CLEAN UP: run every checked row's picks. `End` only appears on explicitly checked
-    /// leftover rows (never pre-checked), so asking for it is the person's confirmation.
+    /// CLEAN UP: run every checked row's picks. Ending processes always needs a second,
+    /// explicit confirmation (docs/DESIGN.md), so when a checked row's pick is "End it" or
+    /// "End them" this only opens the in-window confirmation listing them; its "End them"
+    /// runs everything (`confirm_ok`), Cancel runs nothing.
     pub fn clean_up(&mut self, host: Option<&mut Host>) {
+        let Some(m) = self.model.as_ref() else { return };
+        if self.working || !m.any_checked() {
+            return;
+        }
+        let ending = m.ending_rows();
+        if !ending.is_empty() {
+            self.confirm = Some(Confirm::CleanUp(ending));
+            return;
+        }
+        self.run_clean_up(host);
+    }
+
+    /// Run every checked row's picks now (after any confirmation).
+    fn run_clean_up(&mut self, host: Option<&mut Host>) {
         let Some(m) = self.model.as_mut() else { return };
         if self.working || !m.any_checked() {
             return;
@@ -873,7 +961,11 @@ impl DoctorWindow {
         let st = &m.rows[i];
         let cb = c.s(20.0);
         let tx = x0 + cb + c.s(16.0);
-        let ctl_w = c.s(280.0).min((x1 - tx) / 2);
+        let mut ctl_w = c.s(280.0).min((x1 - tx) / 2);
+        if sec == SectionKind::ThisPc {
+            // Notes with at most a link: the text gets the room a pill would take.
+            ctl_w = help_link(f).map_or(0, |l| c.measure(l, F_HINT).0 + c.s(2.0)).min(ctl_w);
+        }
         let gap = c.s(16.0);
         let text_w = x1 - tx - ctl_w - gap;
         let gb = format_gb(f.ram_mb as f64 / 1024.0);
@@ -908,8 +1000,8 @@ impl DoctorWindow {
         } else if f.needs_admin {
             Right::Note(vec!["Needs an administrator".into()], MUTED, None)
         } else if f.kind == FindingKind::System {
-            match &f.help_url {
-                Some(_) => Right::Link("How to fix".into(), Act::HowToFix(i)),
+            match help_link(f) {
+                Some(label) => Right::Link(label.into(), Act::HowToFix(i)),
                 None => Right::Nothing,
             }
         } else {
@@ -1120,12 +1212,19 @@ impl DoctorWindow {
     }
 
     fn dialog(&self) -> Option<Dialog> {
-        let Confirm::End(i) = self.confirm.clone()?;
-        let app = self.model.as_ref()?.report.findings.get(i)?.title.clone();
+        let m = self.model.as_ref()?;
+        let (title, body, ok) = match self.confirm.as_ref()? {
+            Confirm::End(i) => confirm_words(&[m.report.findings.get(*i)?.title.clone()], false),
+            Confirm::CleanUp(rows) => {
+                let names: Vec<String> = rows.iter().filter_map(|&i| m.report.findings.get(i)).map(|f| f.title.clone()).collect();
+                let many = rows.len() == 1 && m.chosen(rows[0]).is_some_and(|c| c.label == "End them");
+                confirm_words(&names, many)
+            }
+        };
         Some(Dialog {
-            title: format!("End {}?", app),
-            body: "Anything unsaved in it is lost.".into(),
-            ok: Button::new("End it", ButtonStyle::Danger),
+            title,
+            body,
+            ok: Button::new(&ok, ButtonStyle::Danger),
             cancel: Button::new("Cancel", ButtonStyle::Normal),
         })
     }
@@ -1175,7 +1274,10 @@ impl DoctorWindow {
             }
             Act::EndAnyway(i) => self.confirm = Some(Confirm::End(i)),
             Act::HowToFix(i) => {
-                if let Some(url) = self.model.as_ref().and_then(|m| m.report.findings[i].help_url.clone()) {
+                let Some(f) = self.model.as_ref().and_then(|m| m.report.findings.get(i)) else { return };
+                if let Some(cmd) = f.help_command {
+                    (self.commands)(cmd);
+                } else if let Some(url) = f.help_url.clone() {
                     host.shell_open(&url);
                 }
             }
@@ -1206,8 +1308,10 @@ impl DoctorWindow {
     }
 
     fn confirm_ok(&mut self, host: &mut Host) {
-        if let Some(Confirm::End(i)) = self.confirm.take() {
-            self.end_anyway(i, Some(host));
+        match self.confirm.take() {
+            Some(Confirm::End(i)) => self.end_anyway(i, Some(host)),
+            Some(Confirm::CleanUp(_)) => self.run_clean_up(Some(host)),
+            None => {}
         }
     }
 }
@@ -1363,14 +1467,14 @@ impl Surface for DoctorWindow {
 }
 
 /// Open the checkup window (it scans right away), or bring the open one to the front.
-/// Call on the UI thread.
-pub fn open_doctor(source: Box<dyn DoctorSource>) -> HWND {
+/// Call on the UI thread. `commands` receives what rows ask for ("Show me how").
+pub fn open_doctor(source: Box<dyn DoctorSource>, commands: Box<dyn Fn(Command)>) -> HWND {
     if let Some(h) = window::find(KIND) {
         window::bring_to_front(h);
         return h;
     }
     let spec = WindowSpec { kind: KIND, title: TITLE.into(), size: (760, 720), min_size: (620, 480), placement: super::ui_state::load(KIND), resizable: true };
-    window::open(spec, Box::new(DoctorWindow::new(source)))
+    window::open(spec, Box::new(DoctorWindow::new(source).with_commands(commands)))
 }
 
 /// Paint the window at `w` (96-DPI px) wide and `h` high, or the whole page with `h == None`.
@@ -1527,6 +1631,149 @@ mod tests {
         w.activate(Act::Undo, &mut host);
         assert!(!w.can_undo);
         assert_eq!(w.model.as_ref().unwrap().rows.iter().filter(|r| !r.outcomes.is_empty()).count(), 0, "undo re-scans");
+    }
+
+    #[test]
+    fn ending_rows_need_a_pick_and_a_check() {
+        let mut m = model();
+        assert!(m.ending_rows().is_empty(), "nothing that ends processes starts checked");
+        let icue = idx(&m, "app:icue");
+        let orphans = idx(&m, "ue:orphans");
+        let end_it = choices(&m.report.findings[icue]).iter().position(|c| c.label == "End it").unwrap();
+        // Picked but not checked: nothing.
+        m.set_choice(icue, end_it);
+        assert!(m.ending_rows().is_empty());
+        m.toggle(icue);
+        assert_eq!(m.ending_rows(), vec![icue]);
+        m.toggle(orphans);
+        assert_eq!(m.ending_rows(), vec![icue, orphans], "leftover helpers count too");
+        // Back to "Close": only the helpers end.
+        m.set_choice(icue, 0);
+        assert_eq!(m.ending_rows(), vec![orphans]);
+    }
+
+    #[test]
+    fn confirmation_words() {
+        let n = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            confirm_words(&n(&["iCUE", "3 leftover Unreal helpers from a closed editor"]), false),
+            (
+                "End 2 apps?".to_string(),
+                "Anything unsaved in them is lost.\niCUE and 3 leftover Unreal helpers from a closed editor.".to_string(),
+                "End them".to_string()
+            )
+        );
+        assert_eq!(confirm_words(&n(&["A", "B", "C"]), false).1, "Anything unsaved in them is lost.\nA, B and C.");
+        assert_eq!(
+            confirm_words(&n(&["Spotify"]), false),
+            ("End Spotify?".to_string(), "Anything unsaved in it is lost.".to_string(), "End it".to_string())
+        );
+        assert_eq!(confirm_words(&n(&["3 leftover Unreal helpers"]), true).2, "End them");
+    }
+
+    #[test]
+    fn clean_up_asks_before_ending_anything() {
+        let mut w = DoctorWindow::new(Box::new(FakeDoctor::new()));
+        let mut host = Host::detached((760, 720), Scale(1.0));
+        w.scan(None);
+        let m = w.model.as_ref().unwrap();
+        let (icue, orphans, steam) = (idx(m, "app:icue"), idx(m, "ue:orphans"), idx(m, "app:steam"));
+        let end_it = choices(&m.report.findings[icue]).iter().position(|c| c.label == "End it").unwrap();
+        w.activate(Act::Check(icue), &mut host);
+        w.model.as_mut().unwrap().set_choice(icue, end_it);
+        w.activate(Act::Check(orphans), &mut host);
+
+        // CLEAN UP only asks: nothing runs, nothing changes.
+        w.activate(Act::CleanUp, &mut host);
+        assert_eq!(w.confirm, Some(Confirm::CleanUp(vec![icue, orphans])));
+        let d = w.dialog().unwrap();
+        assert_eq!(d.title, "End 2 apps?");
+        assert_eq!(d.body, "Anything unsaved in them is lost.\niCUE and 3 leftover Unreal helpers from a closed editor.");
+        assert_eq!((d.ok.label.as_str(), d.cancel.label.as_str()), ("End them", "Cancel"));
+        let m = w.model.as_ref().unwrap();
+        assert!(m.rows.iter().all(|r| r.outcomes.is_empty() && !r.busy), "nothing ran before the answer");
+        assert!(!w.can_undo);
+
+        // Cancel (Enter is Cancel, the focused default; Esc too): nothing ran, the picks stay.
+        w.event(Event::Key(VK_RETURN, Default::default()), &mut host);
+        assert_eq!(w.confirm, None);
+        let m = w.model.as_ref().unwrap();
+        assert!(m.rows.iter().all(|r| r.outcomes.is_empty()));
+        assert!(m.rows[icue].checked && m.rows[orphans].checked && m.rows[steam].checked);
+        w.activate(Act::CleanUp, &mut host);
+        w.event(Event::Key(VK_ESCAPE, Default::default()), &mut host);
+        assert_eq!(w.confirm, None);
+        assert!(w.model.as_ref().unwrap().rows.iter().all(|r| r.outcomes.is_empty()));
+
+        // "End them": everything checked runs, the ends included.
+        w.activate(Act::CleanUp, &mut host);
+        w.confirm_ok(&mut host);
+        assert_eq!(w.confirm, None);
+        let m = w.model.as_ref().unwrap();
+        assert_eq!(outcome_text(&m.rows[icue].outcomes).0, "Ended");
+        assert_eq!(outcome_text(&m.rows[orphans].outcomes).0, "Ended 3 helpers");
+        assert_eq!(outcome_text(&m.rows[steam].outcomes).0, "Closed");
+        assert!(w.can_undo);
+    }
+
+    #[test]
+    fn one_leftover_row_alone_still_asks() {
+        let mut w = DoctorWindow::new(Box::new(FakeDoctor::new()));
+        let mut host = Host::detached((760, 720), Scale(1.0));
+        w.scan(None);
+        let m = w.model.as_mut().unwrap();
+        for r in &mut m.rows {
+            r.checked = false;
+        }
+        let orphans = idx(m, "ue:orphans");
+        m.toggle(orphans);
+        w.activate(Act::CleanUp, &mut host);
+        assert_eq!(w.confirm, Some(Confirm::CleanUp(vec![orphans])));
+        let d = w.dialog().unwrap();
+        assert_eq!(d.title, "End 3 leftover Unreal helpers from a closed editor?");
+        assert_eq!(d.body, "Anything unsaved in them is lost.");
+        assert_eq!(d.ok.label, "End them");
+        // Clicking Cancel in the dialog.
+        let probe = Canvas::new(760, 720, Scale(1.0));
+        w.size = (760, 720);
+        let (_, ok, cancel) = d.layout(&probe, probe.bounds());
+        w.event(Event::MouseUp(Pt::new(cancel.cx(), cancel.cy()), MouseButton::Left), &mut host);
+        assert_eq!(w.confirm, None);
+        assert!(w.model.as_ref().unwrap().rows[orphans].outcomes.is_empty());
+        // Clicking "End them".
+        w.activate(Act::CleanUp, &mut host);
+        w.event(Event::MouseUp(Pt::new(ok.cx(), ok.cy()), MouseButton::Left), &mut host);
+        assert_eq!(outcome_text(&w.model.as_ref().unwrap().rows[orphans].outcomes).0, "Ended 3 helpers");
+    }
+
+    #[test]
+    fn this_pc_links() {
+        let sent: std::rc::Rc<std::cell::RefCell<Vec<Command>>> = Default::default();
+        let log = sent.clone();
+        let mut w = DoctorWindow::new(Box::new(FakeDoctor::new())).with_commands(Box::new(move |c| log.borrow_mut().push(c)));
+        let mut host = Host::detached((760, 720), Scale(1.0));
+        w.scan(None);
+        let c = Canvas::new(760, 3000, Scale(1.0));
+        w.layout(&c);
+        let m = w.model.clone().unwrap();
+        let ram = idx(&m, "sys:ram");
+        let page = idx(&m, "sys:pagefile");
+        assert_eq!(help_link(&m.report.findings[ram]), Some("Show me how"));
+        assert_eq!(help_link(&m.report.findings[page]), Some("How to fix"));
+        assert!(!m.selectable(ram) && !m.rows[ram].checked, "the RAM row is a note, never a pick");
+        let link = |w: &DoctorWindow, i: usize| {
+            w.items().iter().find(|it| it.act == Some(Act::HowToFix(i))).map(|it| it.paint.clone())
+        };
+        assert_eq!(link(&w, ram), Some(Paint::Link { label: "Show me how".into(), color: MUTED }));
+        // "Show me how" sends the command (the tray writes and opens the page); it opens nothing itself.
+        w.activate(Act::HowToFix(ram), &mut host);
+        assert_eq!(*sent.borrow(), vec![Command::ShowRamReport]);
+        assert!(host.shell_targets().is_empty());
+        // "How to fix" opens its page and sends nothing.
+        w.activate(Act::HowToFix(page), &mut host);
+        assert_eq!(sent.borrow().len(), 1);
+        assert_eq!(host.shell_targets().len(), 1);
+        assert!(host.shell_targets()[0].ends_with("PAGEFILE.md"));
     }
 
     fn check_layout(w: &mut DoctorWindow, scale: f32, width: i32, ctx: &str) {

@@ -25,6 +25,7 @@ preset = "balanced"
 notifications = true
 auto_prime = true
 prime_hotkey = "Ctrl+Alt+M"
+check_ram_speed = true
 
 [updates]
 check_automatically = true
@@ -121,6 +122,7 @@ preset = "balanced"
 # notifications = true          # toasts for pressure changes, updates and hints
 # auto_prime = true             # free RAM the moment a build or cook starts
 # prime_hotkey = "Ctrl+Alt+M"   # empty = no hotkey
+# check_ram_speed = true        # say once if the RAM runs below its rated speed (`memguard ram`)
 
 # [updates]
 # check_automatically = true
@@ -407,11 +409,13 @@ pub struct General {
     pub auto_prime: bool,
     /// Empty = no hotkey.
     pub prime_hotkey: String,
+    /// Check whether the RAM runs below its rated speed (the checkup row and a one-time toast).
+    pub check_ram_speed: bool,
 }
 
 impl Default for General {
     fn default() -> Self {
-        General { preset: Preset::Balanced, notifications: true, auto_prime: true, prime_hotkey: "Ctrl+Alt+M".into() }
+        General { preset: Preset::Balanced, notifications: true, auto_prime: true, prime_hotkey: "Ctrl+Alt+M".into(), check_ram_speed: true }
     }
 }
 
@@ -1253,6 +1257,8 @@ mod tests {
         assert!(!c.ue.worker_throttle);
         assert_eq!(c.general.preset, Preset::Balanced);
         assert!(c.general.auto_prime);
+        assert!(c.general.check_ram_speed);
+        assert!(General::default().check_ram_speed, "the struct default matches the built-in file");
         assert_eq!(c.history.keep_days, 7);
         assert_eq!(c.ue.editor_growth_alert_gb_per_hour, 6.0);
     }
@@ -1267,7 +1273,15 @@ mod tests {
         for f in V01_DEFAULTS {
             assert!(Config::parse(f).is_ok());
             assert!(config_from_layers(None, f).is_ok());
+            // 0.1 files never had the RAM check; it is on for them too.
+            assert!(config_from_layers(None, f).unwrap().0.general.check_ram_speed);
         }
+        // The template lists the RAM check, commented out; removing the # turns it off.
+        assert!(cfg.general.check_ram_speed);
+        assert!(DEFAULT_TOML.contains("# check_ram_speed = true"));
+        let off = DEFAULT_TOML.replace("# check_ram_speed = true", "check_ram_speed = false");
+        assert!(!config_from_layers(None, &off).unwrap().0.general.check_ram_speed);
+        assert!(config_from_layers(None, "[general]\ncheck_ram_speed = \"yes\"").is_err(), "it is a bool");
     }
 
     #[test]

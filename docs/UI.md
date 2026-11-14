@@ -95,7 +95,7 @@ Layout, top to bottom (see mockup):
 
 | Section | Rows |
 |---|---|
-| GENERAL | How hard to push other apps (segmented: Gentle / Balanced / Aggressive) · Free memory when a build or cook starts (toggle) · Run at Windows startup (toggle, registry not settings file) · Notifications (toggle) · Free memory now (hotkey field) |
+| GENERAL | How hard to push other apps (segmented: Gentle / Balanced / Aggressive) · Free memory when a build or cook starts (toggle) · Run at Windows startup (toggle, registry not settings file) · Notifications (toggle) · Free memory now (hotkey field) · Check memory speed (toggle, `general.check_ram_speed`) |
 | APP GROUPS | One card per group, then "Add a group" (button "Add group…") |
 | UNREAL | Never touched (chips) · Suggest restarting the editor above (GB) · Warn when the editor grows faster than (GB / hour) · Pause compile workers when memory is critical (toggle, danger hint) · Keep at least this many workers running (number, only visible when the toggle is on) |
 | MEMORY PRESSURE | "Memory is tight when RAM free drops below" (%) · "…or commit free drops below" (%) · "Memory is critical when RAM free drops below" (%) · "…or commit free drops below" (%). Each shows the GB it means on this PC as its unit text |
@@ -190,6 +190,8 @@ Catalogue (exact wording; `{}` are values):
 | Startup toggled | Info | Run at startup: On \| Off | | |
 | Settings problem | Error | There's a problem in your settings | {message} The last good settings are still in use. | Open file |
 | Setup copied | Info | Agent setup copied | Paste it into your agent's terminal. | |
+| About three minutes after start, the RAM runs below its rated speed; once per report `fingerprint` (`[tray] last_ram_fingerprint` in ui-state.toml); never with notifications or `general.check_ram_speed` off | Warning | Your RAM is running below its rated speed | {current} MHz now, rated {rated} MHz. Turning on {XMP\|EXPO} in the BIOS takes about five minutes. | Show me how |
+| Same, but the RAM check found another problem (old Intel microcode, both sticks on one channel) and the speed is fine | Warning | {the finding's title} | {the finding's detail} | Show me how |
 
 Pressure going from normal to tight shows no toast (the icon dot and flyout carry it).
 
@@ -292,7 +294,7 @@ downsampled to at most 1500 points).
 | WORTH A LOOK | verdict `review` | Unchecked · app name, company, "X GB" · pill: "Close" / "Hold back" / "Leave it" (Leave it adds it to `[doctor] keep`) |
 | HELD BACK, NOT CLOSED | `hold_back` apps not yet in a group | Checked · "Hold back" (adds the app to the matching group) |
 | UNREAL | leftovers | "3 leftover Unreal helpers from a closed editor · 1.2 GB" · "End them" |
-| THIS PC | system | Text rows, each with a link: "The page file is small for this much RAM." → "How to fix" |
+| THIS PC | system | Text rows, each with a link: "The page file is small for this much RAM." → "How to fix". The RAM check's rows (`sys:ram`: the report's headline over its summary, and `sys:ram:<what>` for each problem such as old Intel microcode; only with `general.check_ram_speed` on) → "Show me how", which writes `ram-report.html` to the data folder and opens it in the browser (`Command::ShowRamReport`) |
 
 - Rows whose finding is `recommended` start checked. The footer shows the running total of
   what is checked, "Selected: frees about {x} GB", on the left; on the right the primary
@@ -302,6 +304,12 @@ downsampled to at most 1500 points).
   "Closed", "Still open — it may be asking you to save", "Switched off", "Added to
   Browsers". An app that stayed open gets a red link "End it anyway", which asks first:
   "End {app}? Anything unsaved in it is lost." buttons "End it" / "Cancel".
+- **Ending always asks.** When any checked row's pick ends processes ("End it" on a
+  background app, "End them" on Unreal leftovers), CLEAN UP first shows the in-window
+  confirmation listing them: "End {n} apps?" · "Anything unsaved in them is lost." and the
+  names · buttons "End them" / "Cancel" (Cancel is the focused default; Enter and Esc
+  cancel). Nothing runs until "End them"; Cancel leaves the picks as they were. A single
+  app reads "End {app}? Anything unsaved in it is lost." with "End it".
 - Nothing in this window changes anything without a visible checkbox and the CLEAN UP click.
 
 Toasts added to the catalogue:
@@ -312,8 +320,9 @@ Toasts added to the catalogue:
 | Cleanup finished | Info | Checkup done | Freed about {x} GB. {n} apps won't start with Windows any more. | Undo |
 | A `close_while_unreal` app was closed | Info | Closed {app} | It's on your list to stay closed while Unreal is running. | Allow this time |
 
-`Command` gains `OpenDoctor` and `UndoDoctor`. Snapshots: `doctor.png`, `doctor-clear.png`,
-`doctor-results.png`.
+`Command` gains `OpenDoctor` and `UndoDoctor` (and `ShowRamReport` for the RAM check).
+Snapshots: `doctor.png`, `doctor-clear.png`, `doctor-results.png`, `doctor-confirm.png`,
+`doctor-confirm-end.png`.
 
 ## Accessibility and robustness
 

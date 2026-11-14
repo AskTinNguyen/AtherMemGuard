@@ -818,6 +818,39 @@ pub mod catalog {
         keyed(toast(ToastKind::Error, "Couldn't save that setting".into(), message.to_string()), "save")
     }
 
+    /// The RAM runs below its rated speed (docs/RAMCHECK.md, "For the integrator"). `profile`
+    /// is the kit's fast profile, "XMP" or "EXPO".
+    pub fn ram_below_rated(current_mhz: u32, rated_mhz: u32, profile: &str) -> Toast {
+        let profile = match profile {
+            "XMP" | "EXPO" => profile,
+            _ => "XMP or EXPO",
+        };
+        keyed(
+            with(
+                toast(
+                    ToastKind::Warning,
+                    "Your RAM is running below its rated speed".into(),
+                    format!("{} MHz now, rated {} MHz. Turning on {} in the BIOS takes about five minutes.", current_mhz, rated_mhz, profile),
+                ),
+                "Show me how",
+                Command::ShowRamReport,
+            ),
+            "ram",
+        )
+    }
+
+    /// The RAM check found a problem other than the speed (old Intel microcode, both sticks on
+    /// one channel): its own title and detail.
+    pub fn ram_problem(title: &str, detail: &str) -> Toast {
+        keyed(with(toast(ToastKind::Warning, title.trim().to_string(), detail.trim().to_string()), "Show me how", Command::ShowRamReport), "ram")
+    }
+
+    /// "Show me how" couldn't write the RAM report page. Not in the catalogue table: the person
+    /// just clicked and needs an answer.
+    pub fn ram_report_failed(message: &str) -> Toast {
+        keyed(toast(ToastKind::Error, "Couldn't open the RAM report".into(), message.to_string()), "ram")
+    }
+
     /// "Steam, Spotify and Blender"
     fn and_list(names: &[String]) -> String {
         match names {
@@ -902,6 +935,14 @@ pub mod catalog {
             ("checkup-done", checkup_done(3.2, 2)),
             ("guard-closed", guard_closed("Steam")),
             ("checkup-undone", checkup_undone(&[])),
+            ("ram-speed", ram_below_rated(4800, 6000, "EXPO")),
+            (
+                "ram-problem",
+                ram_problem(
+                    "Update the BIOS before changing memory settings",
+                    "This CPU runs microcode 0x129. Versions before 0x12B can slowly damage 13th and 14th gen Core CPUs. Install the newest BIOS from the board maker first; it carries the fix.",
+                ),
+            ),
         ]
     }
 }
@@ -1024,6 +1065,19 @@ mod tests {
         let g = catalog::guard_closed("Steam");
         assert_eq!((g.title.as_str(), g.body.as_str()), ("Closed Steam", "It's on your list to stay closed while Unreal is running."));
         assert_eq!(g.actions, vec![("Allow this time".to_string(), Command::AllowGuarded)]);
+
+        // docs/RAMCHECK.md, "For the integrator".
+        let r = catalog::ram_below_rated(4800, 6000, "EXPO");
+        assert_eq!(r.kind, ToastKind::Warning);
+        assert_eq!(r.title, "Your RAM is running below its rated speed");
+        assert_eq!(r.body, "4800 MHz now, rated 6000 MHz. Turning on EXPO in the BIOS takes about five minutes.");
+        assert_eq!(r.actions, vec![("Show me how".to_string(), Command::ShowRamReport)]);
+        assert_eq!(catalog::ram_below_rated(2133, 3600, "XMP").body, "2133 MHz now, rated 3600 MHz. Turning on XMP in the BIOS takes about five minutes.");
+        assert!(catalog::ram_below_rated(4800, 6000, "JEDEC").body.contains("Turning on XMP or EXPO in the BIOS"));
+        let p = catalog::ram_problem("Update the BIOS first", "Old microcode.");
+        assert_eq!((p.kind, p.title.as_str(), p.body.as_str()), (ToastKind::Warning, "Update the BIOS first", "Old microcode."));
+        assert_eq!(p.actions, r.actions, "same action as the checkup link");
+        assert_eq!(p.key, r.key);
     }
 
     #[test]

@@ -549,7 +549,52 @@ pub struct ScanInput {
 pub fn scan(cfg: &Config) -> Report {
     let ds = DoctorSettings::load();
     let input = gather(cfg);
-    build_report(cfg, &ds, &input, &mut describe_pid)
+    let mut report = build_report(cfg, &ds, &input, &mut describe_pid);
+    // The RAM check reads firmware tables, so it runs once per process (`check_cached`).
+    // Only reading here: the "Show me how" page is written when the person clicks it.
+    add_ram_findings(&mut report, cfg.general.check_ram_speed, crate::ramcheck::check_cached);
+    report
+}
+
+/// Is this a THIS PC row from the RAM and BIOS check?
+pub fn is_ram_finding(id: &str) -> bool {
+    id == "sys:ram" || id.starts_with("sys:ram:")
+}
+
+/// Append the RAM check's THIS PC rows when `on` (`general.check_ram_speed`). `ram` is only
+/// called when it is on. System rows sort last, so appending keeps the section order.
+pub fn add_ram_findings<'a>(report: &mut Report, on: bool, ram: impl FnOnce() -> &'a crate::ramcheck::RamReport) {
+    if on {
+        report.findings.extend(ram_findings(ram()));
+    }
+}
+
+/// THIS PC rows from the RAM and BIOS check (`ramcheck`). Pure. When the memory runs below its
+/// rated speed: `sys:ram`, the report's headline over its summary. Every other finding the
+/// check calls a problem (old Intel microcode, both sticks on one channel) gets its own
+/// `sys:ram:<what>` row, also when the speed is fine. Nothing when nothing needs attention.
+pub fn ram_findings(r: &crate::ramcheck::RamReport) -> Vec<Finding> {
+    use crate::ramcheck::{needs_attention, Severity, Verdict as RamVerdict};
+    let mut out = Vec::new();
+    if !needs_attention(r) {
+        return out;
+    }
+    let row = |id: String, title: &str, detail: &str| {
+        // The report's "the steps below" points at steps this row doesn't show; its link does.
+        let detail = detail.replace(" The steps below say how.", "").trim().to_string();
+        Finding::new(id, FindingKind::System, Verdict::Review, title.trim().to_string(), detail)
+    };
+    if r.verdict == RamVerdict::BelowRated {
+        out.push(row("sys:ram".into(), &r.headline, &r.summary));
+    }
+    for f in r.findings.iter().filter(|f| f.severity == Severity::Problem && f.id != "ram:speed") {
+        let what = slug(f.id.strip_prefix("ram:").unwrap_or(&f.id));
+        let id = format!("sys:ram:{}", what);
+        if !out.iter().any(|o: &Finding| o.id == id) {
+            out.push(row(id, &f.title, &f.detail));
+        }
+    }
+    out
 }
 
 fn describe_pid(pid: u32) -> Option<(String, String)> {
@@ -2527,5 +2572,74 @@ mod tests {
         assert!(ev.is_empty(), "{:?}", ev);
         let mut g = Guard::new(vec![]);
         assert!(g.on_tick(&[proc(10, 1, "Spotify", 1)], true).is_empty());
+    }
+
+    fn ram_report(verdict: crate::ramcheck::Verdict, problems: &[(&str, &str, &str)]) -> crate::ramcheck::RamReport {
+        use crate::ramcheck::{RamFinding, RamReport, Severity};
+        let mut findings: Vec<RamFinding> = problems
+            .iter()
+            .map(|(id, title, detail)| RamFinding { id: id.to_string(), severity: Severity::Problem, title: title.to_string(), detail: detail.to_string() })
+            .collect();
+        findings.push(RamFinding { id: "ram:bios".into(), severity: Severity::Caution, title: "BIOS may be out of date".into(), detail: String::new() });
+        RamReport {
+            verdict,
+            headline: "Your RAM is running at 4800 MHz. The kit is rated for 6000 MHz.".into(),
+            summary: "The kit's fast profile (EXPO) looks switched off in the BIOS. Turning it on takes about five minutes. The steps below say how.".into(),
+            sticks: Vec::new(),
+            slots_total: 4,
+            rated: None,
+            current_mhz: Some(4800),
+            current_voltage: None,
+            board: Default::default(),
+            cpu: Default::default(),
+            findings,
+            steps: Vec::new(),
+            fallback_mhz: None,
+            fingerprint: "f1".into(),
+        }
+    }
+
+    #[test]
+    fn ram_check_rows_in_this_pc() {
+        use crate::ramcheck::Verdict as V;
+        // Below rated: one row, the headline over the summary, information only.
+        let below = ram_report(V::BelowRated, &[("ram:speed", "Your RAM is running below its rated speed", "4800 MHz now.")]);
+        let rows = ram_findings(&below);
+        assert_eq!(rows.len(), 1, "ram:speed is the sys:ram row itself, cautions don't show");
+        let f = &rows[0];
+        assert_eq!((f.id.as_str(), f.kind, f.verdict), ("sys:ram", FindingKind::System, Verdict::Review));
+        assert_eq!(f.title, below.headline);
+        assert_eq!(f.detail, "The kit's fast profile (EXPO) looks switched off in the BIOS. Turning it on takes about five minutes.");
+        assert!(f.actions.is_empty() && !f.recommended && f.ram_mb == 0);
+        assert!(is_ram_finding(&f.id));
+
+        // Speed fine, but old Intel microcode: its own row, with its own words.
+        let micro = ram_report(V::AtRated, &[("ram:microcode", "Update the BIOS before changing memory settings", "This CPU runs microcode 0x129.")]);
+        let rows = ram_findings(&micro);
+        assert_eq!(rows.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["sys:ram:microcode"]);
+        assert_eq!(rows[0].title, "Update the BIOS before changing memory settings");
+        assert_eq!(rows[0].detail, "This CPU runs microcode 0x129.");
+        assert!(is_ram_finding("sys:ram:microcode") && !is_ram_finding("sys:rampage") && !is_ram_finding("sys:pagefile"));
+
+        // Both: the speed row first, then the problem.
+        let both = ram_report(V::BelowRated, &[("ram:speed", "x", "y"), ("ram:slots", "Both sticks are on the same memory channel", "Move them.")]);
+        assert_eq!(ram_findings(&both).iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["sys:ram", "sys:ram:slots"]);
+
+        // Nothing to act on: no rows (cautions and other verdicts stay in `memguard ram`).
+        for v in [V::AtRated, V::NoProfile, V::MixedKit, V::Unknown, V::NotApplicable] {
+            assert!(ram_findings(&ram_report(v, &[])).is_empty(), "{:?}", v);
+        }
+
+        // Added to the report's THIS PC rows only when the setting is on, and the check isn't
+        // even run when it is off.
+        let inp = input(vec![proc(10, 1, "steam", 900)]);
+        let mut r = report(&inp, &DoctorSettings::default());
+        assert!(r.findings.iter().all(|f| !is_ram_finding(&f.id)), "build_report doesn't run the check");
+        add_ram_findings(&mut r, false, || -> &crate::ramcheck::RamReport { panic!("the RAM check runs only when it is on") });
+        assert!(r.finding("sys:ram").is_none());
+        let reclaim = (r.reclaimable_ram_gb, r.reclaimable_commit_gb);
+        add_ram_findings(&mut r, true, || &below);
+        assert_eq!(r.findings.last().unwrap().id, "sys:ram", "system rows come last");
+        assert_eq!((r.reclaimable_ram_gb, r.reclaimable_commit_gb), reclaim, "frees nothing");
     }
 }
