@@ -505,6 +505,45 @@ pub(crate) mod tests {
         RealStore::with_parts(131_072, Startup { get: fake_get, set: fake_set }, fake_procs)
     }
 
+    /// The checkup writes a `[doctor]` table into settings.toml; the store and the settings
+    /// window must read past it, and edits must keep it.
+    #[test]
+    fn doctor_table_from_the_checkup_is_kept() {
+        let _g = data_dir_lock();
+        let dir = temp_data_dir("doctor");
+        let file = dir.join("settings.toml");
+        let text = format!("{}\n[doctor]\nkeep = [\"x\"]\nclose_while_unreal = [\"y\"]\n", crate::config::DEFAULT_TOML);
+        fs::write(&file, &text).unwrap();
+        crate::config::load_layered().expect("the engine loads it");
+
+        let mut s = store();
+        assert_eq!(s.get("general.preset").unwrap().value, Value::Text("balanced".into()));
+        let groups_before = s.groups().len();
+        assert!(groups_before > 0 && !s.groups().iter().any(|g| g.name.eq_ignore_ascii_case("doctor")));
+        s.set("history.keep_days", Value::Int(30)).unwrap();
+        s.set("general.notifications", Value::Bool(false)).unwrap();
+        assert_eq!(s.get("history.keep_days").unwrap().value, Value::Int(30));
+        assert_eq!(s.groups().len(), groups_before);
+
+        let after = fs::read_to_string(&file).unwrap();
+        assert!(after.contains("keep_days = 30"));
+        let ds = crate::doctor::DoctorSettings::load();
+        assert_eq!((ds.keep, ds.close_while_unreal), (vec!["x".to_string()], vec!["y".to_string()]), "{}", after);
+
+        // The settings window opens and paints on it.
+        let mut w = crate::ui::settings::SettingsWindow::new(crate::ui::settings::SettingsHost {
+            store: Box::new(store()),
+            status: Box::new(crate::ui::status_source::FakeStatus::default()),
+            commands: Box::new(|_| {}),
+            app_version: "0.2.0".into(),
+            update_state: Box::new(|| crate::ui::settings::UpdateState::Unknown),
+        });
+        let c = crate::ui::snapshots::render_settings(&mut w, crate::ui::theme::Scale(1.0), 900, Some(760));
+        assert_eq!(c.width(), 900);
+        w.set_query("keep");
+        crate::ui::snapshots::render_settings(&mut w, crate::ui::theme::Scale(1.0), 900, Some(760));
+    }
+
     #[test]
     fn get_set_reset_and_layers() {
         let _g = data_dir_lock();
