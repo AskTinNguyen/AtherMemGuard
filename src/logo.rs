@@ -194,9 +194,43 @@ pub fn render(size: usize, level: Level) -> Vec<u8> {
     out
 }
 
+/// Opacity of the mark while Ather MemGuard is paused (docs/UI.md section 3).
+pub const PAUSED_OPACITY: f32 = 0.45;
+
+/// The paused look: the mark at 45% opacity; the status dot (where `level` has one) stays
+/// fully opaque so pressure still reads.
+pub fn render_paused(size: usize, level: Level) -> Vec<u8> {
+    let plain = render(size, Level::Normal);
+    let dotted = if level == Level::Normal { plain.clone() } else { render(size, level) };
+    paused_pixels(&plain, &dotted)
+}
+
+/// Pure part of `render_paused`: pixels that differ between the plain and the dotted mark
+/// belong to the dot and are kept; everything else is faded.
+fn paused_pixels(plain: &[u8], dotted: &[u8]) -> Vec<u8> {
+    let mut out = plain.to_vec();
+    for (i, px) in out.chunks_exact_mut(4).enumerate() {
+        let d = &dotted[i * 4..i * 4 + 4];
+        if d != &plain[i * 4..i * 4 + 4] {
+            px.copy_from_slice(d);
+        } else {
+            px[3] = (px[3] as f32 * PAUSED_OPACITY).round() as u8;
+        }
+    }
+    out
+}
+
 /// An icon handle for the tray. The caller destroys it with DestroyIcon.
 pub fn create_icon(size: usize, level: Level) -> HICON {
-    let pixels = render(size, level);
+    icon_from_pixels(size, &render(size, level))
+}
+
+/// The tray icon with the paused look (`render_paused`).
+pub fn create_paused_icon(size: usize, level: Level) -> HICON {
+    icon_from_pixels(size, &render_paused(size, level))
+}
+
+fn icon_from_pixels(size: usize, pixels: &[u8]) -> HICON {
     unsafe {
         let colour = CreateBitmap(size as i32, size as i32, 1, 32, pixels.as_ptr() as *const _);
         let mask_bits = vec![0u8; size.div_ceil(16) * 2 * size];
@@ -247,4 +281,18 @@ pub fn write_ico(path: &std::path::Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     std::fs::write(path, file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paused_fades_the_mark_and_keeps_the_dot() {
+        let plain = vec![10, 20, 30, 200, 1, 2, 3, 0];
+        let dotted = vec![10, 20, 30, 200, 9, 9, 9, 255];
+        let out = paused_pixels(&plain, &dotted);
+        assert_eq!(&out[..4], &[10, 20, 30, 90]);
+        assert_eq!(&out[4..], &[9, 9, 9, 255]);
+    }
 }

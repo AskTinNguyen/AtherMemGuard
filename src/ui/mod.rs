@@ -17,3 +17,5 @@ pub mod settings_model;
 pub mod settings;
 pub mod ui_state;
 pub mod snapshots;
+pub mod flyout;
+pub mod real_store;

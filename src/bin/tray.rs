@@ -16,6 +16,8 @@ enum Command {
     Uninstall,
     /// Silent install for scripts.
     Install { add_to_path: bool, start: bool },
+    /// Paint every UI surface with sample data into PNG files (docs/UI.md, for review).
+    UiSnapshots(String),
     /// Anything else: say so in the log and do nothing.
     Unknown(String),
 }
@@ -29,6 +31,10 @@ fn parse_args(args: &[String]) -> Command {
             _ => Command::Unknown(args.join(" ")),
         },
         "--uninstall" if rest.is_empty() => Command::Uninstall,
+        "--ui-snapshots" => match rest {
+            [dir] => Command::UiSnapshots(dir.clone()),
+            _ => Command::Unknown(args.join(" ")),
+        },
         "--install" => {
             let (mut add_to_path, mut start) = (true, true);
             for a in rest {
@@ -62,14 +68,15 @@ fn main() {
                 tray::run();
                 0
             }
-            // The branded setup window plugs in here later; until then install right away.
+            // INTEGRATION: open E2's setup window (src/ui/setup.rs) here; until then install right away.
             LaunchMode::Setup => run_install(true, true),
         },
         Command::AfterUpdate(pid) => {
             updater::finish_update(pid);
-            tray::run();
+            tray::run_after_update();
             0
         }
+        // INTEGRATION: E2's setup window has an "UNINSTALL?" state for this; until then uninstall right away.
         Command::Uninstall => match install::uninstall() {
             Ok(()) => 0,
             Err(e) => {
@@ -78,6 +85,24 @@ fn main() {
             }
         },
         Command::Install { add_to_path, start } => run_install(add_to_path, start),
+        Command::UiSnapshots(dir) => {
+            let dir = std::path::Path::new(&dir);
+            // INTEGRATION: drop the flyout call once ui::snapshots::write_all includes it.
+            let result = athermemguard::ui::snapshots::write_all(dir).and_then(|mut a| {
+                a.extend(athermemguard::ui::flyout::snapshots(dir)?);
+                Ok(a)
+            });
+            match result {
+                Ok(files) => {
+                    log::write(&format!("wrote {} UI snapshots to {}", files.len(), dir.display()));
+                    0
+                }
+                Err(e) => {
+                    log::write(&format!("UI snapshots failed: {}", e));
+                    1
+                }
+            }
+        }
         Command::Unknown(a) => {
             log::write(&format!("AtherMemGuard.exe didn't understand \"{}\"; use memguard.exe for commands", a));
             2
@@ -104,6 +129,7 @@ mod tests {
         assert_eq!(p(&["--install", "--no-path"]), Command::Install { add_to_path: false, start: true });
         assert_eq!(p(&["--install", "--no-start"]), Command::Install { add_to_path: true, start: false });
         assert_eq!(p(&["--install", "--no-start", "--no-path"]), Command::Install { add_to_path: false, start: false });
+        assert_eq!(p(&["--ui-snapshots", r"C:\shots"]), Command::UiSnapshots(r"C:\shots".into()));
     }
 
     #[test]
@@ -114,6 +140,8 @@ mod tests {
             &["--after-update", "-1"],
             &["--after-update", "1", "2"],
             &["--uninstall", "now"],
+            &["--ui-snapshots"],
+            &["--ui-snapshots", "a", "b"],
             &["--install", "--add-to-path"],
             &["status"],
             &["--no-path"],
