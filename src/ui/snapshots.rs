@@ -1,0 +1,85 @@
+//! Paint every Part D surface off-screen with fixed sample data and save PNGs for review.
+//! `cargo run --example ui_snapshots -- <dir>`. Nothing here reads the live machine or
+//! writes settings: the data is `FakeStore` + `sample_status()`.
+
+use std::path::{Path, PathBuf};
+
+use super::canvas::Canvas;
+use super::settings::{SettingsHost, SettingsWindow};
+use super::settings_model::UpdateState;
+use super::settings_store::FakeStore;
+use super::status_source::FakeStatus;
+use super::theme::Scale;
+use super::toast;
+use super::window::Surface;
+
+/// A settings window over the mockup's data.
+pub fn sample_settings() -> SettingsWindow {
+    SettingsWindow::new(sample_host())
+}
+
+pub fn sample_host() -> SettingsHost {
+    SettingsHost {
+        store: Box::new(FakeStore::mockup()),
+        status: Box::new(FakeStatus::default()),
+        commands: Box::new(|_| {}),
+        app_version: "0.2.0".into(),
+        update_state: Box::new(|| UpdateState::UpToDate { checked: "today at 14:02".into() }),
+    }
+}
+
+/// Paint the settings window at `width` x `height` (96-DPI px) or, with `height == None`,
+/// the whole page in one tall image.
+pub fn render_settings(w: &mut SettingsWindow, scale: Scale, width: i32, height: Option<i32>) -> Canvas {
+    let pw = scale.s(width as f32);
+    let ph = match height {
+        Some(h) => scale.s(h as f32),
+        None => {
+            let probe = Canvas::new(pw, scale.s(760.0), scale);
+            w.page_height(&probe)
+        }
+    };
+    let mut c = Canvas::new(pw, ph, scale);
+    w.paint(&mut c);
+    c
+}
+
+/// Write every snapshot into `dir` at 100% and 150%; returns the files written.
+pub fn write_all(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+    let mut out = Vec::new();
+    for (scale, suffix) in [(Scale(1.0), ""), (Scale(1.5), "@1.5x")] {
+        let mut save = |name: &str, c: &Canvas| -> Result<(), String> {
+            let p = dir.join(format!("{}{}.png", name, suffix));
+            c.save_png(&p)?;
+            out.push(p);
+            Ok(())
+        };
+        // The whole page, groups closed.
+        let mut w = sample_settings();
+        save("settings", &render_settings(&mut w, scale, 900, None))?;
+        // The window as it opens (900 x 760).
+        let mut w = sample_settings();
+        save("settings-window", &render_settings(&mut w, scale, 900, Some(760)))?;
+        // Browsers open, as in the mockup.
+        let mut w = sample_settings();
+        w.set_open_group(Some("Browsers"));
+        save("settings-group-open", &render_settings(&mut w, scale, 900, None))?;
+        // Searching.
+        let mut w = sample_settings();
+        w.set_query("cap");
+        save("settings-search", &render_settings(&mut w, scale, 900, Some(760)))?;
+        // The hard-cap confirmation over the window.
+        let mut w = sample_settings();
+        w.set_open_group(Some("Browsers"));
+        w.confirm_hard_cap("Browsers", 4096.0);
+        save("settings-confirm", &render_settings(&mut w, scale, 900, Some(760)))?;
+        // Minimum size.
+        let mut w = sample_settings();
+        save("settings-min", &render_settings(&mut w, scale, 720, Some(480)))?;
+        for (name, t) in toast::catalog::samples() {
+            save(&format!("toast-{}", name), &toast::render(&t, scale))?;
+        }
+    }
+    Ok(out)
+}

@@ -21,6 +21,7 @@ pub mod net;
 pub mod ops;
 pub mod paths;
 pub mod tray;
+pub mod ui;
 pub mod updater;
 pub mod win;
 
