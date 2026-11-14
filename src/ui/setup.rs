@@ -523,15 +523,6 @@ pub(crate) fn paint_link(c: &mut Canvas, r: Rect, label: &str, font: Font, color
     }
 }
 
-/// Eyebrow over a display headline, starting at (x, y). Returns the height used.
-pub(crate) fn paint_title(c: &mut Canvas, x: i32, y: i32, w: i32, eyebrow: &str, headline: &str, headline_font: Font) -> i32 {
-    let eh = c.line_height(F_EYEBROW);
-    c.spaced_text(Rect::new(x, y, w, eh), eyebrow, F_EYEBROW, MUTED, c.s(3.0), Align::Left);
-    let hh = c.line_height(headline_font);
-    c.text(Rect::new(x, y + eh + c.s(4.0), w, hh), headline, headline_font, TEXT, Align::Left);
-    eh + c.s(4.0) + hh
-}
-
 // ---------------------------------------------------------------- the window
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

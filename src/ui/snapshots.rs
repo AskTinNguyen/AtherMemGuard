@@ -14,6 +14,7 @@ use super::toast;
 use super::setup::{self, FakeBackend, Input, SetupMode, SetupWindow};
 use super::history::{self, FakeHistory, HistoryWindow, Range};
 use super::geom::Pt;
+use super::doctor::{self, DoctorWindow, FakeDoctor};
 use super::window::Surface;
 
 /// A settings window over the mockup's data.
@@ -105,6 +106,26 @@ pub fn write_all(dir: &Path) -> Result<Vec<PathBuf>, String> {
             }
             save(name, &history::render(&mut w, scale, 960, 600))?;
         }
+        // Checkup: the whole report, all clear, after a cleanup (Spotify stayed open), and the
+        // "End it anyway" confirmation.
+        let mut d = DoctorWindow::new(Box::new(FakeDoctor::new()));
+        d.scan(None);
+        save("doctor", &doctor::render(&mut d, scale, 760, None))?;
+        let mut d = DoctorWindow::new(Box::new(FakeDoctor::all_clear()));
+        d.scan(None);
+        save("doctor-clear", &doctor::render(&mut d, scale, 760, Some(720)))?;
+        let mut d = DoctorWindow::new(Box::new(FakeDoctor::new()));
+        d.scan(None);
+        if let Some(m) = d.model.as_mut() {
+            let spotify = m.report.findings.iter().position(|f| f.id == "app:spotify").unwrap_or(0);
+            m.toggle(spotify);
+        }
+        d.clean_up(None);
+        save("doctor-results", &doctor::render(&mut d, scale, 760, None))?;
+        if let Some(i) = d.model.as_ref().and_then(|m| (0..m.rows.len()).find(|&i| m.still_open(i))) {
+            d.confirm = Some(doctor::Confirm::End(i));
+        }
+        save("doctor-confirm", &doctor::render(&mut d, scale, 760, Some(720)))?;
     }
     Ok(out)
 }

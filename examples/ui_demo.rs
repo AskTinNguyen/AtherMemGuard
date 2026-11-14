@@ -48,6 +48,14 @@ unsafe extern "system" fn close(_: HWND, _: u32, id: usize, _: u32) {
     PostMessageW(hwnd, WM_CLOSE, 0, 0);
 }
 
+/// `--close-after <seconds>` for the E2 windows: close `hwnd` (capturing it first with --capture).
+fn close_later(hwnd: HWND, secs: Option<String>) {
+    SETTINGS.with(|s| s.set(hwnd as isize));
+    if let Some(secs) = secs.and_then(|s| s.parse::<u32>().ok()) {
+        unsafe { SetTimer(std::ptr::null_mut(), 0, secs * 1000, Some(close)) };
+    }
+}
+
 fn main() {
     if std::env::var_os("ATHER_MEMGUARD_DIR").is_none() {
         std::env::set_var("ATHER_MEMGUARD_DIR", std::env::temp_dir().join("AtherMemGuard-ui-demo"));
@@ -55,6 +63,37 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     CAPTURE.with(|c| *c.borrow_mut() = arg("--capture").map(PathBuf::from));
+
+    // Part E2 windows, each on its fake (nothing here installs, reads history or touches a process):
+    //   --setup [--installed <ver>] [--uninstall] [--fail]   --history [--empty]   --doctor [--clear]
+    let has = |name: &str| args.iter().any(|a| a == name);
+    if has("--setup") {
+        use athermemguard::ui::setup::{run_setup_with_version, FakeBackend, SetupMode};
+        let mut fake = FakeBackend::new(arg("--installed").as_deref()).with_delay(std::time::Duration::from_secs(2));
+        if has("--fail") {
+            fake = fake.failing("Couldn't write the install folder (Access is denied).");
+        }
+        let mode = if has("--uninstall") { SetupMode::Uninstall } else { SetupMode::Install };
+        let code = run_setup_with_version(Box::new(fake), mode, "0.2.0");
+        println!("setup exit code: {}", code);
+        return;
+    }
+    if has("--history") {
+        use athermemguard::ui::history::{open_history, FakeHistory};
+        let src = if has("--empty") { FakeHistory::empty() } else { FakeHistory::mockup() };
+        let hwnd = open_history(Box::new(src));
+        close_later(hwnd, arg("--close-after"));
+        window::run_until_closed(hwnd);
+        return;
+    }
+    if has("--doctor") {
+        use athermemguard::ui::doctor::{open_doctor, FakeDoctor};
+        let src = if has("--clear") { FakeDoctor::all_clear() } else { FakeDoctor::new() };
+        let hwnd = open_doctor(Box::new(src.with_delay(std::time::Duration::from_millis(1200))));
+        close_later(hwnd, arg("--close-after"));
+        window::run_until_closed(hwnd);
+        return;
+    }
 
     toast::set_command_handler(Box::new(|c: Command| println!("toast command: {:?}", c)));
     let hwnd = open_settings(SettingsHost {
