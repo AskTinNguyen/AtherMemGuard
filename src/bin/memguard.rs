@@ -314,6 +314,13 @@ enum Cmd {
         #[arg(long, value_name = "FILE")]
         html: Option<std::path::PathBuf>,
     },
+
+    /// Which drivers and Windows processes hold the 'Windows and drivers' memory
+    Drivers {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn load_config() -> Config {
@@ -666,6 +673,16 @@ fn main() -> ExitCode {
 
         // ---- Part G: RAM and BIOS check
         Cmd::Ram { json, html } => run_ram(json, html),
+
+        Cmd::Drivers { json } => {
+            let report = athermemguard::drivers::report();
+            if json {
+                print_json(&report);
+            } else {
+                print!("{}", athermemguard::drivers::render_text(&report));
+            }
+            ExitCode::SUCCESS
+        }
     }
 }
 

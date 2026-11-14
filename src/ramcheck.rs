@@ -10,6 +10,7 @@
 //! Knowledge (part-number rules, voltages, board menus, CPU cautions) lives in
 //! `ramcheck_data.toml` so it can grow without code changes.
 
+use crate::report_page::{esc, esc_rich, page};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -1467,36 +1468,6 @@ pub fn render_text(r: &RamReport) -> String {
     o
 }
 
-fn esc(s: &str) -> String {
-    let mut o = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => o.push_str("&amp;"),
-            '<' => o.push_str("&lt;"),
-            '>' => o.push_str("&gt;"),
-            '"' => o.push_str("&quot;"),
-            '\'' => o.push_str("&#39;"),
-            c if c.is_control() => {}
-            c => o.push(c),
-        }
-    }
-    o
-}
-
-/// Escape, then show `backticks` as code.
-fn esc_rich(s: &str) -> String {
-    let e = esc(s);
-    let mut o = String::new();
-    for (i, part) in e.split('`').enumerate() {
-        if i % 2 == 1 {
-            o.push_str(&format!("<code>{}</code>", part));
-        } else {
-            o.push_str(part);
-        }
-    }
-    o
-}
-
 /// A self-contained page (inline CSS, no scripts, nothing external) in the Ather look.
 pub fn render_html(r: &RamReport) -> String {
     let verdict_class = match r.verdict {
@@ -1506,9 +1477,6 @@ pub fn render_html(r: &RamReport) -> String {
         _ => "ok",
     };
     let mut h = String::new();
-    h.push_str("<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>RAM and BIOS check</title>\n<style>\n");
-    h.push_str(CSS);
-    h.push_str("</style>\n</head>\n<body>\n<main>\n");
     h.push_str("<p class=\"eyebrow\">Ather MemGuard · RAM and BIOS check</p>\n");
     h.push_str(&format!("<p class=\"pill {}\">{}</p>\n", verdict_class, esc(verdict_word(r.verdict))));
     h.push_str(&format!("<h1>{}</h1>\n<p class=\"summary\">{}</p>\n", esc(&r.headline), esc_rich(&r.summary)));
@@ -1561,8 +1529,8 @@ pub fn render_html(r: &RamReport) -> String {
         }
         h.push_str("</ol>\n</section>\n");
     }
-    h.push_str("<p class=\"foot\">Read from this PC's firmware tables. Nothing was changed.</p>\n</main>\n</body>\n</html>\n");
-    h
+    h.push_str("<p class=\"foot\">Read from this PC's firmware tables. Nothing was changed.</p>\n");
+    page("RAM and BIOS check", &h)
 }
 
 /// Turn already-escaped https:// URLs into links (text after them stays as is).
@@ -1581,50 +1549,6 @@ fn linkify(escaped: &str) -> String {
     out
 }
 
-const CSS: &str = r#":root { color-scheme: dark; }
-* { box-sizing: border-box; }
-body { margin: 0; background: rgb(14,14,13); color: rgb(242,239,232);
-  font: 15px/1.55 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; }
-main { max-width: 860px; margin: 0 auto; padding: 32px 16px 48px; }
-.eyebrow { font-family: "Bahnschrift SemiBold", "Bahnschrift", "Segoe UI", sans-serif; text-transform: uppercase;
-  letter-spacing: 3px; font-size: 12px; color: rgb(212,255,0); margin: 0 0 14px; }
-h1 { font-family: "Bahnschrift SemiBold Condensed", "Bahnschrift Condensed", "Bahnschrift", "Segoe UI", sans-serif;
-  font-stretch: condensed; text-transform: uppercase; font-weight: 600; font-size: 34px; line-height: 1.1; margin: 8px 0 12px; }
-h2 { font-family: "Bahnschrift SemiBold", "Bahnschrift", "Segoe UI", sans-serif; text-transform: uppercase;
-  letter-spacing: 3px; font-size: 13px; color: rgb(212,255,0); margin: 0 0 14px; font-weight: 600; }
-.summary { color: rgb(208,206,199); margin: 0 0 24px; max-width: 70ch; }
-.pill { display: inline-block; margin: 0; padding: 3px 10px; border-radius: 6px; font-size: 12px; font-weight: 600;
-  text-transform: uppercase; letter-spacing: 1px; }
-.pill.ok { background: rgb(212,255,0); color: rgb(14,14,13); }
-.pill.warn { background: rgb(255,184,48); color: rgb(14,14,13); }
-.pill.bad { background: rgb(255,120,110); color: rgb(14,14,13); }
-.card { background: rgb(26,27,25); border: 1px solid rgb(50,52,46); border-radius: 8px; padding: 20px; margin: 0 0 16px; }
-.scroll { overflow-x: auto; }
-table { width: 100%; border-collapse: collapse; font-size: 14px; }
-th { text-align: left; color: rgb(150,150,142); font-weight: 600; padding: 6px 10px 6px 0; border-bottom: 1px solid rgb(50,52,46); white-space: nowrap; }
-td { padding: 7px 10px 7px 0; border-bottom: 1px solid rgb(37,38,35); vertical-align: top; }
-tr.empty td { color: rgb(150,150,142); }
-.mono, code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 13px; }
-code { background: rgb(37,38,35); padding: 1px 5px; border-radius: 4px; }
-dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 16px 0 0; }
-dt { color: rgb(150,150,142); }
-dd { margin: 0; }
-.findings { list-style: none; padding: 0; margin: 0; }
-.findings li { border-left: 3px solid rgb(150,150,142); padding: 2px 0 2px 14px; margin: 0 0 16px; }
-.findings li.problem { border-color: rgb(255,120,110); }
-.findings li.caution { border-color: rgb(255,184,48); }
-.findings p { margin: 4px 0 0; color: rgb(208,206,199); overflow-wrap: anywhere; }
-.tag { display: inline-block; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; margin-right: 8px; color: rgb(150,150,142); }
-li.problem .tag { color: rgb(255,120,110); }
-li.caution .tag { color: rgb(255,184,48); }
-.steps { margin: 0; padding-left: 22px; }
-.steps li { margin: 0 0 10px; padding-left: 4px; }
-.steps li::marker { color: rgb(212,255,0); font-weight: 700; }
-.muted { color: rgb(150,150,142); margin: -6px 0 14px; }
-a { color: rgb(212,255,0); }
-.foot { color: rgb(150,150,142); font-size: 13px; margin-top: 24px; }
-@media (max-width: 560px) { h1 { font-size: 26px; } dl { grid-template-columns: 1fr; } dt { margin-top: 6px; } }
-"#;
 
 // ---------------------------------------------------------------- unit tests (internals)
 

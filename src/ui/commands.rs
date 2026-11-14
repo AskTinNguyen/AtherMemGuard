@@ -32,11 +32,29 @@ pub enum Command {
     /// Empty Windows' file cache (asks for administrator permission): the tray menu and the
     /// flyout's "Windows file cache" row.
     FreeWindowsCache,
+    /// The flyout's "Windows and drivers" menu: write the driver report page and open it.
+    ShowDriverReport,
+    /// The flyout's Unreal menu: end Unreal helpers whose editor, build or cook has exited
+    /// (after a confirmation).
+    EndUnrealLeftovers,
+}
+
+/// What a flyout row menu asks for. Most are plain commands; the rest name the group or app
+/// they act on, which a `Command` can't carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UiAction {
+    Run(Command),
+    /// Free memory from one app group now (trim its processes).
+    FreeGroup(String),
+    /// Ask an app (by executable name, without `.exe`) to close, through the checkup's rules.
+    CloseApp(String),
+    /// Add an app to an app group in the settings.
+    AddToGroup { app: String, group: String },
 }
 
 impl Command {
     /// Every command, in a fixed order (their ids).
-    pub const ALL: [Command; 18] = [
+    pub const ALL: [Command; 20] = [
         Command::FreeMemory,
         Command::Pause30,
         Command::PauseUntilResumed,
@@ -55,6 +73,8 @@ impl Command {
         Command::AllowGuarded,
         Command::ShowRamReport,
         Command::FreeWindowsCache,
+        Command::ShowDriverReport,
+        Command::EndUnrealLeftovers,
     ];
 
     /// A small non-zero number for menu item ids and window messages.
@@ -78,6 +98,8 @@ impl Command {
             Command::AllowGuarded => 16,
             Command::ShowRamReport => 17,
             Command::FreeWindowsCache => 18,
+            Command::ShowDriverReport => 19,
+            Command::EndUnrealLeftovers => 20,
         }
     }
 
@@ -98,7 +120,7 @@ mod tests {
             assert_eq!(Command::from_id(c.id()), Some(c));
             seen.insert(c.id());
         }
-        assert_eq!(seen.len(), 18, "every variant has its own id");
+        assert_eq!(seen.len(), 20, "every variant has its own id");
         assert_eq!(Command::from_id(0), None);
         assert_eq!(Command::from_id(99), None);
     }

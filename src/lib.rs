@@ -15,8 +15,10 @@
 //! - `ramcheck` RAM and BIOS check: memory below its rated speed, slots, BIOS age (Part G)
 //! - `smbios`  reading and parsing the firmware SMBIOS tables (Part G)
 
+pub mod breakdown;
 pub mod config;
 pub mod doctor;
+pub mod drivers; // which drivers and Windows processes hold the "Windows and drivers" RAM
 mod doctor_win;
 pub mod engine;
 pub mod history;
@@ -27,6 +29,7 @@ pub mod net;
 pub mod ops;
 pub mod paths;
 pub mod ramcheck; // Part G: RAM and BIOS check
+pub mod report_page;
 pub mod smbios; // Part G: firmware tables for the RAM check
 pub mod startup;
 pub mod tray;

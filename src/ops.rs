@@ -95,6 +95,29 @@ pub fn trim_groups(cfg: &Config, procs: &[win::Proc]) -> usize {
     trimmed
 }
 
+/// What freeing one group did.
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupFreeReport {
+    pub group: String,
+    pub trimmed_processes: usize,
+    pub ram_free_before_gb: f64,
+    pub ram_free_after_gb: f64,
+}
+
+/// Free memory from one app group now: its processes get the group's lowest memory priority
+/// and are trimmed (the flyout's "Free memory from {group} now"). Blocks a moment so the
+/// trimmed memory shows up as free RAM.
+pub fn free_group(cfg: &Config, group: &str) -> GroupFreeReport {
+    let mut one = cfg.clone();
+    one.groups.retain(|g| g.name == group);
+    let gb = |b: u64| (b as f64 / GB * 10.0).round() / 10.0;
+    let before = win::sys_info();
+    let trimmed = trim_groups(&one, &win::list_processes());
+    sleep(Duration::from_millis(800));
+    let after = win::sys_info();
+    GroupFreeReport { group: group.to_string(), trimmed_processes: trimmed, ram_free_before_gb: gb(before.ram_avail), ram_free_after_gb: gb(after.ram_avail) }
+}
+
 /// Free as much RAM as possible for Unreal right now: every group gets its lowest
 /// memory priority and is trimmed, whatever the current pressure level.
 pub fn prime(cfg: &Config, target: Option<&str>, kill_orphans: bool) -> PrimeReport {
@@ -192,14 +215,14 @@ pub fn flush_cache_here() -> Result<(), String> {
 pub fn flush_cache(exe: &std::path::Path, args: &str) -> CacheFlushReport {
     let gb = |b: u64| (b as f64 / GB * 10.0).round() / 10.0;
     let before = win::sys_info();
+    use win::ElevateError;
     let result = if win::is_elevated() {
-        flush_cache_here().map_err(|e| (false, e))
+        flush_cache_here().map_err(ElevateError::Failed)
     } else {
         match win::run_elevated(exe, args, 120_000) {
             Ok(0) => Ok(()),
-            Ok(code) => Err((false, format!("Windows didn't let it empty the cache (exit code {}; details in the log)", code))),
-            Err(win::ElevateError::Declined) => Err((true, "administrator permission was declined".to_string())),
-            Err(win::ElevateError::Failed(e)) => Err((false, e)),
+            Ok(code) => Err(ElevateError::Failed(format!("Windows didn't let it empty the cache (exit code {}; details in the log)", code))),
+            Err(e) => Err(e),
         }
     };
     // The cache's pages move to the standby list at once; give the counters a moment.
@@ -207,14 +230,14 @@ pub fn flush_cache(exe: &std::path::Path, args: &str) -> CacheFlushReport {
         sleep(Duration::from_millis(500));
     }
     let after = win::sys_info();
-    let (declined, error) = match result {
-        Ok(()) => (false, None),
-        Err((d, e)) => (d, Some(e)),
-    };
     CacheFlushReport {
-        ok: error.is_none(),
-        declined,
-        error,
+        ok: result.is_ok(),
+        declined: result == Err(ElevateError::Declined),
+        error: match result {
+            Ok(()) => None,
+            Err(ElevateError::Declined) => Some("administrator permission was declined".into()),
+            Err(ElevateError::Failed(e)) => Some(e),
+        },
         ram_free_before_gb: gb(before.ram_avail),
         ram_free_after_gb: gb(after.ram_avail),
         file_cache_before_gb: gb(before.resident_system_cache),

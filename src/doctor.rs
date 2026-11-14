@@ -1178,6 +1178,64 @@ pub fn doc_add_to_group(
     Ok(added)
 }
 
+/// What asking one app to close did (the flyout's "Close {app}").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseApp {
+    /// The checkup doesn't offer to close it: Windows or Unreal may need it, or it's kept.
+    NotOffered,
+    /// The checkup's message for each outcome ("Closed", "Still open — it may be asking you to
+    /// save", or why not).
+    Closed(String),
+    StillOpen(String),
+    NotClosed(String),
+}
+
+/// Ask the app `exe` (executable name, no `.exe`) to close through the checkup's rules: only
+/// an app finding that offers Close, never forced, logged for Undo. Scans first.
+pub fn close_app(exe: &str) -> CloseApp {
+    let report = scan(&load_config_readonly());
+    let found = report
+        .findings
+        .iter()
+        .find(|f| f.kind == FindingKind::App && f.offers(ActionKind::Close) && f.names.iter().any(|n| n.eq_ignore_ascii_case(exe)));
+    let Some(f) = found else { return CloseApp::NotOffered };
+    match apply(&report, &[(f.id.clone(), ActionKind::Close)], false).into_iter().next() {
+        Some(o) if o.result == OutcomeKind::Done => CloseApp::Closed(o.message),
+        Some(o) if o.result == OutcomeKind::StillOpen => CloseApp::StillOpen(o.message),
+        Some(o) => CloseApp::NotClosed(o.message),
+        None => CloseApp::NotClosed("Nothing happened".into()),
+    }
+}
+
+/// What ending the Unreal leftovers did (the flyout's "End leftover Unreal helpers").
+#[derive(Debug, Clone, PartialEq)]
+pub enum EndLeftovers {
+    NoneFound,
+    Ended { processes: usize, ram_gb: f64 },
+    /// Some are still running: why.
+    NotAll(String),
+}
+
+/// End the checkup's "ue:orphans" finding: Unreal helpers whose editor, build or cook has
+/// exited. Forced, so the caller asks the person first. Scans first.
+pub fn end_leftovers() -> EndLeftovers {
+    let report = scan(&load_config_readonly());
+    let Some(f) = report.findings.iter().find(|f| f.id == "ue:orphans") else { return EndLeftovers::NoneFound };
+    let outs = apply(&report, &[(f.id.clone(), ActionKind::End)], true);
+    match outs.into_iter().find(|o| o.result != OutcomeKind::Done) {
+        None => EndLeftovers::Ended { processes: f.processes, ram_gb: f.ram_mb as f64 / 1024.0 },
+        Some(o) => EndLeftovers::NotAll(o.message),
+    }
+}
+
+/// Add `app` (executable name, no `.exe`) to the app group `group` in settings.toml: the
+/// flyout's "Hold it back with". Returns false when it was already in the group.
+pub fn add_to_group(app: &str, group: &str) -> Result<bool, String> {
+    let cfg = load_config_readonly();
+    let base: Vec<String> = cfg.groups.iter().find(|g| g.name == group).map(|g| g.processes.clone()).unwrap_or_default();
+    edit_settings(|doc| doc_add_to_group(doc, group, &[app.to_string()], &base)).map(|added| !added.is_empty())
+}
+
 pub fn doc_remove_from_group(doc: &mut toml_edit::DocumentMut, group: &str, names: &[String]) {
     let Some(groups) = doc.get_mut("group").and_then(|g| g.as_array_of_tables_mut()) else { return };
     for t in groups.iter_mut() {

@@ -870,6 +870,75 @@ pub mod catalog {
         keyed(toast(ToastKind::Error, "Couldn't open the RAM report".into(), message.to_string()), "ram")
     }
 
+    /// Flyout: "Free memory from {group} now".
+    pub fn group_freed(group: &str, processes: usize, ram_before_gb: f64, ram_after_gb: f64) -> Toast {
+        if processes == 0 {
+            return toast(ToastKind::Info, format!("Nothing to free in {}", group), "None of its apps are running.".into());
+        }
+        toast(
+            ToastKind::Info,
+            format!("Freed memory from {}", group),
+            format!("Held back {} processes. RAM free went from {} to {} GB.", processes, gb(ram_before_gb), gb(ram_after_gb)),
+        )
+    }
+
+    /// Flyout: "Close {app}" asked it to close and it did.
+    pub fn app_closed(app: &str, message: &str) -> Toast {
+        with(toast(ToastKind::Info, format!("Closed {}", app), sentence(message)), "Undo", Command::UndoDoctor)
+    }
+
+    /// Flyout: "Close {app}": still running after the wait (often a "save changes?" prompt).
+    pub fn app_still_open(app: &str, message: &str) -> Toast {
+        toast(ToastKind::Warning, format!("{} is still open", app), sentence(message))
+    }
+
+    /// Flyout: "Close {app}" was refused or failed, or the checkup doesn't offer it.
+    pub fn app_not_closed(app: &str, why: &str) -> Toast {
+        with(toast(ToastKind::Warning, format!("{} wasn't closed", app), sentence(why)), "Run a checkup", Command::OpenDoctor)
+    }
+
+    /// Flyout: "Hold it back with {group}".
+    pub fn added_to_group(app: &str, group: &str, added: bool) -> Toast {
+        let body = if added {
+            format!("MemGuard holds it back with {} from now on. Remove it there in Settings.", group)
+        } else {
+            format!("It was already in {}.", group)
+        };
+        toast(ToastKind::Info, format!("{} is in {}", app, group), body)
+    }
+
+    pub fn add_to_group_failed(app: &str, why: &str) -> Toast {
+        toast(ToastKind::Error, format!("Couldn't add {} to the group", app), sentence(why))
+    }
+
+    /// Flyout: "End leftover Unreal helpers".
+    pub fn leftovers_ended(processes: usize, ram_gb: f64) -> Toast {
+        toast(ToastKind::Info, "Ended leftover Unreal helpers".into(), format!("{} processes, holding {} GB.", processes, gb(ram_gb)))
+    }
+
+    pub fn no_leftovers() -> Toast {
+        toast(ToastKind::Info, "No leftover Unreal helpers".into(), "Every Unreal helper running belongs to an editor, build or cook.".into())
+    }
+
+    pub fn leftovers_failed(why: &str) -> Toast {
+        toast(ToastKind::Warning, "Some Unreal helpers are still running".into(), sentence(why))
+    }
+
+    /// Flyout: "Which drivers use it?" couldn't write or open its page.
+    pub fn driver_report_failed(message: &str) -> Toast {
+        keyed(toast(ToastKind::Error, "Couldn't open the drivers report".into(), message.to_string()), "drivers")
+    }
+
+    /// "it failed" -> "It failed."
+    fn sentence(s: &str) -> String {
+        let s = s.trim().trim_end_matches('.');
+        let mut c = s.chars();
+        match c.next() {
+            Some(f) => format!("{}{}.", f.to_uppercase(), c.as_str()),
+            None => String::new(),
+        }
+    }
+
     /// "Steam, Spotify and Blender"
     fn and_list(names: &[String]) -> String {
         match names {

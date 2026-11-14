@@ -1,7 +1,8 @@
 //! Where the UI gets the engine's latest `Status` (the tray loop owns the engine).
 
 use crate::config::{Cpu, MemPriority};
-use crate::engine::{Activities, AppRam, Effective, GroupRam, GroupStatus, Level, RamBreakdown, Status, SystemStatus, UeProcess, UeStatus};
+use crate::breakdown::{AppRam, GroupRam, RamBreakdown};
+use crate::engine::{Activities, Effective, GroupStatus, Level, Status, SystemStatus, UeProcess, UeStatus};
 
 pub trait StatusSource {
     /// The engine's most recent status, `None` before the first tick.

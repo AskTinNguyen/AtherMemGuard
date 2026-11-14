@@ -56,6 +56,8 @@ const UPDATE_EVERY: Duration = Duration::from_secs(24 * 3600);
 const RAM_CHECK_AFTER: Duration = Duration::from_secs(180);
 /// The RAM report page "Show me how" writes into the data folder.
 pub const RAM_REPORT_FILE: &str = "ram-report.html";
+/// The flyout's "Which drivers use it?" page, in the data folder.
+pub const DRIVER_REPORT_FILE: &str = "drivers-report.html";
 pub const RELEASES_URL: &str = "https://github.com/AskTinNguyen/AtherMemGuard/releases/latest";
 
 /// The tray window, for posting commands from closures (toasts, flyout, settings window).
@@ -751,6 +753,15 @@ pub mod doctor_map {
 /// What a worker thread hands back to the tray thread.
 enum Work {
     Primed(ops::PrimeReport),
+    /// A flyout row action that names what it acts on (posted, so it runs after the flyout's
+    /// window procedure has returned).
+    Ui(crate::ui::commands::UiAction),
+    /// A flyout action finished: say how it went.
+    Toast(crate::ui::toast::Toast),
+    /// "Free memory from {group} now" finished.
+    GroupFreed(ops::GroupFreeReport),
+    /// The driver report page was written: open it.
+    OpenPage(PathBuf),
     /// "Empty Windows file cache" finished (or was declined).
     CacheFlushed(ops::CacheFlushReport),
     Checked { manual: bool, result: CheckResult },
@@ -1077,6 +1088,32 @@ impl App {
         });
     }
 
+    /// A flyout row action that names a group or app.
+    fn run_ui_action(&mut self, a: crate::ui::commands::UiAction) {
+        use crate::ui::commands::UiAction;
+        match a {
+            UiAction::Run(c) => post_command(c),
+            UiAction::FreeGroup(group) => {
+                let cfg = self.engine.cfg.clone();
+                spawn_work(self.hwnd, move || Work::GroupFreed(ops::free_group(&cfg, &group)));
+            }
+            UiAction::CloseApp(exe) => {
+                spawn_work(self.hwnd, move || Work::Toast(close_app_toast(&exe, crate::doctor::close_app(&exe))));
+            }
+            UiAction::AddToGroup { app, group } => {
+                let name = flyout::app_words(&app);
+                let t = match crate::doctor::add_to_group(&app, &group) {
+                    Ok(added) => catalog::added_to_group(&name, &group, added),
+                    Err(e) => {
+                        crate::log::write(&format!("add {} to {}: {}", app, group, e));
+                        catalog::add_to_group_failed(&name, &e)
+                    }
+                };
+                toast::show_always(t);
+            }
+        }
+    }
+
     fn on_work(&mut self, w: Work) {
         match w {
             Work::CacheFlushed(r) => {
@@ -1092,6 +1129,18 @@ impl App {
                 }
                 self.tick();
             }
+            Work::Ui(a) => self.run_ui_action(a),
+            // The person just asked for these: say how it went even with notifications off.
+            Work::Toast(t) => {
+                toast::show_always(t);
+                self.tick();
+            }
+            Work::GroupFreed(r) => {
+                self.engine.forget_applied(); // trimming set memory priorities of its own
+                toast::show_always(catalog::group_freed(&r.group, r.trimmed_processes, r.ram_free_before_gb, r.ram_free_after_gb));
+                self.tick();
+            }
+            Work::OpenPage(path) => shell_open(&path.display().to_string()),
             Work::Primed(r) => {
                 self.priming = false;
                 self.engine.forget_applied(); // prime set memory priorities of its own
@@ -1326,6 +1375,25 @@ fn dispatch(hwnd: HWND, cmd: Command) {
         Command::OpenReleasesPage => shell_open(RELEASES_URL),
         Command::OpenSettingsFile => open_in_notepad(&paths::config_file()),
         Command::ShowRamReport => show_ram_report(),
+        Command::ShowDriverReport => {
+            if let Some(h) = with_app(|a| a.hwnd) {
+                spawn_work(h, || {
+                    let path = paths::data_dir().join(DRIVER_REPORT_FILE);
+                    let html = crate::drivers::render_html(&crate::drivers::report());
+                    match std::fs::create_dir_all(paths::data_dir()).and_then(|_| std::fs::write(&path, html)) {
+                        Ok(()) => Work::OpenPage(path),
+                        Err(e) => Work::Toast(catalog::driver_report_failed(&format!("{}: {}", path.display(), e))),
+                    }
+                });
+            }
+        }
+        Command::EndUnrealLeftovers => {
+            if confirm_end_leftovers() {
+                if let Some(h) = with_app(|a| a.hwnd) {
+                    spawn_work(h, || Work::Toast(leftovers_toast(crate::doctor::end_leftovers())));
+                }
+            }
+        }
     }
 }
 
@@ -1394,7 +1462,54 @@ fn on_select(hwnd: HWND, keyboard: bool) {
         return;
     }
     if let Some(d) = with_app(|a| a.flyout_data()).flatten() {
-        flyout::show(d, icon_rect(hwnd), Box::new(post_command));
+        flyout::show(d, icon_rect(hwnd), Box::new(on_flyout_action));
+    }
+}
+
+/// A pick in the flyout: commands go the usual way; actions that name a group or app are
+/// posted as work, so they run after the flyout's window procedure has returned.
+fn on_flyout_action(a: crate::ui::commands::UiAction) {
+    match a {
+        crate::ui::commands::UiAction::Run(c) => post_command(c),
+        other => {
+            let h = TRAY_HWND.load(Ordering::SeqCst);
+            if h != 0 {
+                post_work(h, Work::Ui(other));
+            }
+        }
+    }
+}
+
+/// "End leftover Unreal helpers…": ending loses whatever they were doing, so ask first.
+fn confirm_end_leftovers() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, IDYES, MB_ICONQUESTION, MB_SETFOREGROUND, MB_YESNO};
+    let text = wide("End the Unreal helpers whose editor, build or cook has already exited?\n\nThese are compile and shader workers left behind by a crash or a killed build. Anything they were still doing is lost.");
+    let title = wide("Ather MemGuard");
+    let r = unsafe { MessageBoxW(null_mut(), text.as_ptr(), title.as_ptr(), MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND) };
+    r == IDYES
+}
+
+/// The toast for a "Close {app}" from the flyout.
+fn close_app_toast(exe: &str, r: crate::doctor::CloseApp) -> crate::ui::toast::Toast {
+    use crate::doctor::CloseApp;
+    let name = flyout::app_words(exe);
+    match r {
+        CloseApp::Closed(m) => catalog::app_closed(&name, &m),
+        CloseApp::StillOpen(m) => catalog::app_still_open(&name, &m),
+        CloseApp::NotClosed(m) => catalog::app_not_closed(&name, &m),
+        CloseApp::NotOffered => {
+            catalog::app_not_closed(&name, "The checkup doesn't offer to close it: Windows or Unreal may need it, or it's on your keep list")
+        }
+    }
+}
+
+/// The toast for "End leftover Unreal helpers".
+fn leftovers_toast(r: crate::doctor::EndLeftovers) -> crate::ui::toast::Toast {
+    use crate::doctor::EndLeftovers;
+    match r {
+        EndLeftovers::NoneFound => catalog::no_leftovers(),
+        EndLeftovers::Ended { processes, ram_gb } => catalog::leftovers_ended(processes, ram_gb),
+        EndLeftovers::NotAll(why) => catalog::leftovers_failed(&why),
     }
 }
 
@@ -1612,15 +1727,8 @@ pub fn status_text(st: &Status) -> String {
     );
     let r = &st.ram;
     if r.in_use_gb > 0.0 {
-        let mut parts = vec![("Unreal".to_string(), r.unreal_gb)];
-        parts.extend(r.groups.iter().map(|g| (g.name.clone(), g.ram_gb)));
-        parts.extend([
-            ("other apps".to_string(), r.other_apps_gb),
-            ("Windows file cache".to_string(), r.file_cache_gb),
-            ("Windows and drivers".to_string(), r.windows_gb),
-            ("squeezed by Windows".to_string(), r.compressed_gb),
-            ("shared or not itemized".to_string(), r.unattributed_gb),
-        ]);
+        let mut parts: Vec<(String, f64)> = r.parts().into_iter().map(|(p, gb)| (r.label(p), gb)).collect();
+        parts.push(("Unreal".into(), r.unreal_gb));
         parts.sort_by(|a, b| b.1.total_cmp(&a.1));
         let list: Vec<String> = parts.iter().filter(|p| p.1 >= 0.05).map(|(n, gb)| format!("{} {:.1}", n, gb)).collect();
         s.push_str(&format!("RAM in use: {:.1} GB = {} (GB)\n", r.in_use_gb, list.join(", ")));

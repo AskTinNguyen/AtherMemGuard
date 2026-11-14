@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde::Serialize;
 
+use crate::breakdown::{breakdown, Owner, RamBreakdown};
 use crate::config::{any_matches, limit_mb, scale_soft_cap, Config, Cpu, Group, MemPriority, Patterns, Policy, Preset};
 use crate::history::History;
 use crate::win::{self, Proc, SysInfo};
@@ -150,134 +151,6 @@ pub struct GroupStatus {
     /// Members as (pid, creation time).
     #[serde(skip)]
     pub pids: Vec<(u32, u64)>,
-}
-
-/// One app outside Unreal and the groups, its processes added up by name.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct AppRam {
-    /// Executable name without `.exe`, as the first process of that name spells it.
-    pub name: String,
-    pub processes: usize,
-    pub ram_gb: f64,
-}
-
-/// A group's share of the RAM in use.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct GroupRam {
-    pub name: String,
-    pub ram_gb: f64,
-}
-
-/// Where the RAM in use is (docs/UI.md section 3). Processes count their private RAM only, so
-/// nothing is counted twice, and each process lands in exactly one part: Unreal, then the
-/// first group that lists it, then Windows, then other apps. The parts plus `unattributed_gb`
-/// add up to `in_use_gb`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
-pub struct RamBreakdown {
-    /// Total RAM minus available RAM.
-    pub in_use_gb: f64,
-    /// Everything on the protect list and the compile workers.
-    pub unreal_gb: f64,
-    pub unreal_editor_gb: f64,
-    pub unreal_workers_gb: f64,
-    /// In the order of `Status::groups`.
-    pub groups: Vec<GroupRam>,
-    /// Apps in no group, Unreal or Windows.
-    pub other_apps_gb: f64,
-    pub other_apps_count: usize,
-    /// The biggest other apps, largest first (at most `TOP_APPS`). Left out of status.json:
-    /// it names what someone has open, and agents don't need it.
-    #[serde(skip)]
-    pub top_apps: Vec<AppRam>,
-    /// Windows' file cache: file data Windows keeps in RAM for itself (its working set, not
-    /// the standby list, which counts as available).
-    pub file_cache_gb: f64,
-    /// Windows processes and services, kernel memory and drivers.
-    pub windows_gb: f64,
-    /// The Memory Compression process: memory of other apps, packed smaller.
-    pub compressed_gb: f64,
-    /// What is left: memory several processes share, memory drivers lock, pages waiting to be
-    /// written. Windows doesn't say whose it is.
-    pub unattributed_gb: f64,
-}
-
-/// How many other apps the breakdown names.
-pub const TOP_APPS: usize = 5;
-
-/// Processes that are part of Windows (lowercase, without `.exe`). They can't be closed, so
-/// they count as "Windows and drivers", not "Other apps".
-const WINDOWS_PROCESSES: &[&str] = &[
-    "system", "registry", "secure system", "smss", "csrss", "wininit", "winlogon", "services", "lsass", "lsaiso", "svchost",
-    "fontdrvhost", "dwm", "msmpeng", "mpdefendercoreservice", "nissrv", "securityhealthservice", "spoolsv", "searchindexer",
-    "searchhost", "searchprotocolhost", "searchfilterhost", "wmiprvse", "audiodg", "conhost", "sihost", "taskhostw",
-    "runtimebroker", "ctfmon", "explorer", "startmenuexperiencehost", "shellexperiencehost", "textinputhost", "dllhost",
-    "smartscreen", "wudfhost", "dashost", "unsecapp", "wlanext", "sgrmbroker", "msdtc", "vmcompute", "vmms",
-    "applicationframehost", "lockapp", "systemsettings", "widgets", "widgetservice", "phoneexperiencehost", "crossdeviceservice",
-    "useroobebroker", "backgroundtaskhost", "compattelrunner", "musnotification", "tiworker", "trustedinstaller",
-];
-
-fn is_windows_process(lower: &str) -> bool {
-    WINDOWS_PROCESSES.contains(&lower)
-}
-
-/// Which part of Unreal a process is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UnrealPart {
-    Editor,
-    Worker,
-    Other,
-}
-
-/// The breakdown for a snapshot. `unreal[i]` / `group_of[i]` say where process `i` belongs.
-fn ram_breakdown(snap: &Snapshot, lowers: &[String], unreal: &[Option<UnrealPart>], group_of: &[Option<usize>], groups: &[GroupStatus]) -> RamBreakdown {
-    let sys = &snap.sys;
-    let in_use = sys.ram_total.saturating_sub(sys.ram_avail);
-    let (mut editor, mut workers, mut ue_other) = (0u64, 0u64, 0u64);
-    let mut group_ram = vec![0u64; groups.len()];
-    let (mut windows, mut compressed) = (0u64, 0u64);
-    // By lowercase name: (display name, processes, bytes).
-    let mut apps: HashMap<&str, (&str, usize, u64)> = HashMap::new();
-    for (i, p) in snap.procs.iter().enumerate() {
-        let lower = lowers[i].as_str();
-        match (unreal[i], group_of[i]) {
-            (Some(UnrealPart::Editor), _) => editor += p.private,
-            (Some(UnrealPart::Worker), _) => workers += p.private,
-            (Some(UnrealPart::Other), _) => ue_other += p.private,
-            (None, Some(g)) => group_ram[g] += p.private,
-            (None, None) if lower == "memory compression" => compressed += p.private,
-            (None, None) if p.pid == 0 => {}
-            (None, None) if p.pid == 4 || is_windows_process(lower) => windows += p.private,
-            (None, None) => {
-                let a = apps.entry(lower).or_insert((p.name.as_str(), 0, 0));
-                a.1 += 1;
-                a.2 += p.private;
-            }
-        }
-    }
-    windows += sys.nonpaged_pool + sys.resident_paged_pool + sys.resident_system_code + sys.resident_drivers;
-    let file_cache = sys.resident_system_cache;
-    let other: u64 = apps.values().map(|a| a.2).sum();
-    let unreal = editor + workers + ue_other;
-    let known = unreal + group_ram.iter().sum::<u64>() + other + windows + compressed + file_cache;
-
-    let mut top: Vec<(&str, usize, u64)> = apps.into_values().collect();
-    let other_apps_count = top.len();
-    top.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(b.0)));
-    top.truncate(TOP_APPS);
-    RamBreakdown {
-        in_use_gb: gb(in_use),
-        unreal_gb: gb(unreal),
-        unreal_editor_gb: gb(editor),
-        unreal_workers_gb: gb(workers),
-        groups: groups.iter().zip(&group_ram).map(|(g, &b)| GroupRam { name: g.name.clone(), ram_gb: gb(b) }).collect(),
-        other_apps_gb: gb(other),
-        other_apps_count,
-        top_apps: top.into_iter().map(|(name, processes, b)| AppRam { name: name.to_string(), processes, ram_gb: gb(b) }).collect(),
-        file_cache_gb: gb(file_cache),
-        windows_gb: gb(windows),
-        compressed_gb: gb(compressed),
-        unattributed_gb: gb(in_use.saturating_sub(known)),
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -432,7 +305,8 @@ pub fn analyze_with(cfg: &Config, snap: &Snapshot, cmds: &mut CmdLines) -> Statu
     let mut worker_pids = Vec::new();
     let (mut ue_committed, mut ue_ram, mut workers_committed) = (0u64, 0u64, 0u64);
     let mut git_count = 0usize;
-    let mut unreal: Vec<Option<UnrealPart>> = vec![None; snap.procs.len()];
+    // Who each process's RAM counts for: Unreal here, the groups below, the rest by name.
+    let mut owners = vec![Owner::Nobody; snap.procs.len()];
 
     for (i, (p, lower)) in snap.procs.iter().zip(&lowers).enumerate() {
         let lower = lower.as_str();
@@ -442,10 +316,10 @@ pub fn analyze_with(cfg: &Config, snap: &Snapshot, cmds: &mut CmdLines) -> Statu
         if protect.matches_lower(lower) {
             ue_committed += p.committed;
             ue_ram += p.ram;
-            unreal[i] = Some(UnrealPart::Other);
+            owners[i] = Owner::Unreal;
         }
         if workers.matches_lower(lower) {
-            unreal[i] = Some(UnrealPart::Worker);
+            owners[i] = Owner::UnrealWorker;
             ue.workers += 1;
             workers_committed += p.committed;
             worker_pids.push((p.pid, p.created));
@@ -459,7 +333,7 @@ pub fn analyze_with(cfg: &Config, snap: &Snapshot, cmds: &mut CmdLines) -> Statu
                 "commandlet"
             } else {
                 act.editor = true;
-                unreal[i] = Some(UnrealPart::Editor);
+                owners[i] = Owner::UnrealEditor;
                 "editor"
             };
             ue.processes.push(UeProcess {
@@ -493,10 +367,11 @@ pub fn analyze_with(cfg: &Config, snap: &Snapshot, cmds: &mut CmdLines) -> Statu
     let ue_active = act.any();
 
     let ram_total_mb = snap.sys.ram_total / MB;
+    let group_pats: Vec<Patterns> = cfg.active_groups().map(|g| Patterns::new(&g.processes)).collect();
     let groups: Vec<GroupStatus> = cfg
         .active_groups()
-        .map(|g| {
-            let pats = Patterns::new(&g.processes);
+        .zip(&group_pats)
+        .map(|(g, pats)| {
             // Processes we can't open can't be trimmed or re-prioritized: they don't count.
             let members: Vec<&Proc> = snap
                 .procs
@@ -519,15 +394,16 @@ pub fn analyze_with(cfg: &Config, snap: &Snapshot, cmds: &mut CmdLines) -> Statu
         })
         .collect();
 
-    // Each process in the first group that lists it, for the breakdown.
-    let group_pats: Vec<Patterns> = cfg.active_groups().map(|g| Patterns::new(&g.processes)).collect();
-    let group_of: Vec<Option<usize>> = snap
-        .procs
-        .iter()
-        .enumerate()
-        .map(|(i, p)| if p.queryable && !protected[i] { group_pats.iter().position(|pats| pats.matches_lower(&lowers[i])) } else { None })
-        .collect();
-    let ram = ram_breakdown(snap, &lowers, &unreal, &group_of, &groups);
+    // A process in several groups counts for the first, as it is held back by the first.
+    for (i, p) in snap.procs.iter().enumerate() {
+        if owners[i] == Owner::Nobody && p.queryable && !protected[i] {
+            if let Some(g) = group_pats.iter().position(|pats| pats.matches_lower(&lowers[i])) {
+                owners[i] = Owner::Group(g);
+            }
+        }
+    }
+    let group_names: Vec<String> = groups.iter().map(|g| g.name.clone()).collect();
+    let ram = breakdown(&snap.sys, &snap.procs, &owners, &group_names);
 
     let system = SystemStatus::from(&snap.sys);
     let mut advice = Vec::new();

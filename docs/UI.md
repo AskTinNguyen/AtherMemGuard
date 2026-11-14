@@ -179,6 +179,13 @@ Catalogue (exact wording; `{}` are values):
 | Emptied the file cache | Info | Emptied Windows' file cache | It held {x} GB. RAM free went from {a} to {b} GB. | |
 | File cache: permission declined | Info | Windows' file cache is unchanged | Emptying it needs administrator permission, and that was declined. | |
 | File cache: failed | Error | Couldn't empty Windows' file cache | {why}. | |
+| Group freed (row menu) | Info | Freed memory from {group} | Held back {n} processes. RAM free went from {a} to {b} GB. | |
+| App closed (row menu) | Info | Closed {app} | {checkup message}. | Undo |
+| App still open | Warning | {app} is still open | {checkup message}. | |
+| App not closed | Warning | {app} wasn't closed | {why}. | Run a checkup |
+| Added to a group | Info | {app} is in {group} | MemGuard holds it back with {group} from now on. Remove it there in Settings. | |
+| Leftovers ended | Info | Ended leftover Unreal helpers | {n} processes, holding {x} GB. | |
+| No leftovers | Info | No leftover Unreal helpers | Every Unreal helper running belongs to an editor, build or cook. | |
 | Editor restart hint | Warning | Unreal Editor is at {n} GB | It has been open {h} h {m} min. Restarting it gets that memory back. | |
 | Editor growing | Warning | Unreal Editor is growing {n} GB an hour | At this rate memory runs out in about {t}. | Show history |
 | Paused | Info | Paused for 30 minutes | Other apps are back to normal until {hh:mm}. | Resume now |
@@ -223,7 +230,7 @@ Update to version {v}…                         (or "Check for updates…")
 Quit Ather MemGuard
 ```
 
-- **Flyout** (`src/ui/flyout.rs`): 340 px wide borderless popup anchored above the tray icon
+- **Flyout** (`src/ui/flyout/`: `model.rs` what it shows and the row menus, `view.rs` layout and paint, `mod.rs` the window): 340 px wide borderless popup anchored above the tray icon
   (use `Shell_NotifyIconGetRect`), closes on focus loss or Esc. Its job is to say what is
   using the RAM, so every part it lists adds up to the RAM in use (`Status.ram`, built by
   `engine::ram_breakdown`).
@@ -247,7 +254,27 @@ Quit Ather MemGuard
     cook yet." (apps of 0.5 GB and up, at most three), led by "Emptying Windows' file cache gets
     about {c} GB back" when the cache holds 2 GB or more with the link "Review and close" (opens
     the checkup; nothing closes from the flyout). Otherwise the link "Run a checkup".
-  - Advice from `Status.advice` as one muted line, at most two lines (the critical line gives
+  - **Row menus.** The Unreal band and every row with something behind it highlight on hover
+    and open a small popup menu on click (Tab reaches them, Enter opens). Nothing runs on the
+    click itself. `FlyoutData::row_menu` builds them; picks that name a group or app are
+    `UiAction`s, the rest plain `Command`s:
+    - Unreal: "End leftover Unreal helpers…" (asks first, then ends the checkup's
+      `ue:orphans`), "Memory history"; while it runs, a grey line that restarting the editor
+      gets its piled-up memory back.
+    - A group row (or the shared row of small groups): "Free memory from {group} now" per group
+      (trims just that group), "Change how it's held back…" (Settings).
+    - Other apps: "Close {app} ({size})" for the five biggest, "Run a checkup".
+    - A named app: "Close {app}", then "Hold it back with {group}" per group (adds it to that
+      group in settings.toml).
+    - Windows file cache, Shared or not itemized: a grey line saying what it is, "Empty Windows
+      caches (needs admin)".
+    - Windows and drivers: a grey line, "Which drivers use it?" (writes
+      `drivers-report.html` to the data folder and opens it; `memguard drivers` prints the same).
+    - Squeezed by Windows: a grey line, "Run a checkup".
+    "Close" goes through the checkup's rules (`doctor::apply` with Close, never forced, logged
+    for Undo): only apps the checkup offers to close. Every result is a toast, shown even with
+    notifications off, because the person just asked.
+  - Advice from `Status.advice` as one muted line, at most four lines (the critical line gives
     way to the box).
   - "Commit free" meter under a hairline, with the hint "Room left for apps to ask for more
     memory: RAM plus the page file. When it runs out, apps crash even if RAM is free."
