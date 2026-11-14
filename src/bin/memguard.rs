@@ -168,6 +168,91 @@ fn history_cmd(hours: u64, json: bool) -> ExitCode {
 }
 
 #[derive(Subcommand)]
+enum DiskCmd {
+    /// What could go and what removing it would really free (predicted; deletes nothing)
+    Checkup {
+        /// Only this folder: a project, a lane or a folder of them
+        #[arg(long)]
+        path: Option<String>,
+        /// Count again instead of using the saved result
+        #[arg(long)]
+        refresh: bool,
+        /// How long counting may take, in seconds (default: [disk] scan_budget_sec)
+        #[arg(long)]
+        budget_sec: Option<u64>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fresh numbers for exactly these items of the last checkup (all of them if none given)
+    Plan {
+        /// Item ids from the checkup: d1 d2 ...
+        ids: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Internal: count a scan job from stdin at background priority
+    #[command(hide = true)]
+    ScanChild,
+}
+
+fn disk_cmd(json: bool, refresh: bool, action: Option<DiskCmd>) -> ExitCode {
+    use athermemguard::{disk, disk_scan};
+    let progress = |json: bool| {
+        move |files: u64, secs: f64| {
+            if !json {
+                eprintln!("counting: {} files, {:.0} s", files, secs);
+            }
+        }
+    };
+    match action {
+        None => {
+            let r = disk::report(&load_config(), refresh);
+            if json {
+                print_json(&r);
+            } else {
+                print!("{}", disk::render_text(&r));
+            }
+            ExitCode::SUCCESS
+        }
+        Some(DiskCmd::ScanChild) => ExitCode::from(disk_scan::child_main() as u8),
+        Some(DiskCmd::Checkup { path, refresh, budget_sec, json }) => {
+            let mut p = progress(json);
+            match disk_scan::checkup(&load_config(), path.as_deref(), refresh, budget_sec, &disk_scan::run_child, &mut p) {
+                Ok(c) => {
+                    if json {
+                        print_json(&c);
+                    } else {
+                        print!("{}", disk_scan::render_checkup(&c));
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{}", e);
+                    ExitCode::from(1)
+                }
+            }
+        }
+        Some(DiskCmd::Plan { ids, json }) => {
+            let mut p = progress(json);
+            match disk_scan::plan(&load_config(), &ids, &disk_scan::run_child, &mut p) {
+                Ok(v) => {
+                    if json {
+                        print_json(&v);
+                    } else {
+                        print!("{}", disk_scan::render_plan(&v));
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{}", e);
+                    ExitCode::from(1)
+                }
+            }
+        }
+    }
+}
+
+#[derive(Subcommand)]
 enum Cmd {
     /// Show memory, what Unreal is doing, and what each app group is getting
     Status {
@@ -203,6 +288,12 @@ enum Cmd {
         /// Prime once before waiting
         #[arg(long)]
         prime: bool,
+        /// The project folder whose drive needs free space (default: the current folder)
+        #[arg(long, value_name = "FOLDER")]
+        disk_path: Option<String>,
+        /// Free disk space needed there, in GB (overrides --for's disk_gb)
+        #[arg(long)]
+        disk_gb: Option<f64>,
         #[arg(long)]
         json: bool,
     },
@@ -298,6 +389,20 @@ enum Cmd {
         undo: Option<Option<String>>,
     },
 
+    // ---- Disk and Dev Drive (report only)
+    /// Show your drives, how full they are and Dev Drive health (changes nothing)
+    #[command(args_conflicts_with_subcommands = true)]
+    Disk {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+        /// Read the Defender and Dev Drive facts again instead of today's saved ones
+        #[arg(long)]
+        refresh: bool,
+        #[command(subcommand)]
+        action: Option<DiskCmd>,
+    },
+
     // ---- Part G: RAM and BIOS check
     /// Check whether your RAM runs at its rated speed and how to fix it in the BIOS (changes nothing)
     Ram {
@@ -325,6 +430,7 @@ fn print_json<T: serde::Serialize>(value: &T) {
 fn current_status(cfg: &Config) -> Status {
     let mut st = analyze(cfg, &snapshot());
     st.daemon = win::instance_running(paths::mutex());
+    st.disk = athermemguard::disk::status_brief(cfg);
     // Paused / suspended state only the background app knows: take it from its last report.
     if st.daemon {
         if let Ok(text) = std::fs::read_to_string(paths::status_file()) {
@@ -375,6 +481,8 @@ fn print_status(st: &Status) {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // This process may keep the disk caches (Defender facts, the last disk checkup).
+    athermemguard::disk_scan::allow_cache_writes();
     match cli.command {
         Cmd::Status { json } => {
             let st = current_status(&load_config());
@@ -429,19 +537,38 @@ fn main() -> ExitCode {
             }
         }
 
-        Cmd::Wait { workload, ram_gb, commit_gb, timeout, prime, json } => {
+        Cmd::Wait { workload, ram_gb, commit_gb, timeout, prime, disk_path, disk_gb, json } => {
             let cfg = load_config();
             let base = workload.and_then(|w| cfg.prime.target(w.name())).unwrap_or(Target { ram_gb: 0.0, commit_gb: 0.0, disk_gb: None });
-            let need = Target { ram_gb: ram_gb.unwrap_or(base.ram_gb), commit_gb: commit_gb.unwrap_or(base.commit_gb), disk_gb: None };
-            if need.ram_gb <= 0.0 && need.commit_gb <= 0.0 {
-                eprintln!("Say what to wait for: --for editor|build|cook, or --ram-gb / --commit-gb.");
+            let need = Target { ram_gb: ram_gb.unwrap_or(base.ram_gb), commit_gb: commit_gb.unwrap_or(base.commit_gb), disk_gb: disk_gb.or(base.disk_gb) };
+            if need.ram_gb <= 0.0 && need.commit_gb <= 0.0 && need.disk_gb.unwrap_or(0.0) <= 0.0 {
+                eprintln!("Say what to wait for: --for editor|build|cook, or --ram-gb / --commit-gb / --disk-gb.");
                 return ExitCode::from(1);
+            }
+            // Disk doesn't free itself: a shortfall returns at once, before priming.
+            let disk = ops::disk_gate(&cfg, disk_path.as_deref(), need.disk_gb);
+            if let Some(checks) = disk.as_ref().filter(|c| c.iter().any(|c| !c.ok)) {
+                let result = ops::WaitResult::blocked_by_disk(need, checks.clone());
+                if json {
+                    print_json(&result);
+                } else {
+                    for c in checks.iter().filter(|c| !c.ok) {
+                        println!(
+                            "NOT READY: {} has {:.1} GB free and needs {:.0} GB ({}). Disk space doesn't free itself: run `memguard disk checkup` to see what can go.",
+                            c.volume,
+                            c.free_gb,
+                            c.need_gb,
+                            c.roles.join(", ")
+                        );
+                    }
+                }
+                return ExitCode::from(2);
             }
             if prime {
                 ops::prime(&cfg, None, false);
             }
             let mut last_print = std::time::Instant::now();
-            let result = ops::wait_for(need, Duration::from_secs(timeout), |sys| {
+            let mut result = ops::wait_for(need, Duration::from_secs(timeout), |sys| {
                 if !json && last_print.elapsed().as_secs() >= 10 {
                     last_print = std::time::Instant::now();
                     eprintln!(
@@ -450,6 +577,9 @@ fn main() -> ExitCode {
                     );
                 }
             });
+            if let Some(checks) = disk {
+                result.set_disk(checks);
+            }
             if json {
                 print_json(&result);
             } else {
@@ -636,6 +766,9 @@ fn main() -> ExitCode {
 
         // ---- Part F: doctor
         Cmd::Doctor { json, fix, force, dry_run, undo } => run_doctor(json, fix, force, dry_run, undo),
+
+        // ---- Disk and Dev Drive (report only)
+        Cmd::Disk { json, refresh, action } => disk_cmd(json, refresh, action),
 
         // ---- Part G: RAM and BIOS check
         Cmd::Ram { json, html } => run_ram(json, html),

@@ -162,6 +162,61 @@ pub struct WaitResult {
     pub commit_free_gb: f64,
     pub need_ram_gb: f64,
     pub need_commit_gb: f64,
+    /// What stopped it: "disk" (returned at once: disk doesn't free itself) or "memory"
+    /// (the timeout passed). Empty when ready.
+    pub blocked_by: Vec<String>,
+    /// The project's volume, its free space (available to this user) and the need, when a
+    /// disk need was given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_volume: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_free_gb: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub need_disk_gb: Option<f64>,
+    /// Every volume checked, once each (the project's, and those of the DDC, Zen and TEMP).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub disk_checks: Vec<crate::disk::DiskCheck>,
+}
+
+impl WaitResult {
+    /// Not ready because of the disk: returned at once, before priming or waiting.
+    pub fn blocked_by_disk(need: Target, checks: Vec<crate::disk::DiskCheck>) -> WaitResult {
+        let sys = SystemStatus::from(&win::sys_info());
+        let mut r = WaitResult {
+            ready: false,
+            waited_sec: 0,
+            ram_free_gb: sys.ram_free_gb,
+            commit_free_gb: sys.commit_free_gb,
+            need_ram_gb: need.ram_gb,
+            need_commit_gb: need.commit_gb,
+            blocked_by: vec!["disk".into()],
+            disk_volume: None,
+            disk_free_gb: None,
+            need_disk_gb: None,
+            disk_checks: Vec::new(),
+        };
+        r.set_disk(checks);
+        r
+    }
+
+    pub fn set_disk(&mut self, checks: Vec<crate::disk::DiskCheck>) {
+        if let Some(p) = checks.iter().find(|c| c.roles.iter().any(|r| r == "project")).or_else(|| checks.iter().find(|c| !c.ok)) {
+            self.disk_volume = Some(p.volume.clone());
+            self.disk_free_gb = Some(p.free_gb);
+            self.need_disk_gb = Some(p.need_gb);
+        }
+        self.disk_checks = checks;
+    }
+}
+
+/// The disk part of a wait, each volume checked once. `None` when there is no disk need
+/// (no `disk_gb` on the target or the command line, or `[disk] enabled = false`).
+pub fn disk_gate(cfg: &Config, disk_path: Option<&str>, disk_gb: Option<f64>) -> Option<Vec<crate::disk::DiskCheck>> {
+    let gb = disk_gb.filter(|g| *g > 0.0)?;
+    if !cfg.disk().enabled {
+        return None;
+    }
+    Some(crate::disk::gate(cfg, disk_path, gb))
 }
 
 /// Block until the PC has the requested headroom, or the timeout passes.
@@ -178,6 +233,11 @@ pub fn wait_for(need: Target, timeout: Duration, mut on_poll: impl FnMut(&System
                 commit_free_gb: sys.commit_free_gb,
                 need_ram_gb: need.ram_gb,
                 need_commit_gb: need.commit_gb,
+                blocked_by: if ready { Vec::new() } else { vec!["memory".into()] },
+                disk_volume: None,
+                disk_free_gb: None,
+                need_disk_gb: None,
+                disk_checks: Vec::new(),
             };
         }
         on_poll(&sys);
