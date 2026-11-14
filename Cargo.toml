@@ -1,0 +1,48 @@
+[package]
+name = "memcap"
+version = "2.0.0"
+edition = "2021"
+description = "Memory manager that keeps a Windows PC primed for agentic Unreal Engine work"
+license = "MIT"
+
+[lib]
+name = "memcap"
+path = "src/lib.rs"
+
+[[bin]]
+name = "memcap"
+path = "src/bin/memcap.rs"
+
+[[bin]]
+name = "memcap-tray"
+path = "src/bin/memcap-tray.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+winreg = "0.52"
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
