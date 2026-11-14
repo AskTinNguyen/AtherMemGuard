@@ -25,7 +25,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use super::canvas::{Align, Canvas};
 use super::commands::Command;
 use super::geom::{Pt, Rect};
-use super::kit::{usage_bar, Button, ButtonStyle, WState};
+use super::kit::{Button, ButtonStyle, WState};
 use super::theme::*;
 use crate::config::Pressure;
 use crate::engine::{Level, Status};
@@ -36,7 +36,6 @@ pub const WIDTH: f32 = 340.0;
 const PAD: f32 = 18.0;
 /// Space between the flyout and the taskbar / screen edge.
 pub const EDGE_GAP: f32 = 12.0;
-const MAX_GROUPS: usize = 6;
 
 const F_STATE: Font = Font::new(Face::Display, 30.0, REGULAR);
 const F_METER: Font = Font::new(Face::Body, 12.0, REGULAR);
@@ -55,13 +54,24 @@ pub struct Meter {
     pub color: Rgb,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct GroupLine {
-    pub name: String,
+/// One part of the "where your RAM is" bar: a share of total RAM.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Segment {
     pub frac: f32,
     pub color: Rgb,
+}
+
+/// One line of the RAM list. A `sub` line names one app inside "Other apps" (no swatch,
+/// indented).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RamRow {
+    pub name: String,
     /// "4.1 GB"
     pub value: String,
+    pub swatch: Rgb,
+    pub sub: bool,
+    /// The "Empty it now" link under "Windows file cache" (a sub row with no value).
+    pub link: bool,
 }
 
 /// Everything the flyout shows.
@@ -72,13 +82,24 @@ pub struct FlyoutData {
     /// "MEMORY IS FINE", "MEMORY IS TIGHT", "MEMORY IS CRITICAL", "PAUSED"
     pub headline: String,
     pub headline_color: Rgb,
-    pub ram: Meter,
-    pub commit: Meter,
-    /// "UnrealEditor · 43.8 GB" or "Unreal isn't running"
+    /// "92.6 of 96 GB"
+    pub ram_in_use: String,
+    /// "3.4 GB free", coloured like a free-memory meter.
+    pub ram_free: String,
+    pub ram_free_color: Rgb,
+    /// The stacked bar, in the order of `rows` (Unreal first). The empty rest is free.
+    pub segments: Vec<Segment>,
+    /// "Unreal · 52.9 GB" or "Unreal isn't running"
     pub ue_title: String,
-    /// "Up 30 min · growing 2.1 GB an hour · 3 compile workers" (may be empty)
-    pub ue_detail: String,
-    pub groups: Vec<GroupLine>,
+    /// Lines under the title, each wrapped on its own: what Unreal's RAM is, then
+    /// "Up 30 min · growing 2.1 GB an hour · Windows promised it 47.0 GB".
+    pub ue_detail: Vec<String>,
+    /// Ranked, largest first; they add up to the RAM in use with Unreal.
+    pub rows: Vec<RamRow>,
+    /// When memory is critical: what to close and what it gets back. Shown in a red-edged box
+    /// whose link opens the checkup.
+    pub fix: Option<String>,
+    pub commit: Meter,
     /// One muted line above the buttons (at most two lines when painted).
     pub advice: Option<String>,
     pub paused: bool,
@@ -128,58 +149,158 @@ pub fn uptime_words(min: u64) -> String {
     }
 }
 
+/// Swatch colours of the RAM parts (docs/UI.md section 3): lime is Unreal, off-white is
+/// what you could close yourself, olive is what MemGuard already holds back, the greys are
+/// Windows' own.
+pub const SW_UNREAL: Rgb = ACCENT;
+pub const SW_OTHER: Rgb = TEXT;
+pub const SW_GROUP: Rgb = Rgb(159, 167, 122);
+pub const SW_CACHE: Rgb = Rgb(112, 136, 146);
+pub const SW_WINDOWS: Rgb = Rgb(124, 125, 117);
+pub const SW_SQUEEZED: Rgb = Rgb(90, 91, 84);
+pub const SW_SHARED: Rgb = Rgb(68, 70, 63);
+
+/// A group gets its own row from this size; smaller groups share one.
+const GROUP_ROW_GB: f64 = 1.0;
+/// The critical box mentions the file cache from this size.
+const CACHE_IN_FIX_FROM_GB: f64 = 2.0;
+/// "Empty it now" shows under "Windows file cache" from this size.
+const EMPTY_CACHE_FROM_GB: f64 = 1.0;
+pub const EMPTY_CACHE_LABEL: &str = "Empty it now (needs admin)";
+/// How many other apps are named.
+const NAMED_APPS: usize = 3;
+/// Other apps are named from this size, or whenever memory is tight.
+const NAME_APPS_FROM_GB: f64 = 1.0;
+
+/// A friendlier name for a few executables whose names say little.
+pub fn app_words(exe: &str) -> String {
+    match exe.to_ascii_lowercase().as_str() {
+        "vmmem" | "vmmemwsl" => "Linux VMs (WSL)".into(),
+        "rider64" => "Rider".into(),
+        "devenv" => "Visual Studio".into(),
+        "code" => "VS Code".into(),
+        "msedge" => "Edge".into(),
+        "chrome" => "Chrome".into(),
+        "firefox" => "Firefox".into(),
+        "zenserver" => "Unreal Zen server".into(),
+        _ => exe.to_string(),
+    }
+}
+
+/// "A, B and C"
+fn and_list(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [a] => a.clone(),
+        [rest @ .., last] => format!("{} and {}", rest.join(", "), last),
+    }
+}
+
 impl FlyoutData {
     /// The flyout for `st`. `growth` is the editor's growth in GB an hour (from the memory
     /// history), `pause_note` the line shown while paused ("Other apps are back to normal
     /// until 15:42.").
     pub fn new(st: &Status, pressure: &Pressure, growth: Option<f64>, pause_note: Option<String>) -> FlyoutData {
         let sys = &st.system;
-        let meter = |label: &str, free: f64, total: f64, pct: f64, tight: f64, critical: f64| Meter {
-            label: label.into(),
-            value: format!("{:.1} of {:.0} GB", free, total),
-            frac: if total > 0.0 { (free / total).clamp(0.0, 1.0) as f32 } else { 0.0 },
-            color: meter_color(pct, tight, critical),
+        let br = &st.ram;
+        let commit = Meter {
+            label: "Commit free".into(),
+            value: format!("{:.1} of {:.0} GB", sys.commit_free_gb, sys.commit_limit_gb),
+            frac: if sys.commit_limit_gb > 0.0 { (sys.commit_free_gb / sys.commit_limit_gb).clamp(0.0, 1.0) as f32 } else { 0.0 },
+            color: meter_color(sys.commit_free_pct, pressure.elevated_commit_free_pct, pressure.critical_commit_free_pct),
         };
-        let ram = meter("RAM free", sys.ram_free_gb, sys.ram_total_gb, sys.ram_free_pct, pressure.elevated_ram_free_pct, pressure.critical_ram_free_pct);
-        let commit = meter(
-            "Commit free",
-            sys.commit_free_gb,
-            sys.commit_limit_gb,
-            sys.commit_free_pct,
-            pressure.elevated_commit_free_pct,
-            pressure.critical_commit_free_pct,
-        );
+        let in_use = if br.in_use_gb > 0.0 { br.in_use_gb } else { (sys.ram_total_gb - sys.ram_free_gb).max(0.0) };
 
+        // Unreal.
         let workers = match st.ue.workers {
             0 => None,
             1 => Some("1 compile worker".to_string()),
             n => Some(format!("{} compile workers", n)),
         };
         let editor = st.ue.processes.iter().filter(|p| p.kind == "editor").max_by(|a, b| a.committed_gb.total_cmp(&b.committed_gb));
-        let (ue_title, ue_detail) = match editor.or_else(|| st.ue.processes.first()) {
-            Some(p) => {
-                let mut parts = vec![uptime_words(p.uptime_min)];
+        let running = editor.is_some() || !st.ue.processes.is_empty() || st.activities.any();
+        let ue_title = if running { format!("Unreal · {}", gb_text(br.unreal_gb)) } else { "Unreal isn't running".to_string() };
+        let mut ue_detail = Vec::new();
+        if running {
+            let mut split = Vec::new();
+            if br.unreal_editor_gb > 0.0 {
+                split.push(format!("Editor {}", gb_text(br.unreal_editor_gb)));
+            }
+            if let Some(w) = &workers {
+                split.push(format!("{} {}", w, gb_text(br.unreal_workers_gb)));
+            }
+            let rest = br.unreal_gb - br.unreal_editor_gb - br.unreal_workers_gb;
+            if rest >= 0.05 && !split.is_empty() {
+                split.push(format!("other {}", gb_text(rest)));
+            }
+            if !split.is_empty() {
+                ue_detail.push(split.join(" · "));
+            }
+            let mut parts = Vec::new();
+            if let Some(p) = editor.or_else(|| st.ue.processes.first()) {
+                parts.push(uptime_words(p.uptime_min));
                 if p.kind == "editor" {
                     if let Some(g) = growth.filter(|g| *g >= 0.1) {
                         parts.push(format!("growing {:.1} GB an hour", g));
                     }
                 }
-                parts.extend(workers);
-                (format!("{} · {}", p.name, gb_text(p.committed_gb)), parts.join(" · "))
             }
-            None if st.activities.any() => (format!("Unreal {} running", mode_words(&st.mode).to_lowercase()), workers.unwrap_or_default()),
-            None => ("Unreal isn't running".to_string(), String::new()),
-        };
+            if st.ue.total_committed_gb > 0.0 {
+                parts.push(format!("Windows promised it {}", gb_text(st.ue.total_committed_gb)));
+            }
+            if !parts.is_empty() {
+                ue_detail.push(parts.join(" · "));
+            }
+        }
 
-        let groups = st
-            .groups
-            .iter()
-            .take(MAX_GROUPS)
-            .map(|g| {
-                let bar = usage_bar(g.ram_mb, g.policy.trim_above_mb);
-                GroupLine { name: g.name.clone(), frac: bar.frac, color: bar.color, value: gb_text(g.ram_mb as f64 / 1024.0) }
-            })
-            .collect();
+        // The other parts, as (name, GB, swatch, its sub-rows). Ranked by the size shown (0.1 GB
+        // steps), so the order always matches the numbers; ties keep this order.
+        let tight = st.pressure >= Level::Elevated;
+        let mut parts: Vec<(String, f64, Rgb, Vec<RamRow>)> = Vec::new();
+        let mut other_rows = Vec::new();
+        if tight || br.other_apps_gb >= NAME_APPS_FROM_GB {
+            let named: Vec<_> = br.top_apps.iter().filter(|a| a.ram_gb >= 0.1).take(NAMED_APPS).collect();
+            for a in &named {
+                other_rows.push(RamRow { name: app_words(&a.name), value: gb_text(a.ram_gb), swatch: SW_OTHER, sub: true, link: false });
+            }
+            let rest_n = br.other_apps_count.saturating_sub(named.len());
+            let rest_gb = br.other_apps_gb - named.iter().map(|a| a.ram_gb).sum::<f64>();
+            if !named.is_empty() && rest_n > 0 {
+                let what = if rest_n == 1 { "1 smaller app".to_string() } else { format!("{} smaller apps", rest_n) };
+                other_rows.push(RamRow { name: what, value: gb_text(rest_gb.max(0.0)), swatch: SW_OTHER, sub: true, link: false });
+            }
+        }
+        parts.push(("Other apps".into(), br.other_apps_gb, SW_OTHER, other_rows));
+        let (big, small): (Vec<_>, Vec<_>) = br.groups.iter().partition(|g| g.ram_gb >= GROUP_ROW_GB);
+        for g in big {
+            parts.push((g.name.clone(), g.ram_gb, SW_GROUP, Vec::new()));
+        }
+        if !small.is_empty() {
+            let names: Vec<String> = small.iter().map(|g| g.name.clone()).collect();
+            parts.push((names.join(", "), small.iter().map(|g| g.ram_gb).sum(), SW_GROUP, Vec::new()));
+        }
+        let empty_link = if br.file_cache_gb >= EMPTY_CACHE_FROM_GB {
+            vec![RamRow { name: EMPTY_CACHE_LABEL.into(), value: String::new(), swatch: SW_CACHE, sub: true, link: true }]
+        } else {
+            Vec::new()
+        };
+        parts.push(("Windows file cache".into(), br.file_cache_gb, SW_CACHE, empty_link));
+        parts.push(("Windows and drivers".into(), br.windows_gb, SW_WINDOWS, Vec::new()));
+        parts.push(("Squeezed by Windows".into(), br.compressed_gb, SW_SQUEEZED, Vec::new()));
+        parts.push(("Shared or not itemized".into(), br.unattributed_gb, SW_SHARED, Vec::new()));
+        // Stable sort: equal sizes keep the order above.
+        parts.sort_by_key(|p| std::cmp::Reverse((p.1 * 10.0).round() as i64));
+
+        let total = sys.ram_total_gb.max(in_use);
+        let share = |gb: f64| if total > 0.0 { (gb / total).clamp(0.0, 1.0) as f32 } else { 0.0 };
+        let mut segments = vec![Segment { frac: share(br.unreal_gb), color: SW_UNREAL }];
+        let mut rows = Vec::new();
+        for (name, gb, swatch, subs) in parts {
+            segments.push(Segment { frac: share(gb), color: swatch });
+            rows.push(RamRow { name, value: gb_text(gb), swatch, sub: false, link: false });
+            rows.extend(subs);
+        }
+        segments.retain(|s| s.frac > 0.0);
 
         let (headline, headline_color) = if st.paused {
             ("PAUSED".to_string(), TEXT)
@@ -190,16 +311,41 @@ impl FlyoutData {
                 Level::Critical => ("MEMORY IS CRITICAL".to_string(), ERROR),
             }
         };
-        let advice = if st.paused { pause_note.or_else(|| st.advice.first().cloned()) } else { st.advice.first().cloned() };
+
+        // Critical: say what closing the biggest other apps gets back. The engine's own
+        // "Memory is critical" advice says the same numbers again, so it gives way.
+        let fix = (!st.paused && st.pressure == Level::Critical).then(|| {
+            let named: Vec<_> = br.top_apps.iter().filter(|a| a.ram_gb >= 0.5).take(NAMED_APPS).collect();
+            let names: Vec<String> = named.iter().map(|a| app_words(&a.name)).collect();
+            let back: f64 = named.iter().map(|a| a.ram_gb).sum();
+            let cache = br.file_cache_gb >= CACHE_IN_FIX_FROM_GB;
+            match (cache, named.is_empty()) {
+                (false, true) => "Don't start a build or cook until this clears.".to_string(),
+                (false, false) => format!("Closing {} gets about {:.1} GB back. Don't start a build or cook yet.", and_list(&names), back),
+                (true, true) => format!("Emptying Windows' file cache gets about {:.1} GB back. Don't start a build or cook yet.", br.file_cache_gb),
+                (true, false) => format!(
+                    "Emptying Windows' file cache gets about {:.1} GB back, closing {} about {:.1} GB. Don't start a build or cook yet.",
+                    br.file_cache_gb,
+                    and_list(&names),
+                    back
+                ),
+            }
+        });
+        let engine_advice = || st.advice.iter().find(|a| fix.is_none() || !a.starts_with("Memory is critical")).cloned();
+        let advice = if st.paused { pause_note.or_else(engine_advice) } else { engine_advice() };
         FlyoutData {
             eyebrow: mode_words(&st.mode).to_uppercase(),
             headline,
             headline_color,
-            ram,
-            commit,
+            ram_in_use: format!("{:.1} of {:.0} GB", in_use, sys.ram_total_gb),
+            ram_free: format!("{} free", gb_text(sys.ram_free_gb)),
+            ram_free_color: meter_color(sys.ram_free_pct, pressure.elevated_ram_free_pct, pressure.critical_ram_free_pct),
+            segments,
             ue_title,
             ue_detail,
-            groups,
+            rows,
+            fix,
+            commit,
             advice,
             paused: st.paused,
         }
@@ -213,6 +359,15 @@ impl FlyoutData {
             ("Settings", Command::OpenSettings),
         ]
     }
+
+    /// The link that opens the checkup: inside the red box when there is one.
+    pub fn checkup_label(&self) -> &'static str {
+        if self.fix.is_some() {
+            FIX_LABEL
+        } else {
+            CHECKUP_LABEL
+        }
+    }
 }
 
 // ---------------------------------------------------------------- layout and paint
@@ -224,24 +379,39 @@ pub struct Layout {
     pub height: i32,
     pub eyebrow: Rect,
     pub headline: Rect,
-    /// (label row, bar) for RAM and commit.
-    pub meters: [(Rect, Rect); 2],
-    /// The full-width Unreal band and its two lines.
+    /// "RAM in use … · … free" and the stacked bar under it.
+    pub ram_label: Rect,
+    pub ram_bar: Rect,
+    /// The full-width Unreal band and its lines.
     pub ue_band: Rect,
     pub ue_title: Rect,
     pub ue_detail: Option<Rect>,
     pub ue_detail_lines: Vec<String>,
-    /// (name, bar, value) per group.
-    pub groups: Vec<(Rect, Rect, Rect)>,
-    /// The "Run a checkup" link (docs/UI.md section 6).
+    /// (swatch, name, value) per row; sub rows have an empty swatch.
+    pub rows: Vec<(Rect, Rect, Rect)>,
+    /// The "Empty it now" link, when the file cache row has one.
+    pub empty_cache: Option<Rect>,
+    /// The red-edged box and its wrapped text, when there is a fix.
+    pub fix_box: Option<Rect>,
+    pub fix_lines: Vec<String>,
+    /// The checkup link ("Run a checkup", or "Review and close" inside the box).
     pub checkup: Rect,
     pub advice: Option<Rect>,
     pub advice_lines: Vec<String>,
+    /// (label row, bar) of Commit free, and its hint lines.
+    pub commit: (Rect, Rect),
+    pub commit_hint: Rect,
+    pub commit_hint_lines: Vec<String>,
     pub actions_band: Rect,
     pub buttons: [Rect; 3],
 }
 
 pub const CHECKUP_LABEL: &str = "Run a checkup";
+pub const FIX_LABEL: &str = "Review and close";
+pub const COMMIT_HINT: &str = "Room left for apps to ask for more memory: RAM plus the page file. When it runs out, apps crash even if RAM is free.";
+
+const F_ROW: Font = Font::new(Face::Body, 12.0, REGULAR);
+const F_ROW_STRONG: Font = Font::new(Face::Body, 12.0, SEMIBOLD);
 
 /// At most two lines, breaking between " · " parts rather than inside one when it can.
 fn wrap_segments(c: &Canvas, s: &str, f: Font, width: i32) -> Vec<String> {
@@ -272,28 +442,20 @@ pub fn layout(c: &Canvas, d: &FlyoutData) -> Layout {
     y += eh + c.s(4.0);
     let hh = c.line_height(F_STATE);
     let headline = Rect::new(pad, y, inner, hh);
-    y += hh + c.s(14.0) - c.s(10.0); // the first meter's top margin follows
+    y += hh + c.s(14.0);
 
-    let meter = |y: &mut i32| {
-        *y += c.s(10.0);
-        let lh = c.line_height(F_METER).max(c.line_height(F_METER_VALUE));
-        let label = Rect::new(pad, *y, inner, lh);
-        *y += lh + c.s(4.0);
-        let bar = Rect::new(pad, *y, inner, c.s(6.0));
-        *y += c.s(6.0);
-        (label, bar)
-    };
-    let m1 = meter(&mut y);
-    let m2 = meter(&mut y);
-    y += c.s(14.0);
+    let mh = c.line_height(F_METER).max(c.line_height(F_METER_VALUE));
+    let ram_label = Rect::new(pad, y, inner, mh);
+    y += mh + c.s(5.0);
+    let ram_bar = Rect::new(pad, y, inner, c.s(10.0));
+    y += c.s(10.0) + c.s(14.0);
 
     let ue_top = y;
-    y += c.s(12.0);
+    y += c.s(11.0);
     let th = c.line_height(F_UE);
     let ue_title = Rect::new(pad, y, inner, th);
     y += th;
-    // Wraps to a second line when it is long ("Up 7 h 30 min · growing 9.4 GB an hour · …").
-    let ue_detail_lines = if d.ue_detail.is_empty() { Vec::new() } else { wrap_segments(c, &d.ue_detail, F_HINT, inner) };
+    let ue_detail_lines: Vec<String> = d.ue_detail.iter().flat_map(|l| wrap_segments(c, l, F_HINT, inner)).collect();
     let ue_detail = if ue_detail_lines.is_empty() {
         None
     } else {
@@ -302,28 +464,57 @@ pub fn layout(c: &Canvas, d: &FlyoutData) -> Layout {
         y += dh;
         Some(r)
     };
-    y += c.s(12.0);
+    y += c.s(11.0);
     let ue_band = Rect::new(0, ue_top, w, y - ue_top);
-    y += c.s(14.0) - c.s(6.0);
+    y += c.s(8.0);
 
-    let gh = c.line_height(F_METER).max(c.s(16.0));
-    let name_w = c.s(90.0);
+    let rh = c.line_height(F_ROW).max(c.line_height(F_ROW_STRONG)).max(c.s(16.0));
     let value_w = c.s(64.0);
+    let sw = c.s(8.0);
     let gap = c.s(8.0);
-    let mut groups = Vec::new();
-    for _ in &d.groups {
-        y += c.s(6.0);
-        let name = Rect::new(pad, y, name_w, gh);
-        let value = Rect::new(pad + inner - value_w, y, value_w, gh);
-        let bx = pad + name_w + gap;
-        let bar = Rect::new(bx, y + (gh - c.s(6.0)) / 2, value.x - gap - bx, c.s(6.0));
-        groups.push((name, bar, value));
-        y += gh;
+    let indent = c.s(16.0);
+    let mut rows = Vec::new();
+    let mut empty_cache = None;
+    for r in &d.rows {
+        y += c.s(if r.sub { 2.0 } else { 5.0 });
+        let value = Rect::new(pad + inner - value_w, y, value_w, rh);
+        let (swatch, x) = if r.sub {
+            (Rect::new(pad + indent, y + (rh - sw) / 2, 0, 0), pad + indent)
+        } else {
+            (Rect::new(pad, y + (rh - sw) / 2, sw, sw), pad + sw + gap)
+        };
+        let name = if r.link { Rect::new(x, y, pad + inner - x, rh) } else { Rect::new(x, y, value.x - gap - x, rh) };
+        if r.link {
+            empty_cache = Some(Rect::new(x, y, (c.measure(&r.name, F_ROW).0 + c.s(2.0)).min(name.w), rh));
+        }
+        rows.push((swatch, name, value));
+        y += rh;
     }
-    y += c.s(10.0);
-    let (lw, lh) = c.measure(CHECKUP_LABEL, F_HINT);
-    let checkup = Rect::new(pad, y, lw + c.s(2.0), lh + c.s(2.0));
-    y += lh + c.s(2.0);
+
+    // The fix box, or the plain checkup link.
+    let lh = c.line_height(F_HINT);
+    let (fix_box, fix_lines, checkup) = match &d.fix {
+        Some(text) => {
+            y += c.s(12.0);
+            let bar = c.s(3.0);
+            let (px, py) = (c.s(12.0), c.s(10.0));
+            let tw = inner - bar - 2 * px;
+            let lines = c.wrap_lines(text, F_ROW, tw, 4);
+            let top = y;
+            y += py + lines.len() as i32 * lh + c.s(4.0);
+            let (lw, llh) = c.measure(FIX_LABEL, F_HINT);
+            let link = Rect::new(pad + bar + px, y, lw + c.s(2.0), llh + c.s(2.0));
+            y += llh + c.s(2.0) + py;
+            (Some(Rect::new(pad, top, inner, y - top)), lines, link)
+        }
+        None => {
+            y += c.s(10.0);
+            let (lw, llh) = c.measure(CHECKUP_LABEL, F_HINT);
+            let link = Rect::new(pad, y, lw + c.s(2.0), llh + c.s(2.0));
+            y += llh + c.s(2.0);
+            (None, Vec::new(), link)
+        }
+    };
 
     let advice_lines = match &d.advice {
         Some(a) if !a.trim().is_empty() => c.wrap_lines(a.trim(), F_HINT, inner, 2),
@@ -333,12 +524,22 @@ pub fn layout(c: &Canvas, d: &FlyoutData) -> Layout {
         None
     } else {
         y += c.s(10.0);
-        let h = advice_lines.len() as i32 * c.line_height(F_HINT);
+        let h = advice_lines.len() as i32 * lh;
         let r = Rect::new(pad, y, inner, h);
         y += h;
         Some(r)
     };
-    y += c.s(14.0);
+
+    // Commit free, under a hairline, with what it means.
+    y += c.s(12.0) + c.s(10.0);
+    let commit_label = Rect::new(pad, y, inner, mh);
+    y += mh + c.s(4.0);
+    let commit_bar = Rect::new(pad, y, inner, c.s(6.0));
+    y += c.s(6.0) + c.s(5.0);
+    let commit_hint_lines = c.wrap_lines(COMMIT_HINT, F_READ_SMALL, inner, 3);
+    let sh = c.line_height(F_READ_SMALL);
+    let commit_hint = Rect::new(pad, y, inner, sh * commit_hint_lines.len() as i32);
+    y += commit_hint.h + c.s(14.0);
 
     let band_top = y;
     let bh = c.s(34.0);
@@ -362,15 +563,22 @@ pub fn layout(c: &Canvas, d: &FlyoutData) -> Layout {
         height,
         eyebrow,
         headline,
-        meters: [m1, m2],
+        ram_label,
+        ram_bar,
         ue_band,
         ue_title,
         ue_detail,
         ue_detail_lines,
-        groups,
+        rows,
+        empty_cache,
+        fix_box,
+        fix_lines,
         checkup,
         advice,
         advice_lines,
+        commit: (commit_label, commit_bar),
+        commit_hint,
+        commit_hint_lines,
         actions_band: Rect::new(0, band_top, w, height - band_top),
         buttons,
     }
@@ -380,28 +588,39 @@ pub fn layout(c: &Canvas, d: &FlyoutData) -> Layout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     Checkup,
+    EmptyCache,
     Button(usize),
 }
 
-pub const TAB_ORDER: [Target; 4] = [Target::Button(0), Target::Button(1), Target::Button(2), Target::Checkup];
+/// The targets this layout has, in Tab order: the buttons, then the links top to bottom.
+pub fn tab_order(l: &Layout) -> Vec<Target> {
+    let mut t = vec![Target::Button(0), Target::Button(1), Target::Button(2)];
+    if l.empty_cache.is_some() {
+        t.push(Target::EmptyCache);
+    }
+    t.push(Target::Checkup);
+    t
+}
 
 impl Target {
     pub fn command(self, d: &FlyoutData) -> Command {
         match self {
             Target::Checkup => Command::OpenDoctor,
+            Target::EmptyCache => Command::FreeWindowsCache,
             Target::Button(i) => d.buttons()[i.min(2)].1,
         }
     }
     fn rect(self, l: &Layout) -> Rect {
         match self {
             Target::Checkup => l.checkup,
+            Target::EmptyCache => l.empty_cache.unwrap_or_default(),
             Target::Button(i) => l.buttons[i.min(2)],
         }
     }
 }
 
 pub fn hit(l: &Layout, p: Pt) -> Option<Target> {
-    TAB_ORDER.iter().copied().find(|t| t.rect(l).contains(p))
+    tab_order(l).into_iter().find(|t| t.rect(l).contains(p))
 }
 
 fn paint_bar(c: &mut Canvas, r: Rect, frac: f32, color: Rgb) {
@@ -413,6 +632,38 @@ fn paint_bar(c: &mut Canvas, r: Rect, frac: f32, color: Rgb) {
     }
 }
 
+/// The stacked bar: each segment a share of the width, split by a one-pixel gap, the empty
+/// track after them is free RAM. A critical bar ends in a red notch.
+fn paint_stack(c: &mut Canvas, r: Rect, segs: &[Segment], critical: bool) {
+    c.fill_round_rect(r, c.s(2.0), RAISED);
+    let gap = c.px1(1.0);
+    let mut x = r.x;
+    let mut acc = 0.0f32;
+    for s in segs {
+        acc += s.frac;
+        let end = r.x + (r.w as f32 * acc.min(1.0)).round() as i32;
+        let w = (end - x).max(c.px1(2.0)).min(r.right() - x);
+        if w > 0 {
+            c.fill_rect(Rect::new(x, r.y, w, r.h), s.color);
+        }
+        x += w;
+        if x < r.right() {
+            c.fill_rect(Rect::new(x, r.y, gap, r.h), BG);
+            x += gap;
+        }
+    }
+    if critical {
+        c.fill_rect(Rect::new(r.right() - c.s(3.0), r.y, c.s(3.0), r.h), ERROR);
+    }
+}
+
+fn paint_lines(c: &mut Canvas, r: Rect, lines: &[String], f: Font, color: Rgb) {
+    let lh = c.line_height(f);
+    for (i, line) in lines.iter().enumerate() {
+        c.text_top(Rect::new(r.x, r.y + i as i32 * lh, r.w, lh), line, f, color, Align::Left);
+    }
+}
+
 /// Paint the flyout filling the canvas (sized `layout().width` x `layout().height`).
 pub fn paint(c: &mut Canvas, d: &FlyoutData, mouse: Option<Pt>, focus: Option<Target>) {
     let l = layout(c, d);
@@ -420,45 +671,83 @@ pub fn paint(c: &mut Canvas, d: &FlyoutData, mouse: Option<Pt>, focus: Option<Ta
     c.spaced_text(l.eyebrow, &d.eyebrow, F_EYEBROW, MUTED, c.s(3.0), Align::Left);
     c.text(l.headline, &c.ellipsize(&d.headline, F_STATE, l.headline.w), F_STATE, d.headline_color, Align::Left);
 
-    for (m, (label, bar)) in [&d.ram, &d.commit].into_iter().zip(l.meters.iter()) {
-        c.text(*label, &m.label, F_METER, MUTED, Align::Left);
-        c.text(*label, &m.value, F_METER_VALUE, TEXT, Align::Right);
-        paint_bar(c, *bar, m.frac, m.color);
-    }
+    // "RAM in use 92.6 of 96 GB" on the left, "3.4 GB free" on the right.
+    const RAM_LABEL: &str = "RAM in use";
+    c.text(l.ram_label, RAM_LABEL, F_METER, MUTED, Align::Left);
+    let lw = c.measure(RAM_LABEL, F_METER).0 + c.s(6.0);
+    let value = Rect::new(l.ram_label.x + lw, l.ram_label.y, l.ram_label.w - lw, l.ram_label.h);
+    c.text(value, &d.ram_in_use, F_METER_VALUE, TEXT, Align::Left);
+    c.text(l.ram_label, &d.ram_free, F_METER_VALUE, d.ram_free_color, Align::Right);
+    paint_stack(c, l.ram_bar, &d.segments, d.ram_free_color == ERROR);
 
     c.fill_rect(l.ue_band, SURFACE);
     c.hline(0, l.ue_band.y, l.width, BORDER);
     c.hline(0, l.ue_band.bottom() - c.px1(1.0), l.width, BORDER);
-    c.text(l.ue_title, &d.ue_title, F_UE, TEXT, Align::Left);
+    let sw = c.s(8.0);
+    let running = !d.ue_detail.is_empty();
+    let title = if running {
+        c.fill_round_rect(Rect::new(l.ue_title.x, l.ue_title.cy() - sw / 2, sw, sw), c.s(2.0), SW_UNREAL);
+        Rect::new(l.ue_title.x + sw + c.s(8.0), l.ue_title.y, l.ue_title.w - sw - c.s(8.0), l.ue_title.h)
+    } else {
+        l.ue_title
+    };
+    c.text(title, &d.ue_title, F_UE, TEXT, Align::Left);
     if let Some(r) = l.ue_detail {
-        let lh = c.line_height(F_HINT);
-        for (i, line) in l.ue_detail_lines.iter().enumerate() {
-            c.text_top(Rect::new(r.x, r.y + i as i32 * lh, r.w, lh), line, F_HINT, MUTED, Align::Left);
-        }
-    }
-
-    for (g, (name, bar, value)) in d.groups.iter().zip(l.groups.iter()) {
-        c.text(*name, &g.name, F_METER, TEXT, Align::Left);
-        paint_bar(c, *bar, g.frac, g.color);
-        c.text(*value, &g.value, F_METER, MUTED, Align::Right);
+        paint_lines(c, r, &l.ue_detail_lines, F_HINT, MUTED);
     }
 
     let hover = |t: Target| mouse.is_some_and(|m| hit(&l, m) == Some(t));
+    for (row, (swatch, name, value)) in d.rows.iter().zip(l.rows.iter()) {
+        if row.link {
+            let col = if hover(Target::EmptyCache) { ACCENT_SOFT } else { ACCENT };
+            c.text(*name, &c.ellipsize(&row.name, F_ROW, name.w), F_ROW, col, Align::Left);
+            let (tw, th) = c.measure(&row.name, F_ROW);
+            c.hline(name.x, name.y + (name.h + th) / 2 - c.s(2.0), tw.min(name.w), col);
+            if focus == Some(Target::EmptyCache) {
+                super::kit::focus_ring(c, l.empty_cache.unwrap_or(*name), c.s(3.0));
+            }
+        } else if row.sub {
+            c.text(*name, &c.ellipsize(&row.name, F_ROW, name.w), F_ROW, TEXT_DIM, Align::Left);
+            c.text(*value, &row.value, F_ROW, MUTED, Align::Right);
+        } else {
+            c.fill_round_rect(*swatch, c.s(2.0), row.swatch);
+            c.text(*name, &c.ellipsize(&row.name, F_ROW, name.w), F_ROW, TEXT, Align::Left);
+            c.text(*value, &row.value, F_ROW_STRONG, TEXT, Align::Right);
+        }
+    }
+
+    if let Some(b) = l.fix_box {
+        c.fill_round_rect(b, c.s(6.0), SURFACE);
+        c.fill_rect(Rect::new(b.x, b.y, c.s(3.0), b.h), ERROR);
+        let text = Rect::new(l.checkup.x, b.y + c.s(10.0), b.right() - c.s(12.0) - l.checkup.x, 0);
+        paint_lines(c, Rect { h: c.line_height(F_ROW) * l.fix_lines.len() as i32, ..text }, &l.fix_lines, F_ROW, TEXT);
+    }
+
     // A left-aligned link in the hint size (kit's Link button is centred and 13 px).
-    let col = if hover(Target::Checkup) { TEXT } else { MUTED };
-    c.text(l.checkup, CHECKUP_LABEL, F_HINT, col, Align::Left);
-    let (tw, th) = c.measure(CHECKUP_LABEL, F_HINT);
+    let label = d.checkup_label();
+    let col = match (d.fix.is_some(), hover(Target::Checkup)) {
+        (true, false) => ACCENT,
+        (true, true) => ACCENT_SOFT,
+        (false, false) => MUTED,
+        (false, true) => TEXT,
+    };
+    c.text(l.checkup, label, F_HINT, col, Align::Left);
+    let (tw, th) = c.measure(label, F_HINT);
     c.hline(l.checkup.x, l.checkup.y + th - c.s(1.0), tw, col);
     if focus == Some(Target::Checkup) {
         super::kit::focus_ring(c, l.checkup, c.s(3.0));
     }
 
     if let Some(r) = l.advice {
-        let lh = c.line_height(F_HINT);
-        for (i, line) in l.advice_lines.iter().enumerate() {
-            c.text_top(Rect::new(r.x, r.y + i as i32 * lh, r.w, lh), line, F_HINT, MUTED, Align::Left);
-        }
+        paint_lines(c, r, &l.advice_lines, F_HINT, MUTED);
     }
+
+    let (label, bar) = l.commit;
+    c.hline(0, label.y - c.s(10.0), l.width, HAIRLINE);
+    c.text(label, &d.commit.label, F_METER, MUTED, Align::Left);
+    c.text(label, &d.commit.value, F_METER_VALUE, TEXT, Align::Right);
+    paint_bar(c, bar, d.commit.frac, d.commit.color);
+    paint_lines(c, l.commit_hint, &l.commit_hint_lines, F_READ_SMALL, MUTED);
 
     c.fill_rect(l.actions_band, SURFACE);
     c.hline(0, l.actions_band.y, l.width, BORDER);
@@ -748,15 +1037,16 @@ unsafe extern "system" fn fly_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 let back = GetKeyState(VK_SHIFT as i32) < 0;
                 FLY.with(|f| {
                     if let Some(fly) = f.borrow_mut().as_mut() {
-                        let n = TAB_ORDER.len();
-                        let i = fly.focus.and_then(|t| TAB_ORDER.iter().position(|x| *x == t));
+                        let order = tab_order(&layout(&fly.canvas, &fly.data));
+                        let n = order.len();
+                        let i = fly.focus.and_then(|t| order.iter().position(|x| *x == t));
                         let next = match (i, back) {
                             (None, false) => 0,
                             (None, true) => n - 1,
                             (Some(i), false) => (i + 1) % n,
                             (Some(i), true) => (i + n - 1) % n,
                         };
-                        fly.focus = Some(TAB_ORDER[next]);
+                        fly.focus = Some(order[next]);
                     }
                 });
                 repaint(hwnd);
@@ -775,9 +1065,11 @@ unsafe extern "system" fn fly_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
 
 // ---------------------------------------------------------------- snapshots
 
-/// The four sample states (snapshot name, data), from the mockup's numbers.
+/// The four sample states (snapshot name, data). Normal and paused use the mockup's numbers;
+/// critical is a 96 GB PC with 3.4 GB free where the editor has 47 GB committed.
 pub fn samples() -> Vec<(&'static str, FlyoutData)> {
     use super::status_source::sample_status;
+    use crate::engine::{AppRam, GroupRam, RamBreakdown};
     let pressure = crate::config::Config::builtin().pressure;
     let normal = sample_status();
 
@@ -789,16 +1081,46 @@ pub fn samples() -> Vec<(&'static str, FlyoutData)> {
     tight.system.commit_free_pct = 14.6;
     tight.ue.processes[0].committed_gb = 58.2;
     tight.ue.processes[0].uptime_min = 245;
+    tight.ue.total_committed_gb = 62.3;
+    tight.ram.in_use_gb = 116.4;
+    tight.ram.unreal_gb = 49.8;
+    tight.ram.unreal_editor_gb = 45.9;
+    tight.ram.file_cache_gb = 35.3;
+    tight.ram.unattributed_gb = 6.7;
 
     let mut critical = sample_status();
+    critical.mode = "editor".into();
+    critical.activities = crate::engine::Activities { editor: true, build: false, cook: false };
     critical.pressure = Level::Critical;
-    critical.system.ram_free_gb = 4.1;
-    critical.system.ram_free_pct = 3.2;
-    critical.system.commit_free_gb = 6.2;
-    critical.system.commit_free_pct = 4.3;
-    critical.ue.processes[0].committed_gb = 71.4;
-    critical.ue.processes[0].uptime_min = 450;
-    critical.advice = vec!["Memory is critical: 4.1 GB RAM free, 6.2 GB commit free. Don't start a build or cook until this clears.".into()];
+    critical.system.ram_total_gb = 96.0;
+    critical.system.ram_free_gb = 3.4;
+    critical.system.ram_free_pct = 3.5;
+    critical.system.commit_limit_gb = 128.0;
+    critical.system.commit_free_gb = 45.0;
+    critical.system.commit_free_pct = 35.2;
+    critical.ue.processes[0].committed_gb = 47.0;
+    critical.ue.processes[0].uptime_min = 5;
+    critical.ue.workers = 0;
+    critical.ue.workers_committed_gb = 0.0;
+    critical.ue.total_committed_gb = 47.0;
+    let app = |name: &str, processes: usize, ram_gb: f64| AppRam { name: name.into(), processes, ram_gb };
+    let group = |name: &str, ram_gb: f64| GroupRam { name: name.into(), ram_gb };
+    critical.ram = RamBreakdown {
+        in_use_gb: 92.6,
+        unreal_gb: 40.2,
+        unreal_editor_gb: 38.5,
+        unreal_workers_gb: 0.0,
+        groups: vec![group("Browsers", 0.1), group("Chat", 0.1), group("Agents", 0.8), group("Background", 0.0)],
+        other_apps_gb: 6.1,
+        other_apps_count: 64,
+        top_apps: vec![app("rider64", 1, 2.9), app("vmmem", 1, 1.6), app("devenv", 2, 0.8), app("Discord", 6, 0.2)],
+        file_cache_gb: 31.5,
+        windows_gb: 7.4,
+        compressed_gb: 2.1,
+        unattributed_gb: 4.3,
+    };
+    critical.groups.iter_mut().for_each(|g| g.ram_mb /= 40);
+    critical.advice = vec!["Memory is critical: 3.4 GB RAM free, 45.0 GB commit free. Don't start a build or cook until this clears.".into()];
 
     let mut paused = sample_status();
     paused.paused = true;
@@ -806,7 +1128,7 @@ pub fn samples() -> Vec<(&'static str, FlyoutData)> {
     vec![
         ("normal", FlyoutData::new(&normal, &pressure, Some(2.1), None)),
         ("tight", FlyoutData::new(&tight, &pressure, Some(6.8), None)),
-        ("critical", FlyoutData::new(&critical, &pressure, Some(9.4), None)),
+        ("critical", FlyoutData::new(&critical, &pressure, None, None)),
         ("paused", FlyoutData::new(&paused, &pressure, Some(2.1), Some("Other apps are back to normal until 15:42.".into()))),
     ]
 }
@@ -836,6 +1158,14 @@ mod tests {
         samples().remove(0).1
     }
 
+    fn gb(v: &str) -> f64 {
+        if let Some(mb) = v.strip_suffix(" MB") {
+            mb.parse::<f64>().unwrap() / 1024.0
+        } else {
+            v.strip_suffix(" GB").unwrap().parse().unwrap()
+        }
+    }
+
     #[test]
     fn words_and_colours() {
         assert_eq!(mode_words("editor+build"), "Editor + build");
@@ -847,6 +1177,10 @@ mod tests {
         assert_eq!(meter_color(3.0, 10.0, 4.0), ERROR);
         assert_eq!(uptime_words(30), "Up 30 min");
         assert_eq!(uptime_words(450), "Up 7 h 30 min");
+        assert_eq!(app_words("vmmemWSL"), "Linux VMs (WSL)");
+        assert_eq!(app_words("Notion"), "Notion");
+        assert_eq!(and_list(&["A".into(), "B".into(), "C".into()]), "A, B and C");
+        assert_eq!(and_list(&["A".into()]), "A");
     }
 
     #[test]
@@ -854,33 +1188,78 @@ mod tests {
         let d = data();
         assert_eq!(d.eyebrow, "EDITOR + BUILD");
         assert_eq!(d.headline, "MEMORY IS FINE");
-        assert_eq!(d.ram.value, "45.1 of 128 GB");
+        assert_eq!(d.ram_in_use, "82.6 of 128 GB");
+        assert_eq!((d.ram_free.as_str(), d.ram_free_color), ("45.1 GB free", ACCENT));
         assert_eq!(d.commit.value, "27.6 of 144 GB");
-        assert_eq!(d.ue_title, "UnrealEditor · 43.8 GB");
-        assert_eq!(d.ue_detail, "Up 30 min · growing 2.1 GB an hour · 3 compile workers");
-        assert_eq!(d.groups.len(), 4);
-        assert_eq!(d.groups[0].value, "4.1 GB");
-        assert_eq!(d.groups[3].value, "819 MB");
-        assert_eq!(d.groups[2].color, MUTED, "Agents has no cap");
-        assert_eq!(d.groups[3].color, WARN, "Background is over its cap");
+        assert_eq!(d.ue_title, "Unreal · 34.0 GB");
+        assert_eq!(d.ue_detail, vec!["Editor 30.1 GB · 3 compile workers 2.4 GB · other 1.5 GB", "Up 30 min · growing 2.1 GB an hour · Windows promised it 47.9 GB"]);
+        // Ranked, largest first; groups of 1 GB and up get a row, the rest share one.
+        let names: Vec<&str> = d.rows.iter().filter(|r| !r.sub).map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["Windows file cache", "Other apps", "Agents", "Windows and drivers", "Browsers", "Shared or not itemized", "Squeezed by Windows", "Chat, Background"]);
+        // Other apps is over 1 GB, so its biggest three are named, then the rest.
+        let other = d.rows.iter().position(|r| r.name == "Other apps").unwrap();
+        let subs: Vec<(&str, &str)> = d.rows[other + 1..other + 5].iter().map(|r| (r.name.as_str(), r.value.as_str())).collect();
+        assert_eq!(subs, [("Rider", "2.8 GB"), ("Linux VMs (WSL)", "1.9 GB"), ("Visual Studio", "717 MB"), ("58 smaller apps", "819 MB")]);
+        assert!(d.rows[other + 1..other + 5].iter().all(|r| r.sub));
+        // The parts add up to the RAM in use, and the bar to its share of total RAM.
+        let sum: f64 = d.rows.iter().filter(|r| !r.sub).map(|r| gb(&r.value)).sum::<f64>() + 34.0;
+        assert!((sum - 82.6).abs() < 0.15, "{}", sum);
+        let bar: f32 = d.segments.iter().map(|s| s.frac).sum();
+        assert!((bar - 82.6 / 127.7).abs() < 0.01, "{}", bar);
+        assert_eq!(d.segments[0].color, SW_UNREAL);
+        assert!(d.fix.is_none() && d.advice.is_none());
+        // The file cache row is followed by its "Empty it now" link.
+        let cache = d.rows.iter().position(|r| r.name == "Windows file cache").unwrap();
+        assert!(d.rows[cache + 1].link && d.rows[cache + 1].sub && d.rows[cache + 1].value.is_empty());
+        assert_eq!(d.rows.iter().filter(|r| r.link).count(), 1);
+        assert_eq!(d.checkup_label(), CHECKUP_LABEL);
         assert_eq!(d.buttons()[1], ("Pause 30 min", Command::Pause30));
-        assert!(d.advice.is_none());
 
         let (_, crit) = samples().remove(2);
         assert_eq!((crit.headline.as_str(), crit.headline_color), ("MEMORY IS CRITICAL", ERROR));
-        assert_eq!(crit.ram.color, ERROR);
-        assert!(crit.advice.is_some());
+        assert_eq!((crit.ram_in_use.as_str(), crit.ram_free.as_str(), crit.ram_free_color), ("92.6 of 96 GB", "3.4 GB free", ERROR));
+        assert_eq!(crit.ue_detail, vec!["Editor 38.5 GB · other 1.7 GB", "Up 5 min · Windows promised it 47.0 GB"]);
+        assert_eq!(
+            crit.fix.as_deref(),
+            Some("Emptying Windows' file cache gets about 31.5 GB back, closing Rider, Linux VMs (WSL) and Visual Studio about 5.3 GB. Don't start a build or cook yet.")
+        );
+        assert_eq!(crit.checkup_label(), FIX_LABEL);
+        assert!(crit.advice.is_none(), "the box replaces the engine's critical line");
+        assert_eq!(crit.rows[0].name, "Windows file cache");
+
         let (_, p) = samples().remove(3);
         assert_eq!(p.headline, "PAUSED");
         assert_eq!(p.buttons()[1], ("Resume", Command::Resume));
         assert_eq!(p.advice.as_deref(), Some("Other apps are back to normal until 15:42."));
+        assert!(p.fix.is_none());
 
         let mut idle = sample_status();
         idle.mode = "idle".into();
         idle.activities = Default::default();
         idle.ue = Default::default();
+        idle.ram.unreal_gb = 0.0;
+        idle.ram.other_apps_gb = 0.4;
         let d = FlyoutData::new(&idle, &crate::config::Config::builtin().pressure, None, None);
-        assert_eq!((d.eyebrow.as_str(), d.ue_title.as_str(), d.ue_detail.as_str()), ("IDLE", "Unreal isn't running", ""));
+        assert_eq!((d.eyebrow.as_str(), d.ue_title.as_str()), ("IDLE", "Unreal isn't running"));
+        assert!(d.ue_detail.is_empty());
+        assert!(d.rows.iter().all(|r| !r.sub || r.link), "small other apps aren't itemized when memory is fine");
+    }
+
+    #[test]
+    fn critical_without_big_apps_still_says_wait() {
+        let mut st = sample_status();
+        st.pressure = Level::Critical;
+        st.ram.top_apps.iter_mut().for_each(|a| a.ram_gb = 0.2);
+        let pressure = crate::config::Config::builtin().pressure;
+        let d = FlyoutData::new(&st, &pressure, None, None);
+        assert_eq!(d.fix.as_deref(), Some("Emptying Windows' file cache gets about 22.4 GB back. Don't start a build or cook yet."));
+        // A small cache is neither in the box nor offered.
+        st.ram.file_cache_gb = 0.8;
+        let d = FlyoutData::new(&st, &pressure, None, None);
+        assert_eq!(d.fix.as_deref(), Some("Don't start a build or cook until this clears."));
+        assert!(!d.rows.iter().any(|r| r.link));
+        let l = layout(&Canvas::new(1, 1, Scale(1.0)), &d);
+        assert!(l.empty_cache.is_none() && !tab_order(&l).contains(&Target::EmptyCache));
     }
 
     #[test]
@@ -891,12 +1270,12 @@ mod tests {
                 let l = layout(&c, &d);
                 let bounds = Rect::new(0, 0, l.width, l.height);
                 assert_eq!(l.width, scale.s(WIDTH));
-                let mut rects = vec![l.eyebrow, l.headline, l.ue_band, l.ue_title, l.checkup, l.actions_band];
-                rects.extend(l.meters.iter().flat_map(|(a, b)| [*a, *b]));
-                rects.extend(l.groups.iter().flat_map(|(a, b, v)| [*a, *b, *v]));
+                let mut rects = vec![l.eyebrow, l.headline, l.ram_label, l.ram_bar, l.ue_band, l.ue_title, l.checkup, l.commit.0, l.commit.1, l.commit_hint, l.actions_band];
+                rects.extend(l.rows.iter().flat_map(|(_, n, v)| [*n, *v]));
                 rects.extend(l.buttons);
                 rects.extend(l.advice);
                 rects.extend(l.ue_detail);
+                rects.extend(l.fix_box);
                 for r in &rects {
                     assert!(bounds.encloses(r) && !r.is_empty(), "{} at {:?}: {:?} outside {:?}", name, scale, r, bounds);
                 }
@@ -909,16 +1288,35 @@ mod tests {
                     }
                 }
                 // Top to bottom, nothing overlaps.
-                let order = [l.headline.bottom() <= l.meters[0].0.y, l.meters[0].1.bottom() <= l.meters[1].0.y, l.meters[1].1.bottom() <= l.ue_band.y];
-                assert!(order.iter().all(|x| *x), "{} order", name);
-                assert!(l.groups.last().map_or(l.ue_band.bottom(), |g| g.0.bottom()) <= l.checkup.y);
-                assert!(l.advice.map_or(l.checkup.bottom(), |a| a.bottom()) <= l.actions_band.y);
+                assert!(l.headline.bottom() <= l.ram_label.y && l.ram_label.bottom() <= l.ram_bar.y && l.ram_bar.bottom() <= l.ue_band.y, "{} order", name);
+                let mut y = l.ue_band.bottom();
+                for (_, n, _) in &l.rows {
+                    assert!(n.y >= y, "{} rows overlap", name);
+                    y = n.bottom();
+                }
+                match l.fix_box {
+                    Some(b) => {
+                        assert!(y <= b.y && b.encloses(&l.checkup), "{} fix box", name);
+                        y = b.bottom();
+                    }
+                    None => {
+                        assert!(y <= l.checkup.y);
+                        y = l.checkup.bottom();
+                    }
+                }
+                assert!(l.advice.map_or(y, |a| a.bottom()) <= l.commit.0.y);
+                assert!(l.commit_hint.bottom() <= l.actions_band.y);
                 assert!(c.measure(&d.headline, F_STATE).0 <= l.headline.w, "{} headline clips", name);
                 for line in l.ue_detail_lines.iter().chain(&l.advice_lines) {
                     assert!(c.measure(line, F_HINT).0 <= l.inner_width() && !line.ends_with('…'), "{} line clips: {}", name, line);
                 }
+                for line in &l.commit_hint_lines {
+                    assert!(c.measure(line, F_READ_SMALL).0 <= l.inner_width() && !line.ends_with('…'), "{} hint clips: {}", name, line);
+                }
+                assert!(!l.fix_lines.iter().any(|x| x.ends_with('…')), "{} fix clips", name);
                 // Tab order reaches every target.
-                for t in TAB_ORDER {
+                assert_eq!(l.empty_cache.is_some(), d.rows.iter().any(|r| r.link), "{}", name);
+                for t in tab_order(&l) {
                     assert!(hit(&l, Pt::new(t.rect(&l).cx(), t.rect(&l).cy())) == Some(t));
                 }
             }
@@ -953,6 +1351,11 @@ mod tests {
         assert_eq!(c.pixel(l.width / 2, l.eyebrow.y - 4), BG);
         assert_eq!(c.pixel(4, l.ue_band.cy()), SURFACE);
         assert_eq!(c.pixel(l.buttons[0].x + 3, l.buttons[0].cy()), ACCENT);
+        assert_eq!(c.pixel(l.ram_bar.x + 2, l.ram_bar.cy()), SW_UNREAL);
+        // The link is a target that empties the cache.
+        let r = l.empty_cache.unwrap();
+        assert_eq!(hit(&l, Pt::new(r.cx(), r.cy())), Some(Target::EmptyCache));
+        assert_eq!(Target::EmptyCache.command(&data()), Command::FreeWindowsCache);
     }
 }
 

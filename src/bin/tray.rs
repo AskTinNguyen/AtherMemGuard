@@ -21,6 +21,8 @@ enum Command {
     Install(install::InstallOptions),
     /// Paint every UI surface with sample data into PNG files (docs/UI.md, for review).
     UiSnapshots(String),
+    /// Started elevated by the tray's "Free Windows file cache": empty it, exit 0 when done.
+    FlushCache,
     /// Anything else: say so in the log and do nothing.
     Unknown(String),
 }
@@ -35,6 +37,7 @@ fn parse_args(args: &[String]) -> Command {
         },
         "--uninstall" if rest.is_empty() => Command::Uninstall,
         "--settings" if rest.is_empty() => Command::Settings,
+        "--flush-cache" if rest.is_empty() => Command::FlushCache,
         "--ui-snapshots" => match rest {
             [dir] => Command::UiSnapshots(dir.clone()),
             _ => Command::Unknown(args.join(" ")),
@@ -100,6 +103,13 @@ fn main() {
             }
         }
         Command::Install(opts) => run_install(opts),
+        Command::FlushCache => match athermemguard::ops::flush_cache_here() {
+            Ok(()) => 0,
+            Err(e) => {
+                log::write(&format!("--flush-cache: {}", e));
+                1
+            }
+        },
         Command::UiSnapshots(dir) => {
             let dir = std::path::Path::new(&dir);
             match athermemguard::ui::snapshots::write_all(dir) {
@@ -136,6 +146,7 @@ mod tests {
         assert_eq!(p(&["--uninstall"]), Command::Uninstall);
         assert_eq!(p(&["--UNINSTALL"]), Command::Uninstall);
         assert_eq!(p(&["--settings"]), Command::Settings);
+        assert_eq!(p(&["--flush-cache"]), Command::FlushCache);
         let opts = |add_to_path, start_with_windows, start| Command::Install(install::InstallOptions { add_to_path, start_with_windows, start });
         assert_eq!(p(&["--install"]), opts(true, true, true));
         assert_eq!(p(&["--install", "--no-path"]), opts(false, true, true));

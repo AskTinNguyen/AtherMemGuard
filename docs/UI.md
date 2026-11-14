@@ -176,6 +176,9 @@ Catalogue (exact wording; `{}` are values):
 | Pressure back to normal after critical | Info | Memory is fine again | {ram} GB RAM free. | |
 | Auto-primed | Info | Freed memory for the {build\|cook} | Held back {n} background processes using {x} GB. | |
 | Manual free memory | Info | Freed memory for Unreal | Held back {n} background processes. RAM free went from {a} to {b} GB. | |
+| Emptied the file cache | Info | Emptied Windows' file cache | It held {x} GB. RAM free went from {a} to {b} GB. | |
+| File cache: permission declined | Info | Windows' file cache is unchanged | Emptying it needs administrator permission, and that was declined. | |
+| File cache: failed | Error | Couldn't empty Windows' file cache | {why}. | |
 | Editor restart hint | Warning | Unreal Editor is at {n} GB | It has been open {h} h {m} min. Restarting it gets that memory back. | |
 | Editor growing | Warning | Unreal Editor is growing {n} GB an hour | At this rate memory runs out in about {t}. | Show history |
 | Paused | Info | Paused for 30 minutes | Other apps are back to normal until {hh:mm}. | Resume now |
@@ -208,6 +211,7 @@ Pressure going from normal to tight shows no toast (the icon dot and flyout carr
 {Mode} · memory is {fine|tight|critical}        (disabled status line)
 ────────
 Free memory now                    {hotkey}
+Empty Windows file cache…                      (Windows asks for administrator permission)
 Pause for 30 minutes
 Pause until I resume                           (both replaced by "Resume" while paused)
 ────────
@@ -220,14 +224,43 @@ Quit Ather MemGuard
 ```
 
 - **Flyout** (`src/ui/flyout.rs`): 340 px wide borderless popup anchored above the tray icon
-  (use `Shell_NotifyIconGetRect`), closes on focus loss or Esc. Eyebrow = mode ("EDITOR +
-  BUILD", "IDLE"); headline "MEMORY IS FINE" / "MEMORY IS TIGHT" (amber) / "MEMORY IS
-  CRITICAL" (red) / "PAUSED"; two meters, RAM free and Commit free (bar = share free; lime
-  above the tight threshold, amber below it, red below critical); the Unreal strip
-  ("UnrealEditor · 43.8 GB" / "Up 30 min · growing 2.1 GB an hour · 3 compile workers", or
-  "Unreal isn't running"); one line per group with a bar against its cap and its RAM;
-  buttons "Free memory" (primary), "Pause 30 min" (or "Resume"), "Settings". Any advice
-  from `Status.advice` shows as one muted line above the buttons, at most two lines.
+  (use `Shell_NotifyIconGetRect`), closes on focus loss or Esc. Its job is to say what is
+  using the RAM, so every part it lists adds up to the RAM in use (`Status.ram`, built by
+  `engine::ram_breakdown`).
+  - Eyebrow = mode ("EDITOR + BUILD", "IDLE"); headline "MEMORY IS FINE" / "MEMORY IS TIGHT"
+    (amber) / "MEMORY IS CRITICAL" (red) / "PAUSED".
+  - "RAM in use 92.6 of 96 GB" with "3.4 GB free" on the right (lime / amber / red by the
+    pressure thresholds), over one stacked bar: a segment per part as a share of total RAM,
+    the empty track is free. A critical bar ends in a red notch.
+  - The Unreal band: "Unreal · 52.9 GB" (private RAM of everything on the protect list and the
+    workers), "Editor 41.6 GB · 14 compile workers 9.8 GB · other 1.5 GB", then "Up 5 min ·
+    growing 2.1 GB an hour · Windows promised it 47.0 GB" (the committed total), or "Unreal
+    isn't running".
+  - Rows, largest first by the size shown, each with a swatch matching its bar segment:
+    "Other apps" (apps in no group; its three biggest named, then "N smaller apps", when it is
+    1 GB or more or memory is tight), each group of 1 GB or more, the smaller groups on one
+    row ("Chat, Background"), "Windows file cache", "Windows and drivers", "Squeezed by
+    Windows" (the Memory Compression process), "Shared or not itemized" (the rest: memory
+    processes share, memory drivers lock). From 1 GB, "Windows file cache" has the link "Empty
+    it now (needs admin)" under it (`Command::FreeWindowsCache`, see below).
+  - Critical: a red-edged box "Closing {apps} gets about {x} GB back. Don't start a build or
+    cook yet." (apps of 0.5 GB and up, at most three), led by "Emptying Windows' file cache gets
+    about {c} GB back" when the cache holds 2 GB or more with the link "Review and close" (opens
+    the checkup; nothing closes from the flyout). Otherwise the link "Run a checkup".
+  - Advice from `Status.advice` as one muted line, at most two lines (the critical line gives
+    way to the box).
+  - "Commit free" meter under a hairline, with the hint "Room left for apps to ask for more
+    memory: RAM plus the page file. When it runs out, apps crash even if RAM is free."
+  - Buttons "Free memory" (primary), "Pause 30 min" (or "Resume"), "Settings".
+  - App names are only in memory: `RamBreakdown::top_apps` is left out of status.json.
+- **Emptying Windows' file cache** (`Command::FreeWindowsCache`, `ops::flush_cache`): Windows
+  only lets an elevated process do it, and the tray runs as the user. So the tray starts its
+  own exe as `AtherMemGuard.exe --flush-cache` with the `runas` verb: Windows shows its
+  administrator prompt, the elevated copy empties the cache (`SetSystemFileCacheSize(-1, -1)`)
+  and writes out the modified list, then exits. The tray measures RAM free and the cache before
+  and after and shows a toast. The pages go to the standby list, which counts as available;
+  Windows reads the files again when they are needed. Nothing does this on its own: only a
+  click (or `memguard flush-cache`), because each run asks for permission.
 - **Hotkey**: `general.prime_hotkey` registered with `RegisterHotKey`; runs FreeMemory. If
   registration fails, an error toast "Shortcut {keys} is taken" with "Pick another one in
   Settings.", once per start.

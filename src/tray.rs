@@ -129,6 +129,7 @@ pub mod model {
     pub fn menu(v: &TrayView) -> Vec<MenuEntry> {
         let mut m = vec![MenuEntry::Status(status_line(v)), MenuEntry::Separator];
         m.push(MenuEntry::Item { label: "Free memory now".into(), accel: v.hotkey.clone(), cmd: Command::FreeMemory, checked: false, disabled: false });
+        m.push(item("Empty Windows file cache…", Command::FreeWindowsCache));
         if v.paused {
             m.push(item("Resume", Command::Resume));
         } else {
@@ -750,6 +751,8 @@ pub mod doctor_map {
 /// What a worker thread hands back to the tray thread.
 enum Work {
     Primed(ops::PrimeReport),
+    /// "Empty Windows file cache" finished (or was declined).
+    CacheFlushed(ops::CacheFlushReport),
     Checked { manual: bool, result: CheckResult },
     Progress(u32),
     Downloaded(Result<PathBuf, String>),
@@ -809,6 +812,8 @@ struct App {
     hotkey_warned: bool,
     updates: Updates,
     priming: bool,
+    /// "Empty Windows file cache" is running (the administrator prompt may be up).
+    flushing: bool,
     dblclick_at: Option<Instant>,
     /// Closes `[doctor] close_while_unreal` apps while Unreal works.
     guard: crate::doctor::Guard,
@@ -1074,6 +1079,19 @@ impl App {
 
     fn on_work(&mut self, w: Work) {
         match w {
+            Work::CacheFlushed(r) => {
+                self.flushing = false;
+                if r.ok {
+                    toast::show(catalog::cache_flushed(r.file_cache_before_gb, r.ram_free_before_gb, r.ram_free_after_gb));
+                } else if r.declined {
+                    toast::show(catalog::cache_flush_declined());
+                } else {
+                    let why = r.error.unwrap_or_else(|| "it failed".into());
+                    crate::log::write(&format!("empty file cache: {}", why));
+                    toast::show(catalog::cache_flush_failed(&why));
+                }
+                self.tick();
+            }
             Work::Primed(r) => {
                 self.priming = false;
                 self.engine.forget_applied(); // prime set memory priorities of its own
@@ -1231,6 +1249,17 @@ fn dispatch(hwnd: HWND, cmd: Command) {
                 a.priming = true;
                 let cfg = a.engine.cfg.clone();
                 spawn_work(a.hwnd, move || Work::Primed(ops::prime(&cfg, None, false)));
+            });
+        }
+        Command::FreeWindowsCache => {
+            with_app(|a| {
+                if a.flushing {
+                    return;
+                }
+                a.flushing = true;
+                // Not elevated, this starts AtherMemGuard.exe --flush-cache elevated and waits.
+                let exe = std::env::current_exe().unwrap_or_else(|_| "AtherMemGuard.exe".into());
+                spawn_work(a.hwnd, move || Work::CacheFlushed(ops::flush_cache(&exe, "--flush-cache")));
             });
         }
         Command::Pause30 => {
@@ -1524,6 +1553,7 @@ fn run_with(after_update: bool, open_settings: bool) {
                 toast: ToastId(0),
             },
             priming: false,
+            flushing: false,
             dblclick_at: None,
             guard: crate::doctor::Guard::from_settings(),
             guard_pending: None,
@@ -1580,6 +1610,21 @@ pub fn status_text(st: &Status) -> String {
         st.system.commit_free_gb,
         st.system.commit_limit_gb
     );
+    let r = &st.ram;
+    if r.in_use_gb > 0.0 {
+        let mut parts = vec![("Unreal".to_string(), r.unreal_gb)];
+        parts.extend(r.groups.iter().map(|g| (g.name.clone(), g.ram_gb)));
+        parts.extend([
+            ("other apps".to_string(), r.other_apps_gb),
+            ("Windows file cache".to_string(), r.file_cache_gb),
+            ("Windows and drivers".to_string(), r.windows_gb),
+            ("squeezed by Windows".to_string(), r.compressed_gb),
+            ("shared or not itemized".to_string(), r.unattributed_gb),
+        ]);
+        parts.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let list: Vec<String> = parts.iter().filter(|p| p.1 >= 0.05).map(|(n, gb)| format!("{} {:.1}", n, gb)).collect();
+        s.push_str(&format!("RAM in use: {:.1} GB = {} (GB)\n", r.in_use_gb, list.join(", ")));
+    }
     if !st.ue.processes.is_empty() || st.ue.workers > 0 {
         s.push_str("\nUnreal\n");
         for p in &st.ue.processes {
@@ -1726,6 +1771,7 @@ mod tests {
                 "[Editor + build · memory is fine]",
                 "-",
                 "Free memory now <Ctrl+Alt+M>",
+                "Empty Windows file cache…",
                 "Pause for 30 minutes",
                 "Pause until I resume",
                 "-",
@@ -1746,7 +1792,7 @@ mod tests {
         p.pressure = Some(Level::Critical);
         let l = labels(&menu(&p));
         assert_eq!(l[0], "[Editor + build · memory is critical]");
-        assert_eq!(&l[2..5], ["Free memory now", "Resume", "-"]);
+        assert_eq!(&l[2..6], ["Free memory now", "Empty Windows file cache…", "Resume", "-"]);
         assert!(l.contains(&"Update to version 0.2.1…".to_string()));
         assert!(l.contains(&"Run at Windows startup".to_string()));
         p.updating = true;
@@ -1758,6 +1804,7 @@ mod tests {
             cmds,
             [
                 Command::FreeMemory,
+                Command::FreeWindowsCache,
                 Command::Pause30,
                 Command::PauseUntilResumed,
                 Command::OpenSettings,

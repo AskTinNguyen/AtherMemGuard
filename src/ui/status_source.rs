@@ -1,7 +1,7 @@
 //! Where the UI gets the engine's latest `Status` (the tray loop owns the engine).
 
 use crate::config::{Cpu, MemPriority};
-use crate::engine::{Activities, Effective, GroupStatus, Level, Status, SystemStatus, UeProcess, UeStatus};
+use crate::engine::{Activities, AppRam, Effective, GroupRam, GroupStatus, Level, RamBreakdown, Status, SystemStatus, UeProcess, UeStatus};
 
 pub trait StatusSource {
     /// The engine's most recent status, `None` before the first tick.
@@ -84,7 +84,28 @@ pub fn sample_status() -> Status {
             group("Agents", 26, 6554, 0, MemPriority::Low, Cpu::Normal),
             group("Background", 19, 819, 614, MemPriority::VeryLow, Cpu::Eco),
         ],
+        ram: sample_breakdown(),
         advice: Vec::new(),
         worker_pids: Vec::new(),
+    }
+}
+
+/// The sample's RAM in use (82.6 GB) split up; the parts add up.
+pub fn sample_breakdown() -> RamBreakdown {
+    let app = |name: &str, processes: usize, ram_gb: f64| AppRam { name: name.into(), processes, ram_gb };
+    let group = |name: &str, ram_gb: f64| GroupRam { name: name.into(), ram_gb };
+    RamBreakdown {
+        in_use_gb: 82.6,
+        unreal_gb: 34.0,
+        unreal_editor_gb: 30.1,
+        unreal_workers_gb: 2.4,
+        groups: vec![group("Browsers", 3.6), group("Chat", 0.9), group("Agents", 5.8), group("Background", 0.6)],
+        other_apps_gb: 6.2,
+        other_apps_count: 61,
+        top_apps: vec![app("rider64", 1, 2.8), app("vmmem", 1, 1.9), app("devenv", 2, 0.7), app("Discord", 6, 0.3), app("Spotify", 5, 0.2)],
+        file_cache_gb: 22.4,
+        windows_gb: 5.3,
+        compressed_gb: 1.6,
+        unattributed_gb: 2.2,
     }
 }
