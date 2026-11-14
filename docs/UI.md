@@ -190,6 +190,8 @@ Catalogue (exact wording; `{}` are values):
 | Startup toggled | Info | Run at startup: On \| Off | | |
 | Settings problem | Error | There's a problem in your settings | {message} The last good settings are still in use. | Open file |
 | Setup copied | Info | Agent setup copied | Paste it into your agent's terminal. | |
+| About three minutes after start, the RAM runs below its rated speed; once per report `fingerprint` (`[tray] last_ram_fingerprint` in ui-state.toml); never with notifications or `general.check_ram_speed` off | Warning | Your RAM is running below its rated speed | {current} MHz now, rated {rated} MHz. Turning on {XMP\|EXPO} in the BIOS takes about five minutes. | Show me how |
+| Same, but the RAM check found another problem (old Intel microcode, both sticks on one channel) and the speed is fine | Warning | {the finding's title} | {the finding's detail} | Show me how |
 
 Pressure going from normal to tight shows no toast (the icon dot and flyout carry it).
 

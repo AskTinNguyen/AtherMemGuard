@@ -52,6 +52,8 @@ const TIMER_ID: usize = 1;
 const HOTKEY_ID: i32 = 1;
 const FIRST_UPDATE_CHECK: Duration = Duration::from_secs(60);
 const UPDATE_EVERY: Duration = Duration::from_secs(24 * 3600);
+/// How long after start the RAM check runs for its toast (it reads firmware tables; no hurry).
+const RAM_CHECK_AFTER: Duration = Duration::from_secs(180);
 /// The RAM report page "Show me how" writes into the data folder.
 pub const RAM_REPORT_FILE: &str = "ram-report.html";
 pub const RELEASES_URL: &str = "https://github.com/AskTinNguyen/AtherMemGuard/releases/latest";
@@ -298,6 +300,29 @@ pub mod model {
         let mut apps: Vec<&crate::doctor::Finding> = r.findings.iter().filter(|f| f.kind == FindingKind::App && f.verdict == Verdict::Close).collect();
         apps.sort_by(|a, b| b.ram_mb.cmp(&a.ram_mb));
         Some((r.reclaimable_ram_gb, apps.iter().take(3).map(|f| f.title.clone()).collect()))
+    }
+
+    /// May the RAM check run for its toast? Never with notifications or the check off.
+    pub fn should_check_ram(notifications: bool, check_ram_speed: bool) -> bool {
+        notifications && check_ram_speed
+    }
+
+    /// The RAM check's toast, once per situation: `None` when nothing needs attention or when
+    /// this `fingerprint` was announced before (`last_announced`). Running below the rated
+    /// speed says so with the numbers; otherwise the first problem finding speaks for itself.
+    pub fn ram_toast(r: &crate::ramcheck::RamReport, last_announced: Option<&str>) -> Option<Toast> {
+        use crate::ramcheck::{needs_attention, Severity, Verdict};
+        if !needs_attention(r) || last_announced == Some(r.fingerprint.as_str()) {
+            return None;
+        }
+        if r.verdict == Verdict::BelowRated {
+            if let (Some(now), Some(rated)) = (r.current_mhz, r.rated.as_ref()) {
+                return Some(catalog::ram_below_rated(now, rated.speed_mhz, &rated.profile_kind));
+            }
+        }
+        let f = r.findings.iter().find(|f| f.severity == Severity::Problem && f.id != "ram:speed")
+            .or_else(|| r.findings.iter().find(|f| f.severity == Severity::Problem))?;
+        Some(catalog::ram_problem(&f.title, &f.detail))
     }
 
     /// A value from the `[tray]` table of ui-state.toml.
@@ -732,6 +757,8 @@ enum Work {
     /// The checkup that runs when Unreal work starts: (GB to free, top app names) when it is
     /// worth a nudge.
     Nudge(Option<(f64, Vec<String>)>),
+    /// The RAM check a few minutes after start.
+    RamChecked(Box<crate::ramcheck::RamReport>),
 }
 
 fn post_work(hwnd: isize, w: Work) {
@@ -785,6 +812,8 @@ struct App {
     /// Unreal work (editor, build or cook) on the last tick.
     was_active: bool,
     nudge_running: bool,
+    /// When the RAM check for its toast runs; `None` once it has (or was skipped).
+    ram_check_at: Option<Instant>,
 }
 
 thread_local! {
@@ -963,6 +992,13 @@ impl App {
         }
         self.watch_unreal(&st);
         let now = Instant::now();
+        if self.ram_check_at.is_some_and(|at| now >= at) {
+            self.ram_check_at = None;
+            let g = &self.engine.cfg.general;
+            if should_check_ram(g.notifications, g.check_ram_speed) {
+                spawn_work(self.hwnd, || Work::RamChecked(Box::new(crate::ramcheck::check_cached().clone())));
+            }
+        }
         if self.engine.cfg.updates.check_automatically && now >= self.updates.next_auto && !self.updates.checking && !self.updates.downloading {
             self.updates.next_auto = now + UPDATE_EVERY;
             self.start_check(false);
@@ -1108,6 +1144,17 @@ impl App {
                         set_tray_state("last_nudge_day", toml::Value::String(today));
                         crate::log::write(&format!("checkup nudge: {:.1} GB could be freed", gb));
                         toast::show(catalog::checkup_nudge(gb, &names));
+                    }
+                }
+            }
+            Work::RamChecked(r) => {
+                let g = &self.engine.cfg.general;
+                if should_check_ram(g.notifications, g.check_ram_speed) {
+                    let last = tray_state("last_ram_fingerprint").and_then(|v| v.as_str().map(str::to_string));
+                    if let Some(t) = ram_toast(&r, last.as_deref()) {
+                        set_tray_state("last_ram_fingerprint", toml::Value::String(r.fingerprint.clone()));
+                        crate::log::write(&format!("RAM check: {}", r.headline));
+                        toast::show(t);
                     }
                 }
             }
@@ -1476,6 +1523,7 @@ fn run_with(after_update: bool, open_settings: bool) {
             guard_pending: None,
             was_active: false,
             nudge_running: false,
+            ram_check_at: Some(Instant::now() + RAM_CHECK_AFTER),
         };
         app.add_icon();
         crate::log::write(&format!("Ather MemGuard {} started", env!("CARGO_PKG_VERSION")));
@@ -1971,6 +2019,72 @@ mod tests {
 
         // The day lives in ui-state.toml's [tray] table.
         let text = with_tray_value("", "last_nudge_day", toml::Value::String("2026-11-14".into()));
+        assert_eq!(tray_value(&text, "last_nudge_day").unwrap().as_str(), Some("2026-11-14"));
+    }
+
+    fn ram(verdict: crate::ramcheck::Verdict, problems: &[(&str, &str, &str)], fingerprint: &str) -> crate::ramcheck::RamReport {
+        use crate::ramcheck::{RamFinding, Rated, Severity};
+        let mut r = crate::ramcheck::check_from(&crate::smbios::Smbios::default(), "", None, (2026, 11, 14));
+        r.verdict = verdict;
+        r.current_mhz = Some(4800);
+        r.rated = Some(Rated {
+            speed_mhz: 6000,
+            cl: Some(30),
+            timings: None,
+            voltage: Some(1.35),
+            voltage_is_typical: true,
+            profile_kind: "EXPO".into(),
+            confidence: "part_number".into(),
+        });
+        r.findings = problems
+            .iter()
+            .map(|(id, title, detail)| RamFinding { id: id.to_string(), severity: Severity::Problem, title: title.to_string(), detail: detail.to_string() })
+            .collect();
+        r.findings.push(RamFinding { id: "ram:cpu".into(), severity: Severity::Caution, title: "Keep SoC voltage at or under 1.3 V".into(), detail: String::new() });
+        r.fingerprint = fingerprint.into();
+        r
+    }
+
+    #[test]
+    fn ram_toast_once_per_fingerprint() {
+        use crate::ramcheck::Verdict as V;
+        let below = ram(V::BelowRated, &[("ram:speed", "Your RAM is running below its rated speed", "4800 MHz now.")], "fp1");
+        let t = ram_toast(&below, None).expect("announced the first time");
+        assert_eq!(t, catalog::ram_below_rated(4800, 6000, "EXPO"));
+        assert_eq!(t.title, "Your RAM is running below its rated speed");
+        assert_eq!(t.body, "4800 MHz now, rated 6000 MHz. Turning on EXPO in the BIOS takes about five minutes.");
+        assert_eq!(t.actions, vec![("Show me how".to_string(), Command::ShowRamReport)]);
+        // Once per fingerprint: the same situation stays quiet, a changed one speaks again.
+        assert_eq!(ram_toast(&below, Some("fp1")), None);
+        assert!(ram_toast(&below, Some("fp0")).is_some());
+
+        // Speed fine but a problem: that finding's own words.
+        let micro = ram(V::AtRated, &[("ram:microcode", "Update the BIOS before changing memory settings", "This CPU runs microcode 0x129.")], "fp2");
+        let t = ram_toast(&micro, Some("fp1")).unwrap();
+        assert_eq!((t.title.as_str(), t.body.as_str()), ("Update the BIOS before changing memory settings", "This CPU runs microcode 0x129."));
+        assert_eq!(t.kind, crate::ui::toast::ToastKind::Warning);
+        assert_eq!(t.actions, vec![("Show me how".to_string(), Command::ShowRamReport)]);
+        assert_eq!(ram_toast(&micro, Some("fp2")), None);
+
+        // Below rated wins over another problem: the speed toast, with the numbers.
+        let both = ram(V::BelowRated, &[("ram:speed", "x", "y"), ("ram:slots", "Both sticks are on the same memory channel", "Move them.")], "fp3");
+        assert_eq!(ram_toast(&both, None).unwrap().title, "Your RAM is running below its rated speed");
+
+        // Nothing to act on: no toast, cautions included.
+        for v in [V::AtRated, V::NoProfile, V::MixedKit, V::Unknown, V::NotApplicable] {
+            assert_eq!(ram_toast(&ram(v, &[], "fp"), None), None, "{:?}", v);
+        }
+
+        // Never with notifications or the check off.
+        assert!(should_check_ram(true, true));
+        assert!(!should_check_ram(false, true));
+        assert!(!should_check_ram(true, false));
+        assert!(!should_check_ram(false, false));
+
+        // The last announced fingerprint lives in ui-state.toml's [tray] table.
+        let text = with_tray_value("", "last_nudge_day", toml::Value::String("2026-11-14".into()));
+        let text = with_tray_value(&text, "last_ram_fingerprint", toml::Value::String("fp1".into()));
+        assert_eq!(tray_value(&text, "last_ram_fingerprint").unwrap().as_str(), Some("fp1"));
         assert_eq!(tray_value(&text, "last_nudge_day").unwrap().as_str(), Some("2026-11-14"));
     }
 
