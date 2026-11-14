@@ -343,7 +343,7 @@ fn settings_actions_edit_and_undo_the_temp_settings_file() {
     assert_eq!(out[0].message, "Added to Chat");
 
     let text = std::fs::read_to_string(&settings).unwrap();
-    assert!(text.contains("# AtherMemGuard settings"), "comments are kept");
+    assert!(text.contains("# Ather MemGuard settings"), "comments are kept");
     let ds = doctor::DoctorSettings::load();
     assert_eq!(ds.close_while_unreal, vec!["DoctorTestGame".to_string()]);
     assert_eq!(ds.keep, vec!["DoctorTestMystery".to_string()]);

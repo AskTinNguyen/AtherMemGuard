@@ -1136,6 +1136,30 @@ pub fn doc_remove_from_group(doc: &mut toml_edit::DocumentMut, group: &str, name
     }
 }
 
+/// Remove the user's `[[group]]` entry for `group` if all it holds is a name and the same
+/// process list the lower layers already give (or an empty list). Such an entry was created
+/// by a hold-back and changes nothing; leaving it would pin the list against later updates.
+pub fn doc_drop_redundant_group(doc: &mut toml_edit::DocumentMut, group: &str, below: &[String]) {
+    let Some(groups) = doc.get_mut("group").and_then(|g| g.as_array_of_tables_mut()) else { return };
+    let redundant = |t: &toml_edit::Table| {
+        if t.get("name").and_then(|v| v.as_str()) != Some(group) {
+            return false;
+        }
+        let only_ours = t.iter().all(|(k, _)| k == "name" || k == "processes" || (below.is_empty() && k == "priority"));
+        let listed: Vec<String> = t
+            .get("processes")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        only_ours && (listed.is_empty() || listed == below)
+    };
+    let before = groups.len();
+    groups.retain(|t| !redundant(t));
+    if before > 0 && groups.is_empty() {
+        doc.remove("group");
+    }
+}
+
 /// Check an edited settings text before writing it: valid TOML, a valid `[doctor]` table,
 /// and everything else still accepted by `Config`.
 pub fn validate_settings(text: &str) -> Result<(), String> {
@@ -1322,14 +1346,11 @@ pub fn dry_run(report: &Report, picks: &[(String, ActionKind)], force: bool) -> 
 /// Settings for the "never act on" checks, read without writing anything (unlike
 /// `Config::load`, which creates a missing settings file). Broken or missing = built-in.
 fn load_config_readonly() -> Config {
-    fs::read_to_string(paths::config_file())
-        .ok()
-        .and_then(|t| {
-            let mut table: toml::Table = toml::from_str(&t).ok()?;
-            table.remove("doctor");
-            Config::parse(&toml::to_string(&table).ok()?).ok()
-        })
-        .unwrap_or_else(Config::builtin)
+    // The effective settings: built-in defaults, then the team file, then the user's file.
+    // Read without `Config::load`, which would create or migrate the settings file.
+    let user = fs::read_to_string(paths::config_file()).unwrap_or_default();
+    let team = fs::read_to_string(crate::config::team_file()).ok();
+    crate::config::config_from_layers(team.as_deref(), &user).map(|(cfg, _)| cfg).unwrap_or_else(|_| Config::builtin())
 }
 
 fn act_context<'a>(cfg: &'a Config, ds: &'a DoctorSettings, procs: &[Proc]) -> ActContext<'a> {
@@ -1671,8 +1692,16 @@ fn undo_step(step: &UndoStep) -> Result<String, String> {
             Ok("Switched back on".into())
         }
         UndoStep::Group { group, added } => {
+            // What the group lists without the user's file: if the user's entry only
+            // repeats that, the entry was ours and goes away with the undo.
+            let team = fs::read_to_string(crate::config::team_file()).ok();
+            let below: Vec<String> = crate::config::config_from_layers(team.as_deref(), "")
+                .ok()
+                .and_then(|(cfg, _)| cfg.groups.into_iter().find(|g| &g.name == group).map(|g| g.processes))
+                .unwrap_or_default();
             edit_settings(|doc| {
                 doc_remove_from_group(doc, group, added);
+                doc_drop_redundant_group(doc, group, &below);
                 Ok(())
             })?;
             Ok(format!("Removed from {}", group))
@@ -2412,7 +2441,8 @@ mod tests {
 
     #[test]
     fn settings_edits_keep_comments_and_round_trip() {
-        let text = format!("{}\n# my note\n", crate::config::DEFAULT_TOML);
+        // The built-in defaults have the Chat group; the user template is mostly comments.
+        let text = format!("{}\n# my note\n", crate::config::BUILTIN_TOML);
         let mut doc: toml_edit::DocumentMut = text.parse().unwrap();
         let added = doc_add_to_list(&mut doc, "close_while_unreal", &["Spotify".into(), "steam".into()]).unwrap();
         assert_eq!(added.len(), 2);
@@ -2420,7 +2450,7 @@ mod tests {
         let added = doc_add_to_group(&mut doc, "Chat", &["Notion".into(), "Slack".into()], &[]).unwrap();
         assert_eq!(added, vec!["Notion".to_string()], "Slack is already in Chat");
         let out = doc.to_string();
-        assert!(out.contains("# my note") && out.contains("# AtherMemGuard settings"));
+        assert!(out.contains("# my note") && out.contains("# Ather MemGuard built-in defaults"));
         validate_settings(&out).unwrap();
         let ds = DoctorSettings::from_settings_text(&out).unwrap();
         assert_eq!(ds.close_while_unreal, vec!["Spotify".to_string(), "steam".to_string()]);
