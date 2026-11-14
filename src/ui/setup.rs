@@ -1080,6 +1080,26 @@ mod tests {
         assert_eq!(w.model.phase, Phase::Failed { task: Task::Install, message: "Disk full.".into() });
     }
 
+    #[test]
+    fn worker_thread_reports_back() {
+        let fake = FakeBackend::new(None).with_delay(Duration::from_millis(50));
+        let mut w = SetupWindow::new(Box::new(fake), SetupMode::Install, "0.2.0");
+        // A window handle that isn't real: the wake-up post fails, the poll still finds the result.
+        w.hwnd = 1;
+        let mut host = Host::detached((520, 600), Scale(1.0));
+        w.activate(Act::Primary, &mut host);
+        assert_eq!(w.model.phase, Phase::Working(Task::Install));
+        w.poll_worker(&mut host);
+        for _ in 0..200 {
+            if w.model.phase != Phase::Working(Task::Install) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            w.poll_worker(&mut host);
+        }
+        assert_eq!(w.model.phase, Phase::Done);
+    }
+
     fn all_phases() -> Vec<SetupModel> {
         let mut out = vec![model(None), model(Some("0.1.0")), model(Some("0.2.0")), model(Some("0.3.0"))];
         let mut m = model(None);
