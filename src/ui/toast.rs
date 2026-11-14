@@ -864,6 +864,16 @@ pub mod catalog {
         keyed(with(toast(ToastKind::Warning, title.trim().to_string(), detail.trim().to_string()), "Show me how", Command::ShowRamReport), "ram")
     }
 
+    /// A watched drive changed level (`disk::level_change_words` gives the words). Getting
+    /// fuller offers the checkup; one toast per drive at a time.
+    pub fn disk_level(title: &str, body: &str, worse: bool) -> Toast {
+        if worse {
+            keyed(with(toast(ToastKind::Warning, title.to_string(), body.to_string()), "Open the checkup", Command::OpenDoctor), "disk")
+        } else {
+            keyed(toast(ToastKind::Info, title.to_string(), body.to_string()), "disk")
+        }
+    }
+
     /// "Show me how" couldn't write the RAM report page. Not in the catalogue table: the person
     /// just clicked and needs an answer.
     pub fn ram_report_failed(message: &str) -> Toast {

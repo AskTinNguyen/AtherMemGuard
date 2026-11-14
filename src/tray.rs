@@ -54,6 +54,8 @@ const FIRST_UPDATE_CHECK: Duration = Duration::from_secs(60);
 const UPDATE_EVERY: Duration = Duration::from_secs(24 * 3600);
 /// How long after start the RAM check runs for its toast (it reads firmware tables; no hurry).
 const RAM_CHECK_AFTER: Duration = Duration::from_secs(180);
+/// How often the tray reads free disk space (proposal 4 A). The engine tick never does.
+const DISK_POLL: Duration = Duration::from_secs(60);
 /// The RAM report page "Show me how" writes into the data folder.
 pub const RAM_REPORT_FILE: &str = "ram-report.html";
 pub const RELEASES_URL: &str = "https://github.com/AskTinNguyen/AtherMemGuard/releases/latest";
@@ -767,6 +769,8 @@ enum Work {
     Nudge(Option<(f64, Vec<String>)>),
     /// The RAM check a few minutes after start.
     RamChecked(Box<crate::ramcheck::RamReport>),
+    /// The 60-second disk poll: every volume with its level.
+    DiskPolled(Vec<crate::disk::Volume>),
 }
 
 fn post_work(hwnd: isize, w: Work) {
@@ -824,6 +828,11 @@ struct App {
     nudge_running: bool,
     /// When the RAM check for its toast runs; `None` once it has (or was skipped).
     ram_check_at: Option<Instant>,
+    /// Disk levels already said, for one toast per level change.
+    disk_watch: crate::disk::DiskWatch,
+    /// When the next disk poll runs, and whether one is running.
+    disk_next: Instant,
+    disk_polling: bool,
 }
 
 thread_local! {
@@ -1009,6 +1018,17 @@ impl App {
                 spawn_work(self.hwnd, || Work::RamChecked(Box::new(crate::ramcheck::check_cached().clone())));
             }
         }
+        // Disks every 60 s, never on the engine tick, and off the tray thread.
+        if now >= self.disk_next && !self.disk_polling {
+            self.disk_next = now + DISK_POLL;
+            if self.engine.cfg.disk().enabled {
+                self.disk_polling = true;
+                let (cfg, prev) = (self.engine.cfg.clone(), self.disk_watch.clone());
+                spawn_work(self.hwnd, move || Work::DiskPolled(crate::disk::read_volumes(&cfg, &prev)));
+            } else {
+                self.engine.set_disk(None);
+            }
+        }
         if self.engine.cfg.updates.check_automatically && now >= self.updates.next_auto && !self.updates.checking && !self.updates.downloading {
             self.updates.next_auto = now + UPDATE_EVERY;
             self.start_check(false);
@@ -1169,6 +1189,21 @@ impl App {
                         crate::log::write(&format!("checkup nudge: {:.1} GB could be freed", gb));
                         toast::show(catalog::checkup_nudge(gb, &names));
                     }
+                }
+            }
+            Work::DiskPolled(vols) => {
+                self.disk_polling = false;
+                let s = self.engine.cfg.disk();
+                let cook = self.engine.cfg.prime.cook.disk_gb;
+                for (v, from, to) in self.disk_watch.update(&vols, &s) {
+                    crate::log::write(&format!("disk: {} {} -> {} ({:.1} GB free)", v.name(), from.label(), to.label(), v.free_gb));
+                    if let Some((title, body)) = crate::disk::level_change_words(&v, from, to, cook) {
+                        toast::show(catalog::disk_level(&title, &body, to > from));
+                    }
+                }
+                self.engine.set_disk(Some(crate::disk::brief(&vols, &s)));
+                if let Some(st) = self.status.borrow_mut().as_mut() {
+                    st.disk = Some(crate::disk::brief(&vols, &s));
                 }
             }
             Work::RamChecked(r) => {
@@ -1509,6 +1544,7 @@ pub fn ask_running_to_open_settings(wait: Duration) -> bool {
 
 fn run_with(after_update: bool, open_settings: bool) {
     let Some(_instance) = win::acquire_instance(paths::mutex(), 8000) else { return };
+    crate::disk_scan::allow_cache_writes();
     let exit_event = win::create_event(paths::exit_event());
     let settings_event = win::create_event(paths::settings_event());
 
@@ -1560,6 +1596,9 @@ fn run_with(after_update: bool, open_settings: bool) {
             was_active: false,
             nudge_running: false,
             ram_check_at: Some(Instant::now() + RAM_CHECK_AFTER),
+            disk_watch: crate::disk::DiskWatch::default(),
+            disk_next: Instant::now() + Duration::from_secs(5),
+            disk_polling: false,
         };
         app.add_icon();
         crate::log::write(&format!("Ather MemGuard {} started", env!("CARGO_PKG_VERSION")));

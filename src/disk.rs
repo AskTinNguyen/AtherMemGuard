@@ -270,7 +270,7 @@ pub fn level_change_words(v: &Volume, from: Level, to: Level, cook_gb: Option<f6
 }
 
 /// Remembers each watched volume's level, so a toast fires once per level change.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DiskWatch {
     levels: std::collections::HashMap<String, Level>,
 }
@@ -722,6 +722,26 @@ pub fn brief(vols: &[Volume], s: &DiskSettings) -> DiskBrief {
             .map(|v| BriefVolume { volume: v.name(), free_gb: (v.free_gb * 10.0).round() / 10.0, free_pct: v.free_pct, level: v.level, roles: v.roles.clone() })
             .collect(),
     }
+}
+
+/// The flyout's disk line from a status `disk` block: the watched drive that needs attention
+/// most, the Dev Drive when all are fine. "D: Dev Drive · 370 GB free".
+pub fn brief_line(b: &DiskBrief) -> Option<(String, Level)> {
+    let worst = b.volumes.iter().max_by(|a, c| a.level.cmp(&c.level).then(c.free_pct.total_cmp(&a.free_pct)))?;
+    let v = if worst.level == Level::Normal { b.volumes.iter().find(|v| v.roles.iter().any(|r| r == "dev_drive")).unwrap_or(worst) } else { worst };
+    let kind = if v.roles.iter().any(|r| r == "dev_drive") {
+        " Dev Drive"
+    } else if v.roles.iter().any(|r| r == "system") {
+        " system drive"
+    } else {
+        ""
+    };
+    let state = match v.level {
+        Level::Normal => "",
+        Level::Elevated => " · getting full",
+        Level::Critical => " · almost full",
+    };
+    Some((format!("{}{} · {:.0} GB free{}", v.volume, kind, v.free_gb.floor(), state), v.level))
 }
 
 /// The disk block for `memguard status` and `memguard_status`, or `None` when disk watching is off.
