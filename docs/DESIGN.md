@@ -12,7 +12,10 @@ Read `README.md` first for what the app does today, then `src/lib.rs` for the mo
   in PowerShell run `$env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"` first.
 - `cargo build` and `cargo test` must pass with no warnings before you finish.
 - All `unsafe` Win32 code stays in `win.rs`, `tray.rs`, `logo.rs`, `net.rs`, `doctor_win.rs`,
-  `smbios.rs`, `startup.rs`, `disk_win.rs` and `ui/`.
+  `smbios.rs`, `startup.rs`, `disk_win.rs` and `ui/`. (`disk_win.rs`: volume and file reads, the
+  FSCTLs, the read-only scanner, and since Phase 2 the `WM_SETTINGCHANGE` broadcast after a cache
+  relocation. `disk_clean.rs` and `disk_relocate.rs` have no `unsafe`: deletes and moves use `std::fs`,
+  registry writes use `winreg`.)
   Use `windows-sys` 0.59 (add features to `Cargo.toml` as needed). New crates need a reason;
   the ones already agreed are listed per part.
 - **A copy of the app is installed and running on this PC. Do not disturb it.** Never run
@@ -401,14 +404,13 @@ Defender probe), `src/disk_catalog.toml`.
   tray: `memguard disk scan-child` does it at background priority (CPU, I/O and memory),
   `[disk] scan_threads` threads, a time budget, stopping if a build or cook starts. It opens
   files with `FILE_READ_ATTRIBUTES` only and never follows reparse points.
-- Every "frees" number is **predicted** from ReFS reference counts (`basis: "predicted"`). It
-  has not been confirmed against a real delete (see the risk below). Nothing in Phase 1 deletes
-  or moves files, and there is no "measured after acting" step.
+- Every "frees" number is **predicted** from ReFS reference counts (`basis: "predicted"`). After acting,
+  the measured result is reported separately and never merged with it (Phase 2, below).
 - Caches: the last checkup (`disk-checkup.json`, per item root file id and newest write) and
   the day's Defender facts (`disk-defender.json`) in the data folder. Only the CLI, the MCP
   server and the tray write them; library tests never do.
 
-### Open risk: ReFS returns deleted space late, so Phase 2 is blocked
+### Open risk: ReFS returns deleted space late (still unexplained)
 
 The controlled delete test on the team PC (2026-11-14, Dev Drive D:, ReFS 3.14, 4 KB
 clusters) deleted two throwaway folders: one with 0.50 GB predicted to free (unique data plus
@@ -418,9 +420,99 @@ block clones of existing files), one with 1.00 GB of unique, never-cloned data. 
 20 minutes; whether that was a batch of delayed ReFS frees or an unrelated large delete is not
 known. An elevated `fsutil fsinfo refsinfo D:` and `GetDiskFreeSpaceEx` agreed (504 GB free,
 8.68 GB reserved) and there are no shadow copies on D:. What was observed: on this ReFS
-volume, deleted space can come back much later, and in bulk. The cause is not established.
+volume, deleted space can come back much later, and in bulk. **The cause is still not
+established**; Phase 2 does not explain it, it measures it honestly:
 
-Until it is: "frees" stays labelled predicted; ReFS volumes carry the note "Deleting on this
-drive may take a long time to show up as free space."; agents are told never to promise space
-right after a delete; and Phase 2 (clean, bin, undo, relocate, the measured result after
-acting) stays out of scope.
+- The cleanup reports the prediction at once, labelled predicted, and never says space is free.
+- A watcher (`memguard disk watch-child`, detached, below-normal priority) reads the volume's free
+  space every second for 2 minutes, then every 5 seconds, for at most 30 minutes from the delete.
+  It stops early only when 90% of the prediction has shown up **and** three readings agree within
+  16 MB. It does not stop because the free space is stable: on ReFS a stable reading at zero is the
+  delay itself. At 30 minutes it reports what came back, says it hasn't all come back yet, and
+  notes that this drive can return space much later.
+- `other_activity` is set when free space moved more than 64 MB in the 5 seconds before acting,
+  dropped more than 64 MB after rising, went below the starting point, or overshot the prediction
+  by more than 10% (256 MB at least): the result then says "about" and that other writes made it
+  unclear. A quiet, stable result under 80% of a prediction over 256 MB writes an
+  `accounting_mismatch` log line with the file system version. No telemetry.
+- Live test on this PC (2026-11-14, Phase 2 build): a throwaway project on D: with 2.5 GB predicted
+  to free (exact; its 1 GB block clone in `Content` and a hard-linked file correctly predicted to stay).
+  For 5 minutes nothing came back (free space even fell 0.3 GB from other writes); at 320 s free space
+  rose by 105.2 GB at once, to about 498 GB, far more than anything the test deleted. The watcher
+  flagged `other_activity` and now says the rise can't be told apart from this cleanup's 2.5 GB.
+  The same deletes on C: (NTFS) measured 3.52 GB against 3.52 GB predicted, at once. So the bulk,
+  late return is reproducible on this ReFS volume; what it releases (earlier deletes of other trees,
+  ReFS metadata, something else) is still unknown. A second run (emptying 0.2 GB from the bin on
+  D:) watched the full 30 minutes while other programs wrote to the drive: free space fell 53.8 GB, the
+  prediction never showed up, and the result was reported as not back, with other writes noted.
+- Detached watchers clear the inherit flag on the caller's standard handles first
+  (`disk_win::stop_std_handle_inheritance`), so a script, the tray or an MCP client reading
+  `memguard disk clean` output isn't held for the 30-minute watch.
+
+## Part H, Phase 2: cleanup with undo, the measured result, cache relocation
+
+**Owns:** `src/disk_clean.rs` (actions, safety rules, plans, delete, bin, tool cleans, undo log,
+measured watch, tray housekeeping; pure parts tested, no `unsafe`), `src/disk_relocate.rs`
+(relocation plan, `EnvStore`, apply and undo; no `unsafe`).
+**Shared edits:** `disk_scan.rs` (catalogue `tool`, `actions` per item, the bin and old caches as
+items, `plan_record`), `disk_win.rs` (`broadcast_environment_change`), `disk.rs`
+(`recent_cleanups`), `mcp.rs` (`memguard_disk_clean`, plans recorded, INSTRUCTIONS),
+`bin/memguard.rs` (`disk clean|undo|bin|relocate|watch-child`), `tray.rs` (housekeeping on the disk
+poll, drive rows in the checkup window, `EmptyDiskBin`), `ui/doctor.rs` (ON YOUR DRIVES section,
+the drive confirmation), `ui/toast.rs`, `ui/commands.rs`, `config.rs` (comments only). The spec is
+proposal section 4 E/F with the product owner's decisions, which override it where they differ.
+
+- **Actions.** `now` (permanent delete; the default for `regenerable`), `bin` (same-volume move into
+  `<vol>:\.AtherMemGuard-bin\<run-id>\<n>\<name>`; the default for `disposable` and `rebuild_cost`;
+  frees nothing until emptied and every output says so), `tool` (`npm cache clean --force`,
+  `pip cache purge`, `dotnet nuget locals http-cache --clear`, found on PATH with PATHEXT; permanent,
+  "can't be undone"). Zen, lanes, worktrees, the git LFS store, `review` items and the bin itself
+  offer nothing. `bin` is refused at apply time when the volume root isn't writable.
+- **Safety rules** are `disk_clean::refusal(&ItemCheck, &[PathFacts])`, pure and tested one by one;
+  `clean` reads every fact again at apply time (`path_facts`, `newest_write`, `busy_state`,
+  `sync_roots`, `git_check`). Allow-list: project items only at their catalogue path under the
+  nearest folder with a `.uproject` or an `Engine` folder with `Build\Build.version`; shared caches
+  only at their catalogue path inside `%USERPROFILE%` (TEMP entries: direct children of TEMP only;
+  old caches: the paths in the relocation record). Never-list on the path relative to the project.
+  A reparse point at the item root or any folder up to the project root (or the profile) refuses it;
+  inside an item, links are removed as links (`remove_dir`/`remove_file` on the link, never followed).
+  Cloud attributes or a registered sync root refuse it. `git ls-files` with a 5 s limit; a timeout or
+  a failure inside a checkout refuses it. Anything written in the last `min_age_hours`, or after the
+  plan's newest write, refuses the whole item, as does an Unreal process working in that project (or
+  one whose command line can't be read). The path's file id must match the plan's.
+- **Plans** are recorded (`disk-plans.json`, last 10) with each path's file id and newest write.
+  The CLI makes a fresh plan for exactly the picks (its `frees_together` covers only the `now` and
+  `tool` items) and acts on it after the confirmation. The MCP tool acts only on a plan under 10
+  minutes old. The prediction after acting is the plan's `frees_together` when exactly that set went,
+  else the sum of the items' own numbers labelled `lower_bound` (it can only be lower); a partial
+  delete makes it `estimate`.
+- **Undo:** `disk-undo.json`, the shape of `doctor-undo.json` (`runs[].entries[]` with `id`,
+  `finding_id`, `title`, `action`, `step`, `undone`). Bin moves are `from_bin` steps; deletes and tool
+  cleans are `nothing`. Undo refuses to overwrite a folder that is back (rebuilt) and says where the
+  moved copy is. Emptying a bin run turns its entries into `nothing`.
+- **The bin** empties runs older than `hold_hours` from the tray's disk poll, through a hidden
+  `memguard disk bin --expired --yes` (at most once an hour). At `critical` the tray asks
+  ("Empty the bin on D:?", `Command::EmptyDiskBin`) and never empties it unasked.
+- **Measured result:** one `disk-watch.json` record per volume acted on, with the free space read
+  just before acting (5 readings a second apart) and the prediction. The cleaner starts the detached
+  watcher (`--wait` watches in-process instead); the tray restarts one whose process is gone, shows
+  each result once as a toast, and the watcher writes the log line. `memguard_disk` and
+  `memguard disk` list the last five (`recent_cleanups`). No disk history CSV or chart (out of scope).
+- **The tray never walks or deletes:** the checkup window's drive rows come from the cached checkup,
+  and CLEAN UP on them runs `memguard disk clean --yes --json` in a hidden child. A drive action can
+  never map onto a memory action (`action_to_real` returns `None`).
+- **Relocation:** `UE-LocalDataCachePath`, `NUGET_PACKAGES`, `npm_config_cache`, `PIP_CACHE_DIR`,
+  `VCPKG_DEFAULT_BINARY_CACHE`; never `CARGO_HOME`, `GRADLE_USER_HOME`, `TEMP` or Zen (its variable is
+  unconfirmed). The destination is the fixed, local, non-rotating drive with most room that stays
+  `normal` after taking the caches' current size; a named destination that would drop below that is
+  refused. `--apply` saves the previous values first (`disk-relocate.json`), makes the new folders
+  empty, sets `REG_SZ` user variables and broadcasts `WM_SETTINGCHANGE`; `--undo` restores only
+  variables still holding the value it set. Registry writes go through `EnvStore`;
+  `ATHER_MEMGUARD_ENV_KEY` (must be under `HKCU\Software\AtherMemGuard-test\`) points the CLI at a
+  test key and turns the broadcast off. Tests never open the real `HKCU\Environment`.
+- **Tests:** every rule; tool command construction and a fake `npm.cmd` on a test PATH; delete with a
+  junction, a read-only file and a file held open; bin move, undo, refusal to overwrite, emptying; the
+  measured watch on quiet NTFS, late ReFS frees, never-back and busy drives; relocation plan, apply and
+  undo on an in-memory store and on a throwaway key under `HKCU\Software\AtherMemGuard-test`; the
+  MCP tool over stdio on a tree the test makes (no plan, disposable item, recent write, written since
+  the plan, stale plan, forged protected path, success).

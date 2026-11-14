@@ -357,6 +357,25 @@ pub fn broadcast_environment_change() {
     unsafe { SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, what.as_ptr() as isize, SMTO_ABORTIFHUNG, 5000, &mut result) };
 }
 
+/// Make this process's stdin, stdout and stderr not inheritable, so a detached child (the
+/// measured watcher) doesn't keep the caller's pipes open: whoever reads our output (a script,
+/// the tray, an MCP client) would otherwise wait for the watcher to exit, up to 30 minutes.
+/// Children that ask to inherit them still get them (std duplicates them for that).
+pub fn stop_std_handle_inheritance() {
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: plain calls on this process's own standard handles; an invalid or null handle
+        // makes SetHandleInformation fail, which is ignored.
+        unsafe {
+            let h = GetStdHandle(which);
+            if !h.is_null() && h != INVALID_HANDLE_VALUE {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+}
+
 /// A FILETIME as local "YYYY-MM-DD HH:MM", or "" for 0.
 pub fn filetime_local(ft: u64) -> String {
     use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};

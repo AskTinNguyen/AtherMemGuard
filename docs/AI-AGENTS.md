@@ -7,7 +7,8 @@ and talks to it over stdin and stdout. There is no port, no token and nothing to
 The tools do the same things as the `memguard` commands in the README (`memguard_doctor` is the
 read-only checkup, `memguard doctor --json`; `memguard_ram` the read-only RAM and BIOS check,
 `memguard ram --json`; `memguard_disk`, `memguard_disk_checkup` and `memguard_disk_plan` the read-only
-drive and Dev Drive reports, `memguard disk ... --json`) and return the same JSON as
+drive and Dev Drive reports, `memguard disk ... --json`; `memguard_disk_clean` deletes regenerable build
+output, like `memguard disk clean --fix <ids>`) and return the same JSON as
 their `--json` output. Without the background app running, `memguard_status` still works (it reports
 `daemon: false`), and priming and waiting still work; only the continuous enforcement is missing.
 
@@ -90,7 +91,8 @@ Before a cook, also pass the project folder, so the drive it cooks to is checked
 
 If `blocked_by` contains `disk`, the call returned at once (disk space doesn't free itself): don't
 start. Call `memguard_disk_checkup` with the same path and relay it in two lines, quoting only
-predicted totals (see "Quoting disk numbers" below). Removing anything stays with the person.
+predicted totals (see "Quoting disk numbers" below). An agent may delete regenerable build output with
+`memguard_disk_clean` (below); everything else stays with the person.
 
 A line like this in your project's `CLAUDE.md` or `AGENTS.md` makes agents follow it:
 
@@ -466,6 +468,54 @@ drives). Same as `memguard disk plan <ids> --json`.
 |---|---|---|
 | `ids` | array of strings | Item ids from the latest `memguard_disk_checkup`, e.g. `["d7"]`. Empty = all of them |
 
+The result has a `plan_id`. The plan is recorded: `memguard_disk_clean` acts only on a plan under 10
+minutes old, and only while nothing in its items has been written since. Each item also lists its
+`actions` (`now`, `bin`, `tool`) with what each frees now (`bin` frees 0 until the bin is emptied).
+
+### `memguard_disk_clean`
+
+**Deletes files for good; there is no undo.** Prefer it only for regenerable build output and caches
+(`class: "regenerable"`: `Intermediate`, plugin `Intermediate`, `DerivedDataCache`, `Saved\Crashes`,
+`Saved\ShaderDebugInfo`, npm/pip/uv/NuGet download caches, crash dumps, shader caches), when the person
+needs the room or asked you to clean. Always tell the person what you deleted (titles and paths) and the
+predicted frees.
+
+| Argument | Type | Meaning |
+|---|---|---|
+| `ids` | array of strings, required | Ids of regenerable items from your latest `memguard_disk_plan` |
+| `plan_id` | string | The `plan_id` that plan returned. Default: the newest plan holding all the ids |
+
+What it refuses, item by item (the whole item, never half of it):
+- anything not `regenerable` (logs, cooked output, shared caches, lanes, worktrees, the bin): those are
+  the person's call (`memguard disk clean --fix`), and bin moves and tool cleans are not offered here;
+- ids not in a plan, or a plan 10 minutes old or more (a tool error: call `memguard_disk_plan` again);
+- an item where anything was written in the last 2 hours (`[disk] min_age_hours`) or since the plan;
+- an item whose folder was replaced since the plan (its file id changed);
+- an item in a project where an Unreal editor, build or cook is working;
+- anything git tracks (a 5 second limit; no answer is a refusal), a link or a folder under a link, a
+  cloud-synced folder, anything outside the user's folder and the project roots, and anything on the
+  never-list (`Content`, `Config`, `Source`, `Binaries`, `.git`, `Plugins\*\Content`,
+  `Saved\Autosaves|SaveGames|Config|Collections|SourceControl`).
+
+```json
+{ "run_id": "20261114221538-329", "plan_id": "p20261114221537-905", "dry_run": false,
+  "outcomes": [ { "id": "d1", "title": "Build files (Intermediate) for Game", "action": "now", "result": "done",
+                  "message": "Deleted for good. Removed 22 files (3.0 GB) and 1 link (their targets were left alone).",
+                  "predicted_freed_gb": 2.95, "basis": "predicted", "removed": { "files": 22, "gb": 2.95, "links": 1, "failed": 0, "remains": false } } ],
+  "volumes": [ { "volume": "C:", "item_ids": ["d1", "d3"], "predicted_freed_gb": 3.44, "frees_confidence": "exact",
+                 "basis": "predicted", "free_before_gb": 285.2, "measured": "later" } ],
+  "measured_note": "The space is predicted, not yet measured. ...",
+  "tell_the_person": "Tell the person you deleted: Build files (Intermediate) for Game; Project cache (DDC) for Game. ..." }
+```
+
+`result` is `done`, `partial` (some files were in use: the message says how many are still there),
+`refused` (the message says which rule) or `failed`. The **measured** result comes later: Ather MemGuard
+reads the drive's free space for up to 30 minutes and records what came back. Read it from
+`memguard_disk`'s `recent_cleanups` (`state`: `watching`, then `measured`, with `measured_freed_gb`,
+`settled`, `other_activity`, `appeared_after_sec`). Report it as measured only then; while it says
+`watching`, say the space hasn't been measured yet. `other_activity: true` means other programs moved the
+free space too: say "about".
+
 
 ### Quoting disk numbers
 
@@ -477,11 +527,18 @@ drives). Same as `memguard disk plan <ids> --json`.
   `upper_bound` as "at most". Never add numbers yourself. Never present `logical_gb` as space that can be freed.
 - To decide whether a set frees enough for a job, call `memguard_disk_plan` and use `free_after_gb`; rely
   only on `exact` or `lower_bound`.
-- Nothing here deletes files; the person removes them.
+- Delete only with `memguard_disk_clean`, only regenerable items, only from a plan you just made, and tell
+  the person what went. Never delete lanes, worktrees or anything else yourself (no `rmdir`, no
+  `Remove-Item`): suggest `memguard disk clean --fix` to the person for the rest.
+- After a delete, give the prediction as predicted and the measured result only once `recent_cleanups`
+  shows it. A move to the bin frees nothing until the bin is emptied.
 
 A good relay is two lines: "D: has 38 GB free and a cook needs 100. Removing lanes ready-03 and
 mocap-stellar-girl together would free about 94 GB (predicted; on this drive the space can take a while to
 show up). Want the plan for those two?"
+
+After cleaning: "I deleted the build files (D:\s2\Intermediate) and the project DDC; they are predicted to
+free 16.8 GB on D:. It hasn't been measured yet: on this drive the space can take a while to show up."
 
 ## Troubleshooting
 

@@ -152,8 +152,8 @@ to do if it doesn't start, and how to check it worked.
 A cook that runs out of disk fails late, and on a Dev Drive the usual folder sizes are wrong several times
 over: lanes, worktrees and the git LFS store share the same clusters (block clones), so Explorer counts
 them again and again. On the team PC, files on D: add up to 4.5 TB on a 1.9 TB drive. Ather MemGuard
-watches free space, checks the Dev Drive is set up to be fast, and counts what could go without counting
-anything twice. It only reports: it never deletes or moves files, and needs no admin rights.
+watches free space, checks the Dev Drive is set up to be fast, counts what could go without counting
+anything twice, and cleans up what you pick, with undo where it can. It needs no admin rights.
 
 - **Watching:** every 60 seconds the tray reads free space on Dev Drives, the system drive (page file) and
   drives holding projects, Unreal's DDC or Zen, or TEMP; each drive is one row however it's reached. A
@@ -174,9 +174,46 @@ anything twice. It only reports: it never deletes or moves files, and needs no a
   for a named set, counted once. `memguard disk plan d7 d9` counts exactly those again, fresh. Counting
   runs in a separate low-priority process, a few threads at a time, for at most a minute by default, and
   stops if a build or cook starts.
-- **"Frees" is predicted.** It comes from the drive's reference counts and has not been checked against a
-  real delete. On ReFS (Dev Drives), deleted space has been seen to come back much later, and in bulk:
-  **deleting on this drive may take a long time to show up as free space.**
+- **"Frees" is predicted.** It comes from the drive's reference counts. After a cleanup the prediction is
+  shown at once, labelled predicted; then Ather MemGuard watches the drive's free space for up to 30
+  minutes and tells you what actually came back, labelled measured (a notification and a log line, and
+  `memguard disk` lists it). It never says space is free before it shows up. On ReFS (Dev Drives),
+  deleted space has been seen to come back much later, and in bulk: **deleting on this drive may take a
+  long time to show up as free space.** When other programs write to the drive at the same time, the
+  measured number says "about" and that it isn't exact.
+- **Cleaning up:** `memguard disk clean --fix d1 d3:bin` makes a fresh plan for exactly those items, lists
+  what goes, how, and the predicted frees, and asks first. Three actions:
+  - `now` deletes for good. The default for things Unreal or the tool rebuilds (`Intermediate`,
+    `DerivedDataCache`, crash reports, shader debug files, npm/pip/NuGet download caches, crash dumps,
+    shader caches). It can't be undone.
+  - `bin` moves the folder into `<drive>:\.AtherMemGuard-bin\<run>\` on the same drive. The default for
+    logs, old TEMP folders, cooked output, staged builds and Unreal's shared DDC. **It frees nothing until
+    the bin is emptied.** `memguard disk undo` puts it back. The bin empties itself after 24 hours
+    (`[disk] hold_hours`); `memguard disk bin` shows it and `memguard disk bin --empty` empties it now.
+    When a drive gets almost full, Ather MemGuard asks whether to empty the bin there; it never empties it
+    on its own early.
+  - `tool` runs the tool's own clean command (`npm cache clean --force`, `pip cache purge`,
+    `dotnet nuget locals http-cache --clear`). It can't be undone.
+  Zen is never deleted file by file (use Zen's own garbage collection), and lanes and worktrees are never
+  deleted by Ather MemGuard. The checkup window shows the same items under **On your drives**, with a
+  confirmation that lists everything before it runs, and "Undo last cleanup" for bin moves.
+- **What is never touched:** only the folders in the catalogue are cleaned, and only inside a folder with a
+  `.uproject` (or an engine's `Engine` folder) or at the cache's own place in your user folder. Never
+  `Content`, `Config`, `Source`, `Binaries`, `.git`, `Plugins\*\Content`,
+  `Saved\Autosaves|SaveGames|Config|Collections|SourceControl`, anything git tracks, anything in a
+  cloud-synced folder, a folder that is a link (or sits under one), or anything outside your user folder
+  and your projects. A whole item is left alone when anything in it was written in the last 2 hours
+  (`[disk] min_age_hours`) or since the plan, or when an Unreal editor, build or cook works in that
+  project. Everything is checked again at the moment of acting. A link inside an item is removed as a
+  link; what it points to is left alone. A delete that fails part-way says exactly what was removed and
+  what is still there.
+- **Moving caches off C:** `memguard disk relocate` prints a plan: `UE-LocalDataCachePath`,
+  `NUGET_PACKAGES`, `npm_config_cache`, `PIP_CACHE_DIR` and `VCPKG_DEFAULT_BINARY_CACHE` pointed at a
+  drive with room (never one the caches would leave below the "getting full" level). `--apply` sets them
+  as your user environment variables (asks first) and tells Windows; `--undo` puts the old values back.
+  It never moves data: the old caches stay until you remove them, and once the new place has been used
+  the checkup lists the old one as "Old cache, no longer used". `CARGO_HOME`, `GRADLE_USER_HOME`,
+  `TEMP` and Zen are never moved.
 
 ## Memory history
 
@@ -263,6 +300,15 @@ memguard disk [--json] [--refresh]  drives, how full they are, Dev Drive health 
 memguard disk checkup [--path D:\s2] [--refresh] [--budget-sec 60] [--json]
                                   what could go and what removing it frees (predicted; deletes nothing)
 memguard disk plan d7 d9 [--json]   fresh numbers for exactly these checkup items
+memguard disk clean --fix d1 d3:bin d9:tool [--dry-run] [--yes] [--wait] [--json]
+                                  clean them (now = delete, bin = move to the bin, tool = the tool's
+                                  own clean); lists what goes and asks first; --wait stays for the
+                                  measured result
+memguard disk undo [<undo id>]      put back what the last cleanup moved to the bin
+memguard disk bin [--empty | --expired] [--volume D:] [--yes]
+                                  what is in the bin; empty it for good
+memguard disk relocate [--to E:\Caches] [--apply | --undo] [--yes]
+                                  move caches off C: with user environment variables (copies nothing)
 memguard run --cap-gb 48 [--per-process-cap-gb N] [--priority low] [--cpu below] -- <command...>
                                   run a command (and its children) under a hard memory cap;
                                   the command's exit code is passed through
@@ -291,9 +337,11 @@ The tray app also writes `%APPDATA%\AtherMemGuard\status.json` every interval, w
 `memguard mcp` is an MCP server over stdio, so Claude Code, Codex and other coding agents can call
 MemGuard as tools: `memguard_status`, `memguard_prime`, `memguard_wait`, `memguard_advise`,
 `memguard_history`, `memguard_doctor`, `memguard_ram`, `memguard_disk`, `memguard_disk_checkup` and
-`memguard_disk_plan`. Only `memguard_prime` and `memguard_wait` with `prime` change anything (they free
-memory); the rest are read-only, and no tool deletes files. Agents are told to quote disk "frees" numbers
-as predicted and never to promise space right after a delete. The agent
+`memguard_disk_plan` and `memguard_disk_clean`. `memguard_prime` and `memguard_wait` with `prime` free
+memory; `memguard_disk_clean` is the one tool that deletes files, and only regenerable build output and
+caches from a plan the agent made in the last 10 minutes, with every rule checked again; the rest are
+read-only. Agents are told to quote disk "frees" numbers as predicted, to tell you what they deleted, and
+never to promise space before it has been measured. The agent
 starts it by itself; there is no port and nothing to enable. Run `memguard agent-setup` for ready-to-paste
 setup, or add it to Claude Code with:
 
@@ -426,6 +474,8 @@ lane_dirs = []                 # extra folders holding lanes or worktrees
 scan_budget_sec = 60           # how long a disk checkup may count
 scan_threads = 4
 fresh_sec = 300                # older counts are reported as "about"
+min_age_hours = 2              # cleanup leaves alone an item with anything written more recently
+hold_hours = 24                # the bin empties itself after this
 check_dev_drive = true         # Dev Drive health rows
 
 [[group]]

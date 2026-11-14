@@ -759,9 +759,9 @@ impl DeleteReport {
 
     /// "Removed 6,301 files (16.2 GB)" and, after a partial delete, what remains.
     pub fn words(&self) -> String {
-        let mut s = format!("Removed {} files ({:.1} GB)", thousands(self.files), gb2(self.bytes));
+        let mut s = format!("Removed {} ({})", plural(self.files, "file"), size_words(self.bytes));
         if self.links > 0 {
-            s.push_str(&format!(" and {} links (their targets were left alone)", self.links));
+            s.push_str(&format!(" and {} (their targets were left alone)", plural(self.links, "link")));
         }
         if self.failed_count > 0 {
             s.push_str(&format!(
@@ -771,6 +771,22 @@ impl DeleteReport {
             ));
         }
         s
+    }
+}
+
+/// "1 file", "6,301 files".
+pub fn plural(n: u64, word: &str) -> String {
+    format!("{} {}{}", thousands(n), word, if n == 1 { "" } else { "s" })
+}
+
+/// "16.4 GB", or "30 MB" below 0.1 GB (so small items don't read as nothing).
+pub fn size_words(bytes: u64) -> String {
+    if bytes > 0 && bytes < (1 << 20) {
+        "less than 1 MB".into()
+    } else if bytes > 0 && bytes < (1u64 << 30) / 10 {
+        format!("{} MB", (bytes as f64 / (1u64 << 20) as f64).round() as u64)
+    } else {
+        format!("{:.1} GB", gb2(bytes))
     }
 }
 
@@ -1349,6 +1365,7 @@ pub fn spawn_cli_hidden(args: &[&str]) -> bool {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const BELOW_NORMAL: u32 = 0x4000;
     let Some(exe) = crate::disk_scan::cli_exe() else { return false };
+    disk_win::stop_std_handle_inheritance();
     std::process::Command::new(exe)
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -1464,6 +1481,17 @@ pub fn measured_words(volume: &str, predicted: u64, m: &Measured, refs: bool) ->
     let got = gb2(m.measured_freed.max(0) as u64);
     let pred = gb2(predicted);
     let busy = format!(" Other programs were writing to {} at the same time, so the number isn't exact.", volume);
+    // Far more than predicted came back: something else freed space too (on ReFS, possibly an
+    // earlier delete arriving in bulk). Say so instead of claiming the number for this cleanup.
+    if m.measured_freed > 0 && m.measured_freed as u64 > predicted.saturating_mul(2) + (1u64 << 30) {
+        return (
+            format!("Free space jumped on {}", volume),
+            format!(
+                "Free space on {} rose by {:.1} GB (measured), far more than this cleanup's predicted {:.1} GB, so something else freed space at the same time. How much of the {:.1} GB came back can't be told apart.",
+                volume, got, pred, pred
+            ),
+        );
+    }
     if m.appeared_after_sec.is_some() {
         let mut body = if m.other_activity { format!("About {:.1} GB came back on {} (measured).", got, volume) } else { format!("Freed {:.1} GB on {} (measured).", got, volume) };
         body.push_str(&format!(" Predicted {:.1} GB.", pred));
@@ -1573,6 +1601,7 @@ pub fn spawn_watcher(id: &str) -> Option<u32> {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const BELOW_NORMAL: u32 = 0x4000;
     let exe = crate::disk_scan::cli_exe()?;
+    disk_win::stop_std_handle_inheritance();
     std::process::Command::new(exe)
         .args(["disk", "watch-child", id])
         .stdin(std::process::Stdio::null())
@@ -1999,7 +2028,7 @@ pub fn gb_words(bytes: Option<u64>, confidence: &str) -> String {
                 "upper_bound" => "at most ",
                 _ => "",
             };
-            format!("{}{:.1} GB", q, gb2(b))
+            format!("{}{}", q, size_words(b))
         }
     }
 }
@@ -2020,9 +2049,9 @@ pub fn render_clean(r: &CleanResult) -> String {
     }
     for v in &r.volumes {
         s.push_str(&format!(
-            "\nOn {}: predicted to free {} ({}, predicted, not yet measured).\n",
-            v.volume_root.trim_end_matches('\\'),
+            "\nPredicted to free {} on {} ({}; not measured yet).\n",
             gb_words(Some(v.predicted_freed), &v.confidence),
+            v.volume_root.trim_end_matches('\\'),
             v.confidence
         ));
     }
@@ -2346,7 +2375,7 @@ mod tests {
         assert!(rep.remains);
         assert_eq!(rep.files, 1);
         assert_eq!(rep.failed_count, 1);
-        assert!(rep.words().contains("1 could not be removed"), "{}", rep.words());
+        assert!(rep.words().starts_with("Removed 1 file (less than 1 MB)") && rep.words().contains("1 could not be removed"), "{}", rep.words());
         drop(held);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2507,6 +2536,19 @@ mod tests {
             s += 1;
         }
         assert!(s >= 30 && m.result().settled && m.result().measured_freed == 0);
+        // Seen on the team's D:: 2.5 GB predicted, then 105 GB came back at once after 320 s.
+        let mut m = Measure::new(before, 2 * G + G / 2, 0);
+        for s in 1..320 {
+            m.push(s, before - (300 << 20));
+        }
+        m.push(320, before + 105 * G);
+        m.push(325, before + 105 * G);
+        m.push(330, before + 105 * G);
+        let r = m.result();
+        assert!(r.other_activity);
+        let (t, b) = measured_words("D:", 2 * G + G / 2, &r, true);
+        assert_eq!(t, "Free space jumped on D:");
+        assert!(b.contains("rose by 105.0 GB (measured)") && b.contains("can't be told apart"), "{}", b);
     }
 
     #[test]
@@ -2514,5 +2556,11 @@ mod tests {
         assert_eq!(thousands(0), "0");
         assert_eq!(thousands(6301), "6,301");
         assert_eq!(thousands(1_669_644), "1,669,644");
+        assert_eq!(plural(1, "file"), "1 file");
+        assert_eq!(plural(6301, "file"), "6,301 files");
+        assert_eq!(size_words(30 << 20), "30 MB");
+        assert_eq!(size_words(16 << 30), "16.0 GB");
+        assert_eq!(size_words(0), "0.0 GB");
+        assert_eq!(gb_words(Some(30 << 20), "lower_bound"), "at least 30 MB");
     }
 }
