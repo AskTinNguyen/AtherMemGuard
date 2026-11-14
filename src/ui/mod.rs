@@ -10,3 +10,5 @@ pub mod settings_store;
 pub mod status_source;
 
 pub use commands::Command;
+pub mod dialogs;
+pub mod window;

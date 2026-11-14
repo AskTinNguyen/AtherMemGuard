@@ -85,6 +85,13 @@ fn resolve_face(face: Face, weight: u16) -> (&'static str, i32) {
     }
 }
 
+/// A GDI font for a role at `scale`, for native controls (the temporary EDIT). The caller deletes it.
+pub(crate) fn create_hfont(f: Font, scale: Scale) -> HFONT {
+    let (face, weight) = resolve_face(f.face, f.weight);
+    let w = wide(face);
+    unsafe { CreateFontW(-scale.s(f.px).max(1), 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET as u32, 0, 0, CLEARTYPE_QUALITY as u32, 0, w.as_ptr()) }
+}
+
 /// Horizontal alignment for single-line text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Align {
@@ -416,9 +423,7 @@ impl Canvas {
         if let Some((_, h)) = self.fonts.borrow().iter().find(|(k, _)| *k == key) {
             return *h;
         }
-        let (face, weight) = resolve_face(f.face, f.weight);
-        let w = wide(face);
-        let h = unsafe { CreateFontW(-px, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET as u32, 0, 0, CLEARTYPE_QUALITY as u32, 0, w.as_ptr()) };
+        let h = create_hfont(f, self.scale);
         self.fonts.borrow_mut().push((key, h));
         h
     }
