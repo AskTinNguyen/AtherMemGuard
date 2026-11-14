@@ -1,0 +1,9 @@
+{
+    "windows": {
+        "version": "0.2.0",
+        "url": "https://github.com/AskTinNguyen/AtherMemGuard/releases/download/v0.2.0/AtherMemGuard-Setup-0.2.0.exe",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "size": 1,
+        "notes": "Placeholder: package.ps1 -Publish writes the real values."
+    }
+}

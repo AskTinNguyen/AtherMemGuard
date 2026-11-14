@@ -63,3 +63,20 @@ pub fn log_file() -> PathBuf {
 pub fn status_file() -> PathBuf {
     data_dir().join("status.json")
 }
+
+/// A file with this name next to `AtherMemGuard.exe` makes it run as the tray app from that
+/// folder instead of offering to install (portable zip, dev builds).
+pub const PORTABLE_MARKER: &str = "AtherMemGuard.portable";
+
+/// The Start menu entry `install` adds: %APPDATA%\Microsoft\Windows\Start Menu\Programs.
+pub fn start_menu_shortcut() -> PathBuf {
+    env_dir("APPDATA")
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs")
+        .join(format!("{}.lnk", PRODUCT_NAME))
+}
+
+/// Overrides the update manifest URL (tests); only then is plain http to this PC allowed.
+pub const UPDATE_URL_ENV: &str = "ATHER_MEMGUARD_UPDATE_URL";

@@ -4,16 +4,20 @@
 //! - `config`  TOML settings (groups, pressure thresholds, UE process names)
 //! - `engine`  snapshot -> analyze (pure) -> apply (soft caps, hard caps, throttling)
 //! - `ops`     one-shot operations for agents: prime, wait, run, advise
-//! - `install` per-user install, autostart, PATH
+//! - `install` per-user install, autostart, PATH, Start menu, launch mode
 //! - `tray`    tray icon + background loop
+//! - `net`     HTTP(S) GET through WinHTTP
+//! - `updater` check, download, verify and swap in a new version
 
 pub mod config;
 pub mod engine;
 pub mod install;
 pub mod logo;
+pub mod net;
 pub mod ops;
 pub mod paths;
 pub mod tray;
+pub mod updater;
 pub mod win;
 
 pub mod log {
