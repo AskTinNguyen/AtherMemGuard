@@ -13,3 +13,4 @@ pub use commands::Command;
 pub mod dialogs;
 pub mod window;
 pub mod toast;
+pub mod settings_model;
