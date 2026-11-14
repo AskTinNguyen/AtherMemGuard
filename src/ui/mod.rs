@@ -17,3 +17,6 @@ pub mod settings_model;
 pub mod settings;
 pub mod ui_state;
 pub mod snapshots;
+pub mod setup;
+pub mod history;
+pub mod doctor;

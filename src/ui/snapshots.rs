@@ -11,6 +11,7 @@ use super::settings_store::FakeStore;
 use super::status_source::FakeStatus;
 use super::theme::Scale;
 use super::toast;
+use super::setup::{self, FakeBackend, Input, SetupMode, SetupWindow};
 use super::window::Surface;
 
 /// A settings window over the mockup's data.
@@ -80,6 +81,34 @@ pub fn write_all(dir: &Path) -> Result<Vec<PathBuf>, String> {
         for (name, t) in toast::catalog::samples() {
             save(&format!("toast-{}", name), &toast::render(&t, scale))?;
         }
+        for (name, mut w) in sample_setups() {
+            save(name, &setup::render(&mut w, scale))?;
+        }
     }
     Ok(out)
+}
+
+/// One setup window per state, from `FakeBackend`.
+pub fn sample_setups() -> Vec<(&'static str, SetupWindow)> {
+    let v = "0.2.0";
+    let mk = |installed: Option<&str>, mode: SetupMode| SetupWindow::new(Box::new(FakeBackend::new(installed)), mode, v);
+    let mut working = mk(None, SetupMode::Install);
+    working.model.input(Input::Primary);
+    let mut done = mk(None, SetupMode::Install);
+    done.model.input(Input::Primary);
+    done.model.input(Input::Finished(Ok(())));
+    let mut failed = mk(None, SetupMode::Install);
+    failed.model.input(Input::Primary);
+    failed.model.input(Input::Finished(Err(
+        r"Couldn't write C:\Users\you\AppData\Local\Programs\AtherMemGuard\memguard.exe (Access is denied. (os error 5)).".into(),
+    )));
+    vec![
+        ("setup-install", mk(None, SetupMode::Install)),
+        ("setup-update", mk(Some("0.1.4"), SetupMode::Install)),
+        ("setup-reinstall", mk(Some("0.2.0"), SetupMode::Install)),
+        ("setup-working", working),
+        ("setup-done", done),
+        ("setup-failed", failed),
+        ("setup-uninstall", mk(Some("0.2.0"), SetupMode::Uninstall)),
+    ]
 }
