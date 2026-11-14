@@ -4,3 +4,9 @@
 pub mod canvas;
 pub mod geom;
 pub mod theme;
+pub mod commands;
+pub mod kit;
+pub mod settings_store;
+pub mod status_source;
+
+pub use commands::Command;
