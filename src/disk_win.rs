@@ -345,6 +345,18 @@ pub fn enter_background_mode() -> bool {
     unsafe { SetPriorityClass(GetCurrentProcess(), PROCESS_MODE_BACKGROUND_BEGIN) != 0 }
 }
 
+/// Tell running programs that the user environment changed (`WM_SETTINGCHANGE` with
+/// "Environment", as the System control panel does), so Explorer starts new programs with the
+/// new variables. Waits at most 5 s for windows that don't answer. Writes nothing.
+pub fn broadcast_environment_change() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE};
+    let what = wide("Environment");
+    let mut result = 0usize;
+    // SAFETY: `what` is NUL-terminated and outlives the call (SendMessageTimeout is synchronous);
+    // `result` is a valid out pointer.
+    unsafe { SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, what.as_ptr() as isize, SMTO_ABORTIFHUNG, 5000, &mut result) };
+}
+
 /// A FILETIME as local "YYYY-MM-DD HH:MM", or "" for 0.
 pub fn filetime_local(ft: u64) -> String {
     use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};

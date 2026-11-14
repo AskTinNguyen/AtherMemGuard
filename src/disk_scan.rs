@@ -59,11 +59,32 @@ struct CatalogEntry {
     plugins: bool,
     #[serde(default)]
     older_than_days: Option<u64>,
+    /// The tool whose own clean command can empty it (`npm`, `pip`, `dotnet`).
+    #[serde(default)]
+    tool: Option<String>,
 }
 
 fn catalog() -> &'static CatalogFile {
     static C: OnceLock<CatalogFile> = OnceLock::new();
     C.get_or_init(|| toml::from_str(CATALOG_TOML).expect("the built-in disk catalogue is valid"))
+}
+
+/// What the catalogue says about one key: the cleanup's allow-list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatalogInfo {
+    pub class: String,
+    /// Relative to the project root, or (global) starting with a variable like `%LOCALAPPDATA%`.
+    pub path: String,
+    pub plugins: bool,
+    pub global: bool,
+    pub older_than_days: Option<u64>,
+    pub tool: Option<String>,
+}
+
+pub fn catalog_info(key: &str) -> Option<CatalogInfo> {
+    let c = catalog();
+    let f = |e: &CatalogEntry, global: bool| CatalogInfo { class: e.class.clone(), path: e.path.clone(), plugins: e.plugins, global, older_than_days: e.older_than_days, tool: e.tool.clone() };
+    c.project.iter().find(|e| e.key == key).map(|e| f(e, false)).or_else(|| c.global.iter().find(|e| e.key == key).map(|e| f(e, true)))
 }
 
 /// Class order in reports.
@@ -95,6 +116,11 @@ fn is_dir(p: &Path) -> bool {
 fn is_reparse(p: &Path) -> bool {
     use std::os::windows::fs::MetadataExt;
     std::fs::symlink_metadata(p).map(|m| m.file_attributes() & disk_win::A_REPARSE != 0).unwrap_or(false)
+}
+
+/// Does `dir` hold a `.uproject` file directly?
+pub fn has_uproject(dir: &Path) -> bool {
+    !uprojects(dir).is_empty()
 }
 
 /// The `.uproject` file names directly in `dir`.
@@ -233,7 +259,8 @@ fn plugin_dirs(dir: &Path, leaf: &str, depth: u32, out: &mut Vec<String>) {
     }
 }
 
-fn expand_global(path: &str) -> Option<PathBuf> {
+/// A `[[global]]` catalogue path with its variable filled in.
+pub fn expand_global(path: &str) -> Option<PathBuf> {
     let (ddc, zen) = crate::disk::ue_cache_dirs();
     let s = if let Some(rest) = path.strip_prefix("%DDC%") {
         format!("{}{}", ddc?.display(), rest)
@@ -277,6 +304,29 @@ fn old_entries(dir: &Path, days: u64) -> Vec<String> {
         .filter(|e| e.metadata().and_then(|m| m.modified()).map(|t| t < cutoff).unwrap_or(false))
         .map(|e| e.path().display().to_string())
         .collect()
+}
+
+/// Caches left behind by `memguard disk relocate`, once the new place has been written to.
+fn old_cache_items() -> Vec<CatItem> {
+    let Some(rec) = crate::disk_clean::DiskFiles::default().relocate_record() else { return Vec::new() };
+    crate::disk_relocate::old_caches(&rec)
+        .into_iter()
+        .map(|(name, old)| CatItem { key: "cache:old".into(), class: "disposable".into(), title: format!("Old cache, no longer used ({})", name), paths: vec![old], lane: None })
+        .collect()
+}
+
+/// Ather MemGuard's own bin on each drive: its own item, never part of another.
+fn bin_items() -> Vec<CatItem> {
+    let mut out = Vec::new();
+    for v in disk_win::volumes().iter().filter(|v| v.drive_type == 3) {
+        for root in v.paths.iter().filter(|p| p.len() <= 3) {
+            let b = crate::disk_clean::bin_root(root);
+            if std::fs::read_dir(&b).map(|mut d| d.next().is_some()).unwrap_or(false) {
+                out.push(CatItem { key: "memguard:bin".into(), class: "review".into(), title: format!("Ather MemGuard's bin on {}", root.trim_end_matches('\\')), paths: vec![b.display().to_string()], lane: None });
+            }
+        }
+    }
+    out
 }
 
 /// Everything the checkup lists for `path` (or, without one, the configured project folders,
@@ -343,6 +393,8 @@ pub fn discover(cfg: &Config, path: Option<&str>) -> Vec<CatItem> {
     }
     if path.is_none() {
         items.extend(global_items());
+        items.extend(old_cache_items());
+        items.extend(bin_items());
     }
     let keep: Vec<String> = s.keep.iter().map(|k| norm(k)).collect();
     for it in &mut items {
@@ -771,17 +823,25 @@ pub fn cached_system_caches() -> Option<crate::disk::CachesOnSystem> {
 
 /// The volumes UE processes are working in: project folders named on their command lines.
 fn busy_projects() -> Vec<String> {
+    busy_state().0
+}
+
+/// Project folders an Unreal editor, build or cook is working in (normalised), and whether
+/// some Unreal process's command line couldn't be read (then nobody can say which project).
+pub fn busy_state() -> (Vec<String>, bool) {
     let mut out = Vec::new();
+    let mut unknown = false;
     for p in crate::win::list_processes() {
         let n = p.name.to_ascii_lowercase();
         if !(n.starts_with("unrealeditor") || n == "unrealbuildtool" || n == "automationtool" || n.starts_with("unrealpak")) {
             continue;
         }
-        if let Some(cmd) = crate::win::command_line(p.pid) {
-            out.extend(uproject_dirs_in(&cmd));
+        match crate::win::command_line(p.pid) {
+            Some(cmd) => out.extend(uproject_dirs_in(&cmd)),
+            None => unknown = true,
         }
     }
-    out
+    (out, unknown)
 }
 
 /// Folders of the `.uproject` files a command line names (normalised).
@@ -938,7 +998,9 @@ pub fn build_checkup(items: &[CatItem], out: &ScanOutput, set_names: &[(String, 
             "shared_outside_scan_gb": if known { json!(gb2(r.shared_outside)) } else { Value::Null },
             "last_write": disk_win::filetime_local(l2.map_or(l1.last_write, |l| l.last_write.max(l1.last_write))),
             "in_use": in_use, "in_flux": j.in_flux, "notes": notes_for(r, in_use),
-            "actions": [], "recommended": false,
+            "actions": crate::disk_clean::actions_json(&it.key, &it.class, catalog_info(&it.key).and_then(|c| c.tool).as_deref(), r.volume.is_some(), j.frees.map(gb2)),
+            "no_action": crate::disk_clean::no_action_reason(&it.key, &it.class),
+            "recommended": false,
         }));
     }
     let mut totals = Vec::new();
@@ -1071,13 +1133,30 @@ fn record_system_caches(items: &[CatItem], out: &ScanOutput, time: &str) {
 }
 
 /// `memguard disk plan`: fresh numbers for exactly these items of the last checkup (all of
-/// them when `ids` is empty). One entry per volume, never a sum across volumes.
+/// them when `ids` is empty). One entry per volume, never a sum across volumes. The plan is
+/// recorded (`disk-plans.json`) so `clean` can check nothing changed since.
 pub fn plan(cfg: &Config, ids: &[String], runner: Runner, progress: Progress) -> Result<Value, String> {
     let c = load_cache().ok_or("Run a disk checkup first (memguard disk checkup, or memguard_disk_checkup): a plan uses its item ids.")?;
     plan_from(cfg, &c, ids, runner, progress)
 }
 
 pub fn plan_from(cfg: &Config, c: &CachedCheckup, ids: &[String], runner: Runner, progress: Progress) -> Result<Value, String> {
+    let (v, rec) = plan_record(cfg, c, ids, None, runner, progress)?;
+    let _ = crate::disk_clean::DiskFiles::default().save_plan(&rec);
+    Ok(v)
+}
+
+/// The plan and its record. `together`: the ids whose `frees_together` is computed (default:
+/// all of them; `clean` passes only the items it deletes, since a bin move frees nothing).
+pub fn plan_record(
+    cfg: &Config,
+    c: &CachedCheckup,
+    ids: &[String],
+    together: Option<&[String]>,
+    runner: Runner,
+    progress: Progress,
+) -> Result<(Value, crate::disk_clean::PlanRecord), String> {
+    use crate::disk_clean::{PlanRecord, PlannedItem, PlannedVolume};
     let s = cfg.disk();
     let mut picked: Vec<usize> = Vec::new();
     let mut refused = Vec::new();
@@ -1097,9 +1176,14 @@ pub fn plan_from(cfg: &Config, c: &CachedCheckup, ids: &[String], runner: Runner
         return Err("None of these ids are in the last disk checkup. Run it again and use its ids (d1, d2, ...).".into());
     }
     let items: Vec<CatItem> = picked.iter().map(|i| c.items[*i].clone()).collect();
+    let id_of = |k: usize| format!("d{}", picked[k] + 1);
+    let set: Vec<usize> = match together {
+        None => (0..items.len()).collect(),
+        Some(t) => (0..items.len()).filter(|k| t.iter().any(|x| x.eq_ignore_ascii_case(&id_of(*k)))).collect(),
+    };
     let job = ScanJob {
         items: items.iter().map(|i| i.paths.clone()).collect(),
-        sets: vec![(0..items.len()).collect()],
+        sets: if set.is_empty() { Vec::new() } else { vec![set] },
         threads: s.scan_threads,
         budget_sec: s.scan_budget_sec.max(300),
         stop_on_build: false,
@@ -1107,18 +1191,40 @@ pub fn plan_from(cfg: &Config, c: &CachedCheckup, ids: &[String], runner: Runner
     let out = runner(&job, progress)?;
     let busy = busy_projects();
     let now = crate::win::local_time_string();
+    let plan_id = format!("p{}", crate::disk_clean::run_id());
+    let mut rec = PlanRecord { id: plan_id.clone(), unix: crate::disk_clean::unix_now(), time: now.clone(), items: Vec::new(), volumes: Vec::new() };
+    let in_use_of = |it: &CatItem| it.paths.iter().any(|p| busy.iter().any(|b| disk_space::is_within(&norm(p), b) || disk_space::is_within(b, &norm(p))));
+    let mut confs_by_item: Vec<Confidence> = Vec::new();
+    for (k, it) in items.iter().enumerate() {
+        let r = &out.items[k];
+        let vol = r.volume.as_ref().and_then(|g| out.volumes.iter().find(|v| v.guid.eq_ignore_ascii_case(g)));
+        let j = judge(r, vol.is_some_and(|v| v.block_cloning), in_use_of(it), false);
+        confs_by_item.push(j.conf);
+        rec.items.push(PlannedItem {
+            id: id_of(k),
+            key: it.key.clone(),
+            class: it.class.clone(),
+            title: it.title.clone(),
+            paths: it.paths.clone(),
+            path_ids: it.paths.iter().map(|p| disk_win::identity(p).map(|(_, f, _)| f)).collect(),
+            last_write: r.level2.as_ref().map_or(r.level1.last_write, |l| l.last_write.max(r.level1.last_write)),
+            volume: r.volume.clone(),
+            volume_root: vol.map(|v| v.root.clone()),
+            frees_alone: j.frees,
+            confidence: j.conf.name().into(),
+            tool: catalog_info(&it.key).and_then(|c| c.tool),
+            unmeasurable: r.unmeasurable.clone(),
+        });
+    }
     let mut plans = Vec::new();
     for sr in &out.sets {
         let vol = out.volumes.iter().find(|v| v.guid.eq_ignore_ascii_case(&sr.volume));
-        let block = vol.is_some_and(|v| v.block_cloning);
         let mut confs = Vec::new();
         let mut per_item = Vec::new();
         for &k in &sr.items {
-            let it = &items[k];
-            let in_use = it.paths.iter().any(|p| busy.iter().any(|b| disk_space::is_within(&norm(p), b) || disk_space::is_within(b, &norm(p))));
-            let j = judge(&out.items[k], block, in_use, false);
-            confs.push(j.conf);
-            per_item.push(json!({ "id": format!("d{}", picked[k] + 1), "title": it.title, "frees_alone_gb": opt_gb(j.frees), "frees_confidence": j.conf.name(), "frees_basis": BASIS, "notes": notes_for(&out.items[k], in_use) }));
+            confs.push(confs_by_item[k]);
+            per_item.push(json!({ "id": id_of(k), "title": items[k].title, "frees_alone_gb": opt_gb(rec.items[k].frees_alone), "frees_confidence": confs_by_item[k].name(),
+                                  "frees_basis": BASIS, "notes": notes_for(&out.items[k], in_use_of(&items[k])) }));
         }
         let tc = total_confidence(&confs);
         let free_now = vol.map_or(0, |v| v.avail);
@@ -1126,9 +1232,17 @@ pub fn plan_from(cfg: &Config, c: &CachedCheckup, ids: &[String], runner: Runner
         if vol.is_some_and(|v| v.fs.eq_ignore_ascii_case("ReFS")) {
             notes.push(REFS_DELAY_NOTE.to_string());
         }
+        rec.volumes.push(PlannedVolume {
+            volume: sr.volume.clone(),
+            root: vol.map(|v| v.root.clone()).unwrap_or_default(),
+            fs: vol.map(|v| v.fs.clone()).unwrap_or_default(),
+            item_ids: sr.items.iter().map(|k| id_of(*k)).collect(),
+            frees_together: tc.map(|_| sr.frees_together),
+            confidence: tc.map_or("none", |c| c.name()).into(),
+        });
         plans.push(json!({
             "volume": vol_name(&sr.volume, &out.volumes),
-            "item_ids": sr.items.iter().map(|k| format!("d{}", picked[*k] + 1)).collect::<Vec<_>>(),
+            "item_ids": sr.items.iter().map(|k| id_of(*k)).collect::<Vec<_>>(),
             "frees_together_gb": tc.map(|_| gb2(sr.frees_together)),
             "frees_confidence": tc.map_or("none", |c| c.name()),
             "frees_basis": BASIS,
@@ -1143,16 +1257,31 @@ pub fn plan_from(cfg: &Config, c: &CachedCheckup, ids: &[String], runner: Runner
     }
     for (k, r) in out.items.iter().enumerate() {
         if let Some(why) = &r.unmeasurable {
-            refused.push(json!({ "id": format!("d{}", picked[k] + 1), "reason": format!("Not counted: {}", why) }));
+            refused.push(json!({ "id": id_of(k), "reason": format!("Not counted: {}", why) }));
         }
     }
-    Ok(json!({
+    let actions: Vec<Value> = rec
+        .items
+        .iter()
+        .map(|it| {
+            let a = crate::disk_clean::actions_json(&it.key, &it.class, it.tool.as_deref(), it.volume_root.is_some(), it.frees_alone.map(gb2));
+            json!({ "id": it.id, "class": it.class, "actions": a, "no_action": crate::disk_clean::no_action_reason(&it.key, &it.class) })
+        })
+        .collect();
+    let cleanable: Vec<String> =
+        rec.items.iter().filter(|it| !crate::disk_clean::offered_actions(&it.key, &it.class, it.tool.as_deref(), true).is_empty()).map(|it| it.id.clone()).collect();
+    let v = json!({
+        "plan_id": plan_id,
         "plans": plans,
+        "items": actions,
         "refused": refused,
         "basis": BASIS,
-        "removing": "Ather MemGuard doesn't delete anything. Remove the folders yourself, or use `git worktree remove` for a lane.",
+        "command": if cleanable.is_empty() { Value::Null } else { json!(format!("memguard disk clean --fix {}", cleanable.join(" "))) },
+        "removing": "To act on it: memguard disk clean --fix <id>[:now|bin|tool] (asks first). An agent may call memguard_disk_clean for regenerable items within 10 minutes of this plan. \
+Ather MemGuard never removes lanes or worktrees: use git worktree remove for those.",
         "do_not_sum": "Plans on different drives are never added together. frees_together_gb is predicted, not measured.",
-    }))
+    });
+    Ok((v, rec))
 }
 
 // ---------------------------------------------------------------- text
@@ -1246,7 +1375,8 @@ pub fn render_checkup(c: &Checkup) -> String {
         }
     }
     if !c.items.is_empty() {
-        s.push_str("Next: memguard disk plan <ids>   fresh numbers for exactly the items you pick. Ather MemGuard deletes nothing.\n");
+        s.push_str("Next: memguard disk plan <ids>   fresh numbers for exactly the items you pick.\n");
+        s.push_str("Then: memguard disk clean --fix <id>[:now|bin|tool] ...   asks first; bin moves can be undone, deletes can't.\n");
     } else {
         s.push_str("Nothing to list here.\n");
     }
