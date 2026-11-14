@@ -4,6 +4,7 @@
 //! - `config`  TOML settings (groups, pressure thresholds, UE process names)
 //! - `engine`  snapshot -> analyze (pure) -> apply (soft caps, hard caps, throttling)
 //! - `ops`     one-shot operations for agents: prime, wait, run, advise
+//! - `history` memory history: 24-hour ring, daily CSV files, editor growth slope
 //! - `install` per-user install, autostart, PATH, Start menu, launch mode
 //! - `mcp`     MCP server over stdio, so coding agents can call MemGuard as tools
 //! - `tray`    tray icon + background loop
@@ -12,6 +13,7 @@
 
 pub mod config;
 pub mod engine;
+pub mod history;
 pub mod install;
 pub mod logo;
 pub mod mcp;
@@ -28,6 +30,10 @@ pub mod log {
 
     /// Append one timestamped line to the log. Never fails loudly.
     pub fn write(msg: &str) {
+        // Unit tests must never write to the real data folder.
+        if cfg!(test) {
+            return;
+        }
         let path = crate::paths::log_file();
         let _ = fs::create_dir_all(crate::paths::data_dir());
         if let Ok(meta) = fs::metadata(&path) {

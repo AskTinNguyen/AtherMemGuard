@@ -1,0 +1,103 @@
+# AtherMemGuard settings. Saved changes are picked up within one interval.
+#
+# How it decides what to do
+#   mode      what Unreal is doing: idle, editor, build, cook (several can be true at once)
+#   pressure  normal / elevated / critical, from free RAM and free commit (see [pressure])
+#
+# Each [[group]] is a set of apps. Its base settings always apply. The optional
+# [group.ue], [group.elevated] and [group.critical] tables override them while
+# Unreal is running, and while memory pressure is elevated or critical.
+#
+#   priority       normal | belownormal | medium | low | verylow
+#                  Windows takes RAM from lower-priority apps first. No crash risk.
+#   trim_above_mb  soft cap: when the group's RAM is above this, push its memory to the
+#                  compressed store / page file. Frees RAM, not commit. 0 = off.
+#   cpu            normal | below | idle | eco   (eco = Windows efficiency mode)
+#   suspend        true freezes the apps completely until pressure drops. Use with care.
+#   hard_cap_mb    hard cap on the group's committed memory (Job Object). Apps that hit it
+#                  usually crash. Sandboxed browser/Electron helpers can't be capped. 0 = off.
+#   hard_cap_per_process_mb   same, per process.
+
+interval_sec = 10
+trim_cooldown_sec = 60
+
+[pressure]
+# Percent of total RAM that is free / percent of the commit limit that is free.
+elevated_ram_free_pct = 10
+elevated_commit_free_pct = 12
+critical_ram_free_pct = 4
+critical_commit_free_pct = 6
+
+[ue]
+# Never touched by any group, whatever the group lists say. A trailing * is a wildcard.
+protect = [
+    "UnrealEditor*", "ShaderCompileWorker", "UnrealBuildTool", "dotnet", "cl", "link",
+    "clang-cl", "lld-link", "UbaAgent", "UbaCli", "UbaHost", "zenserver", "UnrealPak",
+    "LiveCodingConsole", "UnrealTraceServer", "CrashReportClient*", "EpicWebHelper",
+    "AutomationTool", "msbuild", "git", "git-lfs",
+]
+# Compile / shader workers, counted in status and used by worker_throttle.
+workers = ["cl", "clang-cl", "link", "lld-link", "ShaderCompileWorker"]
+# Suggest restarting the editor when one editor process commits more than this.
+editor_restart_hint_gb = 48
+# Opt-in. At critical pressure, pause the newest workers (never fewer than min_workers
+# keep running) and resume them when pressure drops. Slows the build instead of
+# letting it die with out-of-memory errors.
+worker_throttle = false
+min_workers = 4
+
+[prime]
+# Headroom `memguard prime --for X` and `memguard wait --for X` aim for. Starting points:
+# tune them to your project.
+editor = { ram_gb = 16, commit_gb = 24 }
+build = { ram_gb = 24, commit_gb = 40 }
+cook = { ram_gb = 32, commit_gb = 48 }
+
+[[group]]
+name = "Browsers"
+processes = ["chrome", "msedge", "firefox", "brave", "msedgewebview2"]
+priority = "low"
+trim_above_mb = 6144
+[group.ue]
+trim_above_mb = 3072
+[group.elevated]
+trim_above_mb = 1024
+cpu = "below"
+[group.critical]
+trim_above_mb = 256
+
+[[group]]
+name = "Chat"
+processes = ["Slack", "ChatGPT", "Wispr Flow", "Discord", "Teams", "ms-teams", "Telegram", "Zoom"]
+priority = "verylow"
+trim_above_mb = 1536
+[group.ue]
+trim_above_mb = 768
+[group.elevated]
+trim_above_mb = 256
+cpu = "below"
+[group.critical]
+trim_above_mb = 64
+
+[[group]]
+name = "Agents"
+# Claude and Codex run your agents: lower priority only, trimmed just under pressure,
+# never suspended or hard capped.
+processes = ["claude", "codex"]
+priority = "low"
+[group.elevated]
+trim_above_mb = 6144
+[group.critical]
+trim_above_mb = 2048
+
+[[group]]
+name = "Background"
+processes = [
+    "steam", "steamwebhelper", "EpicGamesLauncher", "OneDrive", "copilotapp",
+    "PhoneExperienceHost", "Widgets", "WidgetService", "Spotify",
+]
+priority = "verylow"
+trim_above_mb = 512
+cpu = "eco"
+[group.critical]
+trim_above_mb = 64
