@@ -13,6 +13,7 @@ use serde_json::{json, Map, Value};
 
 use crate::config::{Config, Target};
 use crate::engine::{analyze, snapshot, Status};
+use crate::history::Sample;
 use crate::{ops, paths, win};
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -27,6 +28,11 @@ pub const INVALID_PARAMS: i64 = -32602;
 
 const WAIT_DEFAULT_SEC: u64 = 600;
 const WAIT_MAX_SEC: u64 = 3600;
+const HISTORY_DEFAULT_HOURS: f64 = 1.0;
+const HISTORY_MAX_HOURS: f64 = 168.0;
+/// Longer spans are thinned to about this many samples (evenly, always keeping the newest),
+/// so a week of history doesn't flood the agent's context.
+const HISTORY_MAX_SAMPLES: usize = 720;
 
 const INSTRUCTIONS: &str = "Ather MemGuard keeps this Windows PC's memory free for Unreal Engine work. \
 Before starting a local Unreal build, cook or packaging run, call memguard_wait with prime: true and the \
@@ -38,8 +44,13 @@ with out-of-memory errors.";
 /// at once); tests pass the built-in defaults.
 pub type ConfigLoader = Box<dyn Fn() -> Config>;
 
+/// Memory history source: samples from the last `Duration`. The real server reads the CSV
+/// files in the data folder, like `memguard history --json`; tests pass fixed samples.
+pub type HistoryLoader = Box<dyn Fn(Duration) -> Vec<Sample>>;
+
 pub struct Server {
     load_config: ConfigLoader,
+    load_history: HistoryLoader,
 }
 
 impl Default for Server {
@@ -59,7 +70,13 @@ struct ToolError(String);
 
 impl Server {
     pub fn new(load_config: ConfigLoader) -> Self {
-        Server { load_config }
+        Server { load_config, load_history: Box::new(crate::history::load_since) }
+    }
+
+    /// Use another history source (tests).
+    pub fn with_history(mut self, load_history: HistoryLoader) -> Self {
+        self.load_history = load_history;
+        self
     }
 
     /// Read messages until the reader ends. Each reply is one line on the writer.
@@ -212,9 +229,12 @@ impl Server {
                 check_keys(args, &[])?;
                 to_value(&ops::advise(&(self.load_config)()))
             }
-            // TODO(part-b): add `memguard_history` (`hours?` default 1) once Part B's
-            // `history` module is merged: register it in `tool_list()` and call
-            // `crate::history` here, returning the same JSON as `memguard history --json`.
+            "memguard_history" => {
+                check_keys(args, &["hours"])?;
+                let hours = hours_arg(args)?;
+                let samples = (self.load_history)(Duration::from_secs_f64(hours * 3600.0));
+                Ok(history_result(hours, samples))
+            }
             _ => Err(ToolError(format!("Unknown tool: {}", name))),
         }
     }
@@ -323,6 +343,31 @@ fn gb_arg(args: &Map<String, Value>, key: &str) -> Result<Option<f64>, ToolError
     }
 }
 
+fn hours_arg(args: &Map<String, Value>) -> Result<f64, ToolError> {
+    match args.get("hours") {
+        None | Some(Value::Null) => Ok(HISTORY_DEFAULT_HOURS),
+        Some(v) => match v.as_f64() {
+            Some(n) if n.is_finite() && n > 0.0 => Ok(n.min(HISTORY_MAX_HOURS)),
+            _ => Err(ToolError("hours must be a number of hours, more than 0 (at most 168).".into())),
+        },
+    }
+}
+
+/// The `memguard_history` result: the samples `memguard history --json` gives for the same
+/// span, thinned evenly to at most `HISTORY_MAX_SAMPLES` (the newest is always kept).
+fn history_result(hours: f64, samples: Vec<Sample>) -> Value {
+    let total = samples.len();
+    let step = total.div_ceil(HISTORY_MAX_SAMPLES).max(1);
+    let last = total.saturating_sub(1);
+    let kept: Vec<&Sample> = samples.iter().enumerate().filter(|(i, _)| (last - i) % step == 0).map(|(_, s)| s).collect();
+    json!({
+        "hours": hours,
+        "total_samples": total,
+        "step": step,
+        "samples": kept,
+    })
+}
+
 fn timeout_arg(args: &Map<String, Value>) -> Result<Duration, ToolError> {
     let secs = match args.get("timeout_sec") {
         None | Some(Value::Null) => WAIT_DEFAULT_SEC as f64,
@@ -406,7 +451,67 @@ such as closing the editor during a build. Call it before starting a local build
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             "annotations": { "readOnlyHint": true, "openWorldHint": false },
         }),
+        json!({
+            "name": "memguard_history",
+            "title": "Memory history",
+            "description": "Read-only. What memory did over the last hours, as recorded by the background app: \
+one sample per interval with time, Unreal mode, pressure level, free RAM and commit, what Unreal and the editor \
+had committed, compile workers, and RAM per app group. Call it to explain a slow or failed build after the fact, \
+to see whether the editor keeps growing (a leak), or to check how long memory has been tight. Spans over about \
+720 samples are thinned evenly (`step` says by how much); the newest sample is always included.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "hours": { "type": "number", "exclusiveMinimum": 0, "maximum": HISTORY_MAX_HOURS, "default": HISTORY_DEFAULT_HOURS, "description": "How far back to look, in hours. At most 168 (a week)." }
+                },
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false },
+        }),
     ]
+}
+
+/// The memguard.exe agents should start, for `agent_setup_text`: the installed copy if there
+/// is one, else `fallback` (the CLI passes itself; the tray app the memguard.exe next to it).
+pub fn agent_cli_path(fallback: std::path::PathBuf) -> std::path::PathBuf {
+    let installed = paths::install_dir().join(paths::CLI_EXE);
+    if installed.exists() {
+        installed
+    } else {
+        fallback
+    }
+}
+
+/// What `memguard agent-setup` prints and the tray's "Copy setup" puts on the clipboard:
+/// ready-to-paste setup for Claude Code and Codex, starting `exe`.
+pub fn agent_setup_text(exe: &std::path::Path) -> String {
+    let exe = exe.display().to_string();
+    let json_exe = serde_json::to_string(&exe).unwrap_or_else(|_| format!("\"{}\"", exe));
+    let mut s = String::new();
+    let mut line = |l: &str| {
+        s.push_str(l);
+        s.push('\n');
+    };
+    line("Ather MemGuard for AI agents: an MCP server your agent starts by itself (no port, nothing to enable).");
+    line("Tools: memguard_status, memguard_prime, memguard_wait, memguard_advise, memguard_history.");
+    line("");
+    line("Claude Code, for all your projects:");
+    line(&format!("  claude mcp add --scope user ather-memguard -- \"{}\" mcp", exe));
+    line("If `memguard` is on your PATH, this short form works too:");
+    line("  claude mcp add ather-memguard -- memguard mcp");
+    line("");
+    line("Claude Code, shared with a project (.mcp.json in the repo root):");
+    line(&format!("  {{ \"mcpServers\": {{ \"ather-memguard\": {{ \"command\": {}, \"args\": [\"mcp\"] }} }} }}", json_exe));
+    line("");
+    line(r"Codex (%USERPROFILE%\.codex\config.toml):");
+    line("  [mcp_servers.ather-memguard]");
+    line(&format!("  command = '{}'", exe));
+    line("  args = [\"mcp\"]");
+    line("  tool_timeout_sec = 3700   # memguard_wait can block for up to an hour");
+    line("");
+    line("Before a local build or cook, have the agent call memguard_wait with prime: true.");
+    line("More: docs/AI-AGENTS.md");
+    s
 }
 
 // ---------------------------------------------------------------- tests
@@ -474,11 +579,11 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_the_four_tools_with_schemas() {
+    fn tools_list_has_the_five_tools_with_schemas() {
         let r = one(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#);
         let tools = r["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["memguard_status", "memguard_prime", "memguard_wait", "memguard_advise"]);
+        assert_eq!(names, ["memguard_status", "memguard_prime", "memguard_wait", "memguard_advise", "memguard_history"]);
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
             assert!(t["inputSchema"]["properties"].is_object());
@@ -514,6 +619,78 @@ mod tests {
         let s = &r["result"]["structuredContent"];
         assert!(s["suggested_max_parallel_actions"].as_u64().unwrap() >= 1);
         assert!(s["notes"].is_array());
+    }
+
+    fn sample(unix: i64) -> Sample {
+        Sample {
+            unix,
+            time: format!("t{}", unix),
+            mode: "editor".into(),
+            pressure: crate::engine::Level::Normal,
+            ram_free_gb: 40.0,
+            commit_free_gb: 30.0,
+            ue_committed_gb: 20.0,
+            editor_committed_gb: 18.0,
+            workers: 0,
+            groups: vec![crate::history::GroupRam { name: "Browsers".into(), ram_gb: 2.5 }],
+            editors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn history_call_returns_the_samples() {
+        use std::sync::{Arc, Mutex};
+        let asked: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
+        let a = asked.clone();
+        let srv = server().with_history(Box::new(move |d| {
+            a.lock().unwrap().push(d);
+            (0..3).map(|i| sample(1000 + i * 10)).collect()
+        }));
+        let run = |line: &str| {
+            let mut out = Vec::new();
+            srv.serve(line.as_bytes(), &mut out).unwrap();
+            serde_json::from_slice::<Value>(String::from_utf8(out).unwrap().trim().as_bytes()).unwrap()
+        };
+        let r = run(&call(1, "memguard_history", json!({})));
+        let s = &r["result"]["structuredContent"];
+        assert_eq!(r["result"]["isError"], false);
+        assert_eq!(s["hours"], 1.0);
+        assert_eq!(s["total_samples"], 3);
+        let samples = s["samples"].as_array().unwrap();
+        assert_eq!(samples.len(), 3);
+        // The same fields as `memguard history --json`.
+        assert_eq!(samples[0], serde_json::to_value(sample(1000)).unwrap());
+        assert_eq!(samples[2]["groups"][0]["name"], "Browsers");
+        run(&call(2, "memguard_history", json!({ "hours": 500 })));
+        run(&call(3, "memguard_history", json!({ "hours": 6 })));
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(asked, [Duration::from_secs(3600), Duration::from_secs(168 * 3600), Duration::from_secs(6 * 3600)]);
+        for bad in [json!({ "hours": 0 }), json!({ "hours": -1 }), json!({ "hours": "a day" }), json!({ "days": 1 })] {
+            tool_error_text(&run(&call(4, "memguard_history", bad)));
+        }
+    }
+
+    #[test]
+    fn long_history_is_thinned_keeping_the_newest() {
+        let samples: Vec<Sample> = (0..2000).map(sample).collect();
+        let v = history_result(168.0, samples);
+        let kept = v["samples"].as_array().unwrap();
+        assert_eq!(v["step"], 3);
+        assert!(kept.len() <= HISTORY_MAX_SAMPLES);
+        assert_eq!(kept.last().unwrap()["unix"], 1999);
+        assert_eq!(history_result(1.0, (0..5).map(sample).collect())["samples"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn agent_setup_text_names_the_exe_and_every_tool() {
+        let t = agent_setup_text(std::path::Path::new(r"C:\Tools\memguard.exe"));
+        assert!(t.contains(r#"claude mcp add --scope user ather-memguard -- "C:\Tools\memguard.exe" mcp"#), "{}", t);
+        assert!(t.contains(r#""command": "C:\\Tools\\memguard.exe""#), "{}", t);
+        assert!(t.contains(r"command = 'C:\Tools\memguard.exe'"), "{}", t);
+        for tool in tool_list() {
+            assert!(t.contains(tool["name"].as_str().unwrap()), "{}", tool["name"]);
+        }
+        assert!(t.ends_with("More: docs/AI-AGENTS.md\n"));
     }
 
     #[test]

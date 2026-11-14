@@ -1,56 +1,303 @@
-//! Tray icon and background loop. One hidden window, a 1-second timer, and the engine.
+//! Tray icon, menu, flyout, toasts and the background loop (docs/UI.md section 3).
+//!
+//! One hidden window on the UI thread owns the engine and a 1-second timer. Everything the
+//! person can do arrives as a `Command` posted to that window (menu, flyout, toasts, the prime
+//! hotkey, the settings window) and goes through `dispatch`, the one place commands are carried
+//! out. Slow work (freeing memory, update checks and downloads) runs on worker threads, which
+//! post their result back as a `Work` message; workers never touch UI. Toasts come from the
+//! engine's events (`Engine::take_events`) through `model::ToastBrain`.
 
 use std::cell::RefCell;
 use std::mem::{size_of, zeroed};
+use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
-use std::time::Instant;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicIsize, Ordering};
+use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Foundation::{GlobalFree, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, RegisterHotKey, UnregisterHotKey};
 use windows_sys::Win32::UI::Shell::{
-    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIIF_WARNING, NIM_ADD,
-    NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+    ShellExecuteW, Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, NOTIFYICON_VERSION_4,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
-    DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, KillTimer, MessageBoxW, PostQuitMessage, RegisterClassW,
-    RegisterWindowMessageW, SendMessageTimeoutW, SetForegroundWindow, SetTimer, TrackPopupMenu, TranslateMessage,
-    HICON, HWND_BROADCAST, MB_ICONINFORMATION, MB_OK, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, SMTO_ABORTIFHUNG, SM_CXSMICON,
-    SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_LBUTTONDBLCLK,
-    WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DispatchMessageW, GetCursorPos,
+    GetMessageW, GetSystemMetrics, KillTimer, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SendMessageTimeoutW,
+    SetForegroundWindow, SetTimer, TrackPopupMenu, TranslateMessage, HICON, HWND_BROADCAST, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG,
+    SMTO_ABORTIFHUNG, SM_CXSMICON, SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY,
+    WM_LBUTTONDBLCLK, WM_NULL, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW,
 };
 
-use crate::engine::{Engine, Level, Status};
+use crate::engine::{Engine, Event, Level, Status};
+use crate::ui::flyout::{self, FlyoutData};
+use crate::ui::settings::{SettingsHost, UpdateState};
+use crate::ui::toast::{self, catalog, ToastId};
+use crate::ui::Command;
+use crate::updater::{CheckResult, Manifest};
 use crate::win::{self, wide, Handle};
-use crate::{ops, paths};
+use crate::{ops, paths, updater};
+
+pub use model::*;
 
 const WM_TRAY: u32 = WM_APP + 1;
+/// NIN_SELECT | NINF_KEY: Enter or Space on the focused tray icon.
+const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
+const WM_RUN_COMMAND: u32 = WM_APP + 2;
+const WM_WORK: u32 = WM_APP + 3;
 const TIMER_ID: usize = 1;
+const HOTKEY_ID: i32 = 1;
+const FIRST_UPDATE_CHECK: Duration = Duration::from_secs(60);
+const UPDATE_EVERY: Duration = Duration::from_secs(24 * 3600);
+pub const RELEASES_URL: &str = "https://github.com/AskTinNguyen/AtherMemGuard/releases/latest";
 
-const CMD_STATUS: usize = 1;
-const CMD_PRIME: usize = 2;
-const CMD_PAUSE: usize = 3;
-const CMD_SETTINGS: usize = 4;
-const CMD_LOG: usize = 5;
-const CMD_FOLDER: usize = 6;
-const CMD_STARTUP: usize = 7;
-const CMD_EXIT: usize = 9;
+/// The tray window, for posting commands from closures (toasts, flyout, settings window).
+static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
 
-struct App {
-    engine: Engine,
-    hwnd: HWND,
-    icon: HICON,
-    icon_level: Level,
-    last_tick: Option<Instant>,
-    status: Option<Status>,
-    exit_event: Option<Handle>,
-    taskbar_created: u32,
-    hinted_restart: bool,
+// ---------------------------------------------------------------- the pure parts
+
+/// Decisions with no Win32 in them: tooltip and menu text, hotkey parsing, which toast an
+/// engine event shows, update announcements, the `[tray]` table in ui-state.toml.
+pub mod model {
+    use std::cmp::Ordering;
+
+    use crate::engine::{Event, Level, Status};
+    use crate::ui::flyout::{mode_words, pressure_words};
+    use crate::ui::toast::{catalog, Toast};
+    use crate::ui::Command;
+
+    /// What the tooltip and the menu need to know.
+    #[derive(Debug, Clone, PartialEq, Default)]
+    pub struct TrayView {
+        /// Engine mode, "editor+build".
+        pub mode: String,
+        pub pressure: Option<Level>,
+        pub paused: bool,
+        /// "15:42" for a timed pause; `None` while paused until resumed.
+        pub paused_until: Option<String>,
+        pub ram_free_gb: f64,
+        pub commit_free_gb: f64,
+        /// "Ctrl+Alt+M", empty for none.
+        pub hotkey: String,
+        /// A newer version that can be installed.
+        pub update_version: Option<String>,
+        pub updating: bool,
+        pub run_at_startup: bool,
+    }
+
+    /// "Editor + build · memory is fine"
+    pub fn status_line(v: &TrayView) -> String {
+        format!("{} · memory is {}", mode_words(&v.mode), pressure_words(v.pressure.unwrap_or(Level::Normal)))
+    }
+
+    /// `Ather MemGuard\n{Mode} · memory is {fine|tight|critical}\nRAM free {x} GB · commit free {y} GB`,
+    /// with the middle line `Paused until {hh:mm}` while paused. At most 127 characters (the
+    /// tray's limit).
+    pub fn tooltip(v: &TrayView) -> String {
+        let middle = if v.paused {
+            match &v.paused_until {
+                Some(t) => format!("Paused until {}", t),
+                None => "Paused until you resume".to_string(),
+            }
+        } else {
+            status_line(v)
+        };
+        let s = format!("Ather MemGuard\n{}\nRAM free {:.1} GB · commit free {:.1} GB", middle, v.ram_free_gb, v.commit_free_gb);
+        s.chars().take(127).collect()
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum MenuEntry {
+        /// The disabled status line at the top.
+        Status(String),
+        Separator,
+        Item { label: String, accel: String, cmd: Command, checked: bool, disabled: bool },
+    }
+
+    fn item(label: &str, cmd: Command) -> MenuEntry {
+        MenuEntry::Item { label: label.to_string(), accel: String::new(), cmd, checked: false, disabled: false }
+    }
+
+    /// The right-click menu (docs/UI.md section 3, plus "Run a checkup" from section 6).
+    pub fn menu(v: &TrayView) -> Vec<MenuEntry> {
+        let mut m = vec![MenuEntry::Status(status_line(v)), MenuEntry::Separator];
+        m.push(MenuEntry::Item { label: "Free memory now".into(), accel: v.hotkey.clone(), cmd: Command::FreeMemory, checked: false, disabled: false });
+        if v.paused {
+            m.push(item("Resume", Command::Resume));
+        } else {
+            m.push(item("Pause for 30 minutes", Command::Pause30));
+            m.push(item("Pause until I resume", Command::PauseUntilResumed));
+        }
+        m.push(MenuEntry::Separator);
+        m.push(item("Settings", Command::OpenSettings));
+        m.push(item("Memory history", Command::OpenHistory));
+        m.push(item("Run a checkup", Command::OpenDoctor));
+        m.push(MenuEntry::Separator);
+        m.push(match (&v.update_version, v.updating) {
+            (Some(ver), true) => MenuEntry::Item { label: format!("Updating to version {}…", ver), accel: String::new(), cmd: Command::InstallUpdate, checked: false, disabled: true },
+            (Some(ver), false) => item(&format!("Update to version {}…", ver), Command::InstallUpdate),
+            (None, _) => item("Check for updates…", Command::CheckUpdates),
+        });
+        m.push(MenuEntry::Item { label: "Run at Windows startup".into(), accel: String::new(), cmd: Command::ToggleStartup, checked: v.run_at_startup, disabled: false });
+        m.push(item("Quit Ather MemGuard", Command::Quit));
+        m
+    }
+
+    pub const MOD_ALT: u32 = 0x1;
+    pub const MOD_CONTROL: u32 = 0x2;
+    pub const MOD_SHIFT: u32 = 0x4;
+    pub const MOD_WIN: u32 = 0x8;
+    pub const MOD_NOREPEAT: u32 = 0x4000;
+
+    /// The virtual-key code for a key name as the settings window writes it (`settings::key_name`).
+    fn key_vk(name: &str) -> Option<u32> {
+        let n = name.trim();
+        let upper = n.to_ascii_uppercase();
+        if upper.len() == 1 {
+            let c = upper.as_bytes()[0];
+            if c.is_ascii_alphanumeric() {
+                return Some(c as u32);
+            }
+        }
+        if let Some(num) = upper.strip_prefix('F').and_then(|d| d.parse::<u32>().ok()) {
+            if (1..=24).contains(&num) {
+                return Some(0x6F + num);
+            }
+        }
+        Some(match upper.as_str() {
+            "SPACE" => 0x20,
+            "PAGEUP" => 0x21,
+            "PAGEDOWN" => 0x22,
+            "END" => 0x23,
+            "HOME" => 0x24,
+            "LEFT" => 0x25,
+            "UP" => 0x26,
+            "RIGHT" => 0x27,
+            "DOWN" => 0x28,
+            "INSERT" => 0x2D,
+            "PAUSE" => 0x13,
+            _ => return None,
+        })
+    }
+
+    /// `"Ctrl+Alt+M"` -> (RegisterHotKey modifiers with MOD_NOREPEAT, virtual key). A key needs
+    /// Ctrl, Alt or Win unless it is an F-key.
+    pub fn parse_hotkey(s: &str) -> Result<(u32, u32), String> {
+        let parts: Vec<&str> = s.split('+').map(str::trim).filter(|p| !p.is_empty()).collect();
+        let Some((key, mods)) = parts.split_last() else {
+            return Err("no shortcut set".into());
+        };
+        let mut m = 0;
+        for p in mods {
+            m |= match p.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => MOD_CONTROL,
+                "alt" => MOD_ALT,
+                "shift" => MOD_SHIFT,
+                "win" | "windows" => MOD_WIN,
+                _ => return Err(format!("\"{}\" isn't a modifier key", p)),
+            };
+        }
+        let vk = key_vk(key).ok_or_else(|| format!("\"{}\" isn't a key a shortcut can use", key))?;
+        let fkey = (0x70..=0x87).contains(&vk);
+        if m & (MOD_CONTROL | MOD_ALT | MOD_WIN) == 0 && !fkey {
+            return Err(format!("\"{}\" needs Ctrl, Alt or Win", s.trim()));
+        }
+        Ok((m | MOD_NOREPEAT, vk))
+    }
+
+    /// Announce `version` unless it (or a newer one) was announced before.
+    pub fn should_announce(version: &str, last_announced: Option<&str>) -> bool {
+        last_announced.map_or(true, |last| crate::updater::compare_versions(version, last) == Ordering::Greater)
+    }
+
+    /// "2 hours", "40 minutes", "an hour".
+    pub fn runs_out_text(hours: f64) -> String {
+        if !hours.is_finite() || hours <= 0.0 {
+            return "a few minutes".into();
+        }
+        let min = (hours * 60.0).round() as u64;
+        if min < 2 {
+            "a minute".into()
+        } else if min < 55 {
+            format!("{} minutes", min)
+        } else if hours < 1.5 {
+            "an hour".into()
+        } else {
+            format!("{} hours", hours.round() as u64)
+        }
+    }
+
+    /// "15:42": `add_min` minutes after `h`:`m`.
+    pub fn clock_plus(h: u32, m: u32, add_min: u64) -> String {
+        let total = (h as u64 * 60 + m as u64 + add_min) % (24 * 60);
+        format!("{:02}:{:02}", total / 60, total % 60)
+    }
+
+    /// "1.9 MB"
+    pub fn size_words(bytes: u64) -> String {
+        let mb = bytes as f64 / (1024.0 * 1024.0);
+        if mb < 0.1 {
+            format!("{} KB", (bytes as f64 / 1024.0).ceil() as u64)
+        } else {
+            format!("{:.1} MB", mb)
+        }
+    }
+
+    /// Turns engine events into the catalogue's toasts. Remembers whether memory was critical,
+    /// so "Memory is fine again" only follows a critical spell.
+    #[derive(Debug, Default)]
+    pub struct ToastBrain {
+        was_critical: bool,
+    }
+
+    impl ToastBrain {
+        pub fn toast_for(&mut self, ev: &Event, st: &Status) -> Option<Toast> {
+            match ev {
+                Event::PressureChanged { to: Level::Critical, .. } => {
+                    self.was_critical = true;
+                    Some(catalog::memory_critical(st.system.ram_free_gb, st.system.commit_free_gb))
+                }
+                Event::PressureChanged { to: Level::Normal, .. } if self.was_critical => {
+                    self.was_critical = false;
+                    Some(catalog::memory_fine(st.system.ram_free_gb))
+                }
+                // Normal to tight shows nothing: the icon dot and the flyout carry it.
+                Event::PressureChanged { .. } => None,
+                Event::AutoPrimed { reason, trimmed, groups_ram_before_gb } => Some(catalog::auto_primed(reason, *trimmed, *groups_ram_before_gb)),
+                Event::EditorRestartHint { pid, committed_gb } => {
+                    let uptime = st.ue.processes.iter().find(|p| p.pid == *pid).map_or(0, |p| p.uptime_min);
+                    Some(catalog::editor_restart(*committed_gb, uptime))
+                }
+                Event::EditorGrowing { gb_per_hour, .. } => {
+                    Some(catalog::editor_growing(*gb_per_hour, &runs_out_text(st.system.commit_free_gb / gb_per_hour.max(0.01))))
+                }
+                Event::SettingsError(message) => Some(catalog::settings_problem(message)),
+                Event::SettingsReloaded => None,
+            }
+        }
+    }
+
+    /// A value from the `[tray]` table of ui-state.toml.
+    pub fn tray_value(text: &str, key: &str) -> Option<toml::Value> {
+        text.parse::<toml::Table>().ok()?.get("tray")?.as_table()?.get(key).cloned()
+    }
+
+    /// `text` with `[tray] key = value` set; other tables (window placements) are kept.
+    pub fn with_tray_value(text: &str, key: &str, value: toml::Value) -> String {
+        let mut doc: toml::Table = text.parse().unwrap_or_default();
+        let tray = doc.entry("tray").or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if !tray.is_table() {
+            *tray = toml::Value::Table(toml::Table::new());
+        }
+        tray.as_table_mut().unwrap().insert(key.to_string(), value);
+        toml::to_string(&doc).unwrap_or_default()
+    }
 }
 
-thread_local! {
-    static APP: RefCell<Option<App>> = const { RefCell::new(None) };
-}
+// ---------------------------------------------------------------- small Win32 helpers
 
 /// Tell running programs that environment variables changed (after a PATH edit).
 pub fn broadcast_environment_change() {
@@ -61,10 +308,179 @@ pub fn broadcast_environment_change() {
     }
 }
 
-/// The Ather mark at the tray's icon size, with a status dot for the pressure level.
-fn make_icon(level: Level) -> HICON {
+/// Start a program with no inherited handles, so it can't hold a caller's output pipe open.
+pub fn launch_detached(file: &Path, params: &str, hidden: bool) -> bool {
+    let (op, f, p) = (wide("open"), wide(&file.display().to_string()), wide(params));
+    let show = if hidden { 0 } else { SW_SHOWNORMAL };
+    let r = unsafe { ShellExecuteW(null_mut(), op.as_ptr(), f.as_ptr(), p.as_ptr(), null(), show) };
+    r as usize > 32
+}
+
+fn shell_open(target: &str) {
+    let (op, t) = (wide("open"), wide(target));
+    unsafe { ShellExecuteW(null_mut(), op.as_ptr(), t.as_ptr(), null(), null(), SW_SHOWNORMAL) };
+}
+
+fn open_in_notepad(path: &Path) {
+    let (op, exe, arg) = (wide("open"), wide("notepad.exe"), wide(&format!("\"{}\"", path.display())));
+    unsafe { ShellExecuteW(null_mut(), op.as_ptr(), exe.as_ptr(), arg.as_ptr(), null(), SW_SHOWNORMAL) };
+}
+
+/// Put `text` on the clipboard as Unicode text.
+fn set_clipboard(hwnd: HWND, text: &str) -> bool {
+    const CF_UNICODETEXT: u32 = 13;
+    let w: Vec<u16> = text.replace("\r\n", "\n").replace('\n', "\r\n").encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        if OpenClipboard(hwnd) == 0 {
+            return false;
+        }
+        EmptyClipboard();
+        let mem = GlobalAlloc(GMEM_MOVEABLE, w.len() * 2);
+        let mut ok = false;
+        if !mem.is_null() {
+            let p = GlobalLock(mem) as *mut u16;
+            if !p.is_null() {
+                std::ptr::copy_nonoverlapping(w.as_ptr(), p, w.len());
+                GlobalUnlock(mem);
+                ok = !SetClipboardData(CF_UNICODETEXT, mem as _).is_null();
+            }
+            if !ok {
+                GlobalFree(mem);
+            }
+        }
+        CloseClipboard();
+        ok
+    }
+}
+
+/// Local time now as (hour, minute).
+fn local_hm() -> (u32, u32) {
+    let t = win::local_time_string(); // "YYYY-MM-DD HH:MM:SS"
+    let n = |a: usize, b: usize| t.get(a..b).and_then(|s| s.parse().ok()).unwrap_or(0);
+    (n(11, 13), n(14, 16))
+}
+
+/// "15:42": the local time `d` from now.
+fn clock_after(d: Duration) -> String {
+    let (h, m) = local_hm();
+    clock_plus(h, m, d.as_secs().div_ceil(60))
+}
+
+/// ui-state.toml `[tray]` values (first run, last announced update).
+fn tray_state(key: &str) -> Option<toml::Value> {
+    tray_value(&std::fs::read_to_string(crate::ui::ui_state::file()).unwrap_or_default(), key)
+}
+
+fn set_tray_state(key: &str, value: toml::Value) {
+    let path = crate::ui::ui_state::file();
+    let text = with_tray_value(&std::fs::read_to_string(&path).unwrap_or_default(), key, value);
+    let _ = std::fs::create_dir_all(paths::data_dir());
+    let tmp = path.with_extension("toml.tmp");
+    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Send a command to the tray loop (from any UI on the tray thread).
+pub fn post_command(cmd: Command) {
+    let h = TRAY_HWND.load(Ordering::SeqCst);
+    if h != 0 {
+        unsafe { PostMessageW(h as HWND, WM_RUN_COMMAND, cmd.id() as WPARAM, 0) };
+    }
+}
+
+// ---------------------------------------------------------------- windows built by Part E2
+
+// INTEGRATION: open E2's memory history window (src/ui/history.rs) here.
+pub fn open_history_window() {
+    crate::log::write("memory history window: not wired yet");
+}
+
+// INTEGRATION: open E2's checkup window (src/ui/doctor.rs) here.
+pub fn open_doctor_window() {
+    crate::log::write("checkup window: not wired yet");
+}
+
+// INTEGRATION: call doctor::undo (Part F) here and show its toast.
+pub fn undo_doctor() {
+    crate::log::write("undo checkup: not wired yet");
+}
+
+// ---------------------------------------------------------------- worker results
+
+/// What a worker thread hands back to the tray thread.
+enum Work {
+    Primed(ops::PrimeReport),
+    Checked { manual: bool, result: CheckResult },
+    Progress(u32),
+    Downloaded(Result<PathBuf, String>),
+}
+
+fn post_work(hwnd: isize, w: Work) {
+    let p = Box::into_raw(Box::new(w));
+    if unsafe { PostMessageW(hwnd as HWND, WM_WORK, 0, p as LPARAM) } == 0 {
+        drop(unsafe { Box::from_raw(p) });
+    }
+}
+
+fn spawn_work(hwnd: HWND, f: impl FnOnce() -> Work + Send + 'static) {
+    let h = hwnd as isize;
+    std::thread::spawn(move || post_work(h, f()));
+}
+
+// ---------------------------------------------------------------- the app
+
+struct Updates {
+    /// Shared with the settings window ("Version X" row).
+    state: Rc<RefCell<UpdateState>>,
+    available: Option<Manifest>,
+    checking: bool,
+    downloading: bool,
+    next_auto: Instant,
+    toast: ToastId,
+}
+
+struct App {
+    engine: Engine,
+    hwnd: HWND,
+    icon: HICON,
+    icon_key: (Level, bool),
+    last_tick: Option<Instant>,
+    /// The latest status, shared with the settings window.
+    status: Rc<RefCell<Option<Status>>>,
+    exit_event: Option<Handle>,
+    taskbar_created: u32,
+    brain: ToastBrain,
+    /// The hotkey text last tried, and whether it is registered.
+    hotkey_keys: Option<String>,
+    hotkey_ok: bool,
+    hotkey_warned: bool,
+    updates: Updates,
+    priming: bool,
+    dblclick_at: Option<Instant>,
+}
+
+thread_local! {
+    static APP: RefCell<Option<App>> = const { RefCell::new(None) };
+}
+
+/// Runs a closure on the app state. Returns None if the state is busy (a nested message loop
+/// from a menu or dialog is running) or already gone.
+fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
+    APP.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut guard) => guard.as_mut().map(f),
+        Err(_) => None,
+    })
+}
+
+/// The Ather mark at the tray's icon size: a dot for the pressure level, faded while paused.
+fn make_icon(level: Level, paused: bool) -> HICON {
     let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16) as usize;
-    crate::logo::create_icon(size, level)
+    if paused {
+        crate::logo::create_paused_icon(size, level)
+    } else {
+        crate::logo::create_icon(size, level)
+    }
 }
 
 fn copy_to(dst: &mut [u16], text: &str) {
@@ -82,90 +498,248 @@ fn notify_data(hwnd: HWND) -> NOTIFYICONDATAW {
     nid
 }
 
-fn tooltip(st: &Status) -> String {
-    format!(
-        "Ather MemGuard{}: {}, pressure {}\nRAM free {:.1} GB, commit free {:.1} GB",
-        if st.paused { " (paused)" } else { "" },
-        st.mode,
-        st.pressure.label(),
-        st.system.ram_free_gb,
-        st.system.commit_free_gb
-    )
+/// The tray icon's rectangle on screen, for anchoring the flyout.
+fn icon_rect(hwnd: HWND) -> Option<crate::ui::geom::Rect> {
+    let mut id: NOTIFYICONIDENTIFIER = unsafe { zeroed() };
+    id.cbSize = size_of::<NOTIFYICONIDENTIFIER>() as u32;
+    id.hWnd = hwnd;
+    id.uID = 1;
+    let mut rc: RECT = unsafe { zeroed() };
+    let hr = unsafe { Shell_NotifyIconGetRect(&id, &mut rc) };
+    (hr >= 0 && rc.right > rc.left).then(|| crate::ui::geom::Rect::ltrb(rc.left, rc.top, rc.right, rc.bottom))
 }
 
 impl App {
     fn add_icon(&self) {
         let mut nid = notify_data(self.hwnd);
-        nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
         nid.uCallbackMessage = WM_TRAY;
         nid.hIcon = self.icon;
-        copy_to(&mut nid.szTip, "Ather MemGuard");
-        unsafe { Shell_NotifyIconW(NIM_ADD, &nid) };
-    }
-
-    fn update_icon(&mut self, st: &Status) {
-        let mut nid = notify_data(self.hwnd);
-        nid.uFlags = NIF_TIP;
-        copy_to(&mut nid.szTip, &tooltip(st));
-        if st.pressure != self.icon_level {
-            let old = self.icon;
-            self.icon = make_icon(st.pressure);
-            self.icon_level = st.pressure;
-            nid.uFlags |= NIF_ICON;
-            nid.hIcon = self.icon;
-            unsafe {
-                Shell_NotifyIconW(NIM_MODIFY, &nid);
-                DestroyIcon(old);
-            }
-        } else {
-            unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) };
+        copy_to(&mut nid.szTip, &self.status.borrow().as_ref().map(|_| tooltip(&self.view())).unwrap_or_else(|| "Ather MemGuard".into()));
+        unsafe {
+            Shell_NotifyIconW(NIM_ADD, &nid);
+            nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+            Shell_NotifyIconW(NIM_SETVERSION, &nid);
         }
     }
 
-    fn balloon(&self, title: &str, text: &str, warning: bool) {
+    fn view(&self) -> TrayView {
+        let st = self.status.borrow();
+        let paused = self.engine.paused;
+        TrayView {
+            mode: st.as_ref().map_or_else(|| "idle".into(), |s| s.mode.clone()),
+            pressure: st.as_ref().map(|s| s.pressure),
+            paused,
+            paused_until: self.engine.pause_until().map(|t| clock_after(t.saturating_duration_since(Instant::now()))),
+            ram_free_gb: st.as_ref().map_or(0.0, |s| s.system.ram_free_gb),
+            commit_free_gb: st.as_ref().map_or(0.0, |s| s.system.commit_free_gb),
+            hotkey: self.engine.cfg.general.prime_hotkey.trim().to_string(),
+            update_version: self.updates.available.as_ref().map(|m| m.version.clone()),
+            updating: self.updates.downloading,
+            run_at_startup: crate::install::is_run_at_startup(),
+        }
+    }
+
+    fn update_icon(&mut self) {
+        let Some((level, paused)) = self.status.borrow().as_ref().map(|s| (s.pressure, self.engine.paused)) else { return };
         let mut nid = notify_data(self.hwnd);
-        nid.uFlags = NIF_INFO;
-        nid.dwInfoFlags = if warning { NIIF_WARNING } else { NIIF_INFO };
-        copy_to(&mut nid.szInfoTitle, title);
-        copy_to(&mut nid.szInfo, text);
-        unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) };
+        nid.uFlags = NIF_TIP | NIF_SHOWTIP;
+        copy_to(&mut nid.szTip, &tooltip(&self.view()));
+        let old = (self.icon_key != (level, paused)).then(|| {
+            let old = self.icon;
+            self.icon = make_icon(level, paused);
+            self.icon_key = (level, paused);
+            nid.uFlags |= NIF_ICON;
+            nid.hIcon = self.icon;
+            old
+        });
+        unsafe {
+            Shell_NotifyIconW(NIM_MODIFY, &nid);
+            if let Some(old) = old {
+                DestroyIcon(old);
+            }
+        }
+    }
+
+    fn flyout_data(&self) -> Option<FlyoutData> {
+        let st = self.status.borrow();
+        let st = st.as_ref()?;
+        let mut st = st.clone();
+        st.paused = self.engine.paused;
+        let growth = st
+            .ue
+            .processes
+            .iter()
+            .filter(|p| p.kind == "editor")
+            .max_by(|a, b| a.committed_gb.total_cmp(&b.committed_gb))
+            .and_then(|p| self.engine.history().editor_growth_gb_per_hour(p.pid));
+        let note = self.engine.paused.then(|| match self.engine.pause_until() {
+            Some(t) => format!("Other apps are back to normal until {}.", clock_after(t.saturating_duration_since(Instant::now()))),
+            None => "Other apps are back to normal until you resume.".to_string(),
+        });
+        Some(FlyoutData::new(&st, &self.engine.cfg.pressure, growth, note))
+    }
+
+    /// Follow the settings that live outside the engine: notifications and the hotkey.
+    fn apply_settings(&mut self) {
+        toast::set_enabled(self.engine.cfg.general.notifications);
+        let keys = self.engine.cfg.general.prime_hotkey.trim().to_string();
+        if self.hotkey_keys.as_deref() == Some(keys.as_str()) {
+            return;
+        }
+        if self.hotkey_ok {
+            unsafe { UnregisterHotKey(self.hwnd, HOTKEY_ID) };
+            self.hotkey_ok = false;
+        }
+        self.hotkey_keys = Some(keys.clone());
+        if keys.is_empty() {
+            return;
+        }
+        match parse_hotkey(&keys) {
+            Ok((mods, vk)) => {
+                self.hotkey_ok = unsafe { RegisterHotKey(self.hwnd, HOTKEY_ID, mods, vk) } != 0;
+                if self.hotkey_ok {
+                    crate::log::write(&format!("shortcut {} frees memory", keys));
+                } else {
+                    crate::log::write(&format!("shortcut {} is taken by another app", keys));
+                    if !self.hotkey_warned {
+                        self.hotkey_warned = true;
+                        toast::show(catalog::hotkey_taken(&keys));
+                    }
+                }
+            }
+            Err(e) => crate::log::write(&format!("shortcut not registered: {}", e)),
+        }
     }
 
     fn tick(&mut self) {
-        let previous = self.status.as_ref().map(|s| s.pressure);
         let st = self.engine.tick();
-        self.update_icon(&st);
-        if st.pressure == Level::Critical && previous != Some(Level::Critical) {
-            self.balloon(
-                "Memory is critical",
-                &format!(
-                    "RAM free {:.1} GB, commit free {:.1} GB. Background apps are being trimmed.",
-                    st.system.ram_free_gb, st.system.commit_free_gb
-                ),
-                true,
-            );
-            crate::log::write(&format!(
-                "pressure critical: RAM free {:.1} GB, commit free {:.1} GB, mode {}",
-                st.system.ram_free_gb, st.system.commit_free_gb, st.mode
-            ));
-        } else if previous.is_some() && previous != Some(st.pressure) {
-            crate::log::write(&format!("pressure {} (mode {})", st.pressure.label(), st.mode));
-        }
-        let restart_hint = st.advice.iter().find(|a| a.contains("Restart it"));
-        match restart_hint {
-            Some(hint) if !self.hinted_restart => {
-                self.balloon("Unreal Editor is using a lot of memory", hint, false);
-                self.hinted_restart = true;
+        let events = self.engine.take_events();
+        *self.status.borrow_mut() = Some(st.clone());
+        self.update_icon();
+        for ev in &events {
+            log_event(ev, &st);
+            if matches!(ev, Event::SettingsReloaded) {
+                self.apply_settings();
             }
-            None => self.hinted_restart = false,
-            _ => {}
+            if let Some(t) = self.brain.toast_for(ev, &st) {
+                toast::show(t);
+            }
         }
-        self.status = Some(st);
-        self.last_tick = Some(Instant::now());
+        if flyout::is_open() {
+            if let Some(d) = self.flyout_data() {
+                flyout::update(d);
+            }
+        }
+        let now = Instant::now();
+        if self.engine.cfg.updates.check_automatically && now >= self.updates.next_auto && !self.updates.checking && !self.updates.downloading {
+            self.updates.next_auto = now + UPDATE_EVERY;
+            self.start_check(false);
+        }
+        self.last_tick = Some(now);
+    }
+
+    fn start_check(&mut self, manual: bool) {
+        if self.updates.checking {
+            return;
+        }
+        self.updates.checking = true;
+        if manual {
+            *self.updates.state.borrow_mut() = UpdateState::Checking;
+        }
+        spawn_work(self.hwnd, move || Work::Checked { manual, result: updater::check() });
+    }
+
+    fn start_install(&mut self) {
+        if self.updates.downloading {
+            return;
+        }
+        let Some(m) = self.updates.available.clone() else {
+            self.start_check(true);
+            return;
+        };
+        self.updates.downloading = true;
+        *self.updates.state.borrow_mut() = UpdateState::Downloading { pct: 0 };
+        // The person asked for this, so its progress shows even with notifications off.
+        self.updates.toast = toast::show_always(catalog::downloading(0));
+        crate::log::write(&format!("downloading Ather MemGuard {}", m.version));
+        let h = self.hwnd as isize;
+        spawn_work(self.hwnd, move || {
+            let last = std::cell::Cell::new(0u32);
+            let r = updater::download(&m, &|done, total| {
+                let pct = if total == 0 { 0 } else { (done.saturating_mul(100) / total).min(100) as u32 };
+                if pct != last.get() {
+                    last.set(pct);
+                    post_work(h, Work::Progress(pct));
+                }
+            });
+            Work::Downloaded(r)
+        });
+    }
+
+    fn on_work(&mut self, w: Work) {
+        match w {
+            Work::Primed(r) => {
+                self.priming = false;
+                toast::show(catalog::freed_manual(r.trimmed_processes, r.before.ram_free_gb, r.after.ram_free_gb));
+            }
+            Work::Checked { manual, result } => {
+                self.updates.checking = false;
+                match result {
+                    CheckResult::Available(m) => {
+                        crate::log::write(&format!("update available: {}", m.version));
+                        *self.updates.state.borrow_mut() = UpdateState::Available { version: m.version.clone() };
+                        let last = tray_state("last_announced_update").and_then(|v| v.as_str().map(str::to_string));
+                        if manual || should_announce(&m.version, last.as_deref()) {
+                            toast::show(catalog::update_available(&m.version, &m.notes, &size_words(m.size)));
+                            set_tray_state("last_announced_update", toml::Value::String(m.version.clone()));
+                        }
+                        self.updates.available = Some(m);
+                    }
+                    CheckResult::UpToDate => {
+                        let (h, m) = local_hm();
+                        *self.updates.state.borrow_mut() = UpdateState::UpToDate { checked: format!("today at {:02}:{:02}", h, m) };
+                        self.updates.available = None;
+                        if manual {
+                            toast::show(catalog::up_to_date(env!("CARGO_PKG_VERSION")));
+                        }
+                    }
+                    CheckResult::Failed(reason) => {
+                        crate::log::write(&format!("update check failed: {}", reason));
+                        if manual {
+                            *self.updates.state.borrow_mut() = UpdateState::Failed(reason.clone());
+                            toast::show_always(catalog::check_failed(&reason));
+                        }
+                    }
+                }
+            }
+            Work::Progress(pct) => {
+                *self.updates.state.borrow_mut() = UpdateState::Downloading { pct };
+                toast::update_body(self.updates.toast, &catalog::downloading_body(pct));
+            }
+            Work::Downloaded(r) => {
+                let installed = r.and_then(|path| updater::install_staged(&path));
+                match installed {
+                    Ok(()) => unsafe { PostQuitMessage(0) },
+                    Err(e) => {
+                        crate::log::write(&format!("update failed: {}", e));
+                        self.updates.downloading = false;
+                        let v = self.updates.available.as_ref().map(|m| m.version.clone()).unwrap_or_default();
+                        *self.updates.state.borrow_mut() = UpdateState::Available { version: v };
+                        toast::show_always(catalog::update_failed());
+                    }
+                }
+            }
+        }
     }
 
     fn shutdown(&mut self) {
-        unsafe { KillTimer(self.hwnd, TIMER_ID) };
+        unsafe {
+            KillTimer(self.hwnd, TIMER_ID);
+            if self.hotkey_ok {
+                UnregisterHotKey(self.hwnd, HOTKEY_ID);
+            }
+        }
         self.engine.restore_all();
         let nid = notify_data(self.hwnd);
         unsafe {
@@ -175,6 +749,329 @@ impl App {
         crate::log::write("Ather MemGuard stopped, apps restored to normal");
     }
 }
+
+fn log_event(ev: &Event, st: &Status) {
+    let text = match ev {
+        Event::PressureChanged { from, to } => format!(
+            "pressure {} -> {}: RAM free {:.1} GB, commit free {:.1} GB, mode {}",
+            from.label(),
+            to.label(),
+            st.system.ram_free_gb,
+            st.system.commit_free_gb,
+            st.mode
+        ),
+        Event::AutoPrimed { .. } => return, // the engine logs it
+        Event::EditorRestartHint { pid, committed_gb } => format!("editor {} has {:.1} GB committed: restart hint", pid, committed_gb),
+        Event::EditorGrowing { pid, gb_per_hour, committed_gb } => format!("editor {} grows {:.1} GB an hour ({:.1} GB committed)", pid, gb_per_hour, committed_gb),
+        Event::SettingsReloaded => "settings changed on disk, reloaded".into(),
+        Event::SettingsError(_) => return, // the engine logs it
+    };
+    crate::log::write(&text);
+}
+
+// ---------------------------------------------------------------- the dispatcher
+
+/// Carry out a command. The one place every menu item, flyout button, toast button, the prime
+/// hotkey and the settings window end up. Runs on the tray thread, never inside a borrow of
+/// the app state while a window opens.
+fn dispatch(hwnd: HWND, cmd: Command) {
+    match cmd {
+        Command::FreeMemory => {
+            with_app(|a| {
+                if a.priming {
+                    return;
+                }
+                a.priming = true;
+                let cfg = a.engine.cfg.clone();
+                spawn_work(a.hwnd, move || Work::Primed(ops::prime(&cfg, None, false)));
+            });
+        }
+        Command::Pause30 => {
+            with_app(|a| {
+                a.engine.pause_for(Duration::from_secs(30 * 60));
+                a.tick();
+                toast::show(catalog::paused_30(&clock_after(Duration::from_secs(30 * 60))));
+            });
+        }
+        Command::PauseUntilResumed => {
+            with_app(|a| {
+                a.engine.set_paused(true);
+                a.tick();
+                toast::show(catalog::paused());
+            });
+        }
+        Command::Resume => {
+            with_app(|a| {
+                a.engine.set_paused(false);
+                a.tick();
+                toast::show(catalog::resumed());
+            });
+        }
+        Command::OpenSettings => open_settings_window(),
+        Command::OpenHistory => open_history_window(),
+        Command::OpenDoctor => open_doctor_window(),
+        Command::UndoDoctor => undo_doctor(),
+        Command::CheckUpdates => {
+            with_app(|a| a.start_check(true));
+        }
+        Command::InstallUpdate => {
+            with_app(|a| a.start_install());
+        }
+        Command::ToggleStartup => {
+            let on = !crate::install::is_run_at_startup();
+            match crate::install::set_run_at_startup(on) {
+                Ok(()) => {
+                    toast::show(catalog::startup_toggled(on));
+                }
+                Err(e) => {
+                    crate::log::write(&format!("couldn't change run at startup: {}", e));
+                    toast::show_always(catalog::save_failed(&e));
+                }
+            }
+        }
+        Command::CopyAgentSetup => {
+            let fallback = std::env::current_exe().map(|e| e.with_file_name(paths::CLI_EXE)).unwrap_or_else(|_| paths::CLI_EXE.into());
+            let text = crate::mcp::agent_setup_text(&crate::mcp::agent_cli_path(fallback));
+            if set_clipboard(hwnd, &text) {
+                toast::show(catalog::setup_copied());
+            } else {
+                toast::show_always(catalog::save_failed("The clipboard is busy. Try again."));
+            }
+        }
+        Command::Quit => unsafe { PostQuitMessage(0) },
+        Command::OpenReleasesPage => shell_open(RELEASES_URL),
+        Command::OpenSettingsFile => open_in_notepad(&paths::config_file()),
+    }
+}
+
+fn open_settings_window() {
+    let Some((status, update)) = with_app(|a| (a.status.clone(), a.updates.state.clone())) else { return };
+    flyout::close();
+    crate::ui::settings::open_settings(SettingsHost {
+        store: Box::new(crate::ui::real_store::RealStore::new()),
+        status: Box::new(move || status.borrow().clone()),
+        commands: Box::new(post_command),
+        app_version: env!("CARGO_PKG_VERSION").into(),
+        update_state: Box::new(move || update.borrow().clone()),
+    });
+}
+
+fn show_menu(hwnd: HWND) {
+    let Some(entries) = with_app(|a| menu(&a.view())) else { return };
+    flyout::close();
+    let id = unsafe {
+        let m = CreatePopupMenu();
+        for e in &entries {
+            match e {
+                MenuEntry::Status(text) => {
+                    let w = wide(text);
+                    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, w.as_ptr());
+                }
+                MenuEntry::Separator => {
+                    AppendMenuW(m, MF_SEPARATOR, 0, null());
+                }
+                MenuEntry::Item { label, accel, cmd, checked, disabled } => {
+                    let text = if accel.is_empty() { label.clone() } else { format!("{}\t{}", label, accel) };
+                    let w = wide(&text);
+                    let flags = MF_STRING | if *checked { MF_CHECKED } else { 0 } | if *disabled { MF_GRAYED } else { 0 };
+                    AppendMenuW(m, flags, cmd.id() as usize, w.as_ptr());
+                }
+            }
+        }
+        let mut pt: POINT = zeroed();
+        GetCursorPos(&mut pt);
+        SetForegroundWindow(hwnd);
+        let id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, null());
+        PostMessageW(hwnd, WM_NULL, 0, 0);
+        DestroyMenu(m);
+        id as u32
+    };
+    if let Some(cmd) = Command::from_id(id) {
+        dispatch(hwnd, cmd);
+    }
+}
+
+/// Left click (or Enter on the icon): open the flyout, or close it when it is open.
+fn on_select(hwnd: HWND, keyboard: bool) {
+    let dbl = Duration::from_millis(unsafe { GetDoubleClickTime() } as u64);
+    let recent_dblclick = with_app(|a| a.dblclick_at.is_some_and(|t| t.elapsed() < dbl)).unwrap_or(false);
+    if recent_dblclick {
+        return;
+    }
+    if flyout::is_open() {
+        if !keyboard {
+            flyout::close();
+        }
+        return;
+    }
+    // A click on the icon while the flyout was open closed it by taking focus: don't reopen.
+    if !keyboard && flyout::closed_within(300) {
+        return;
+    }
+    if let Some(d) = with_app(|a| a.flyout_data()).flatten() {
+        flyout::show(d, icon_rect(hwnd), Box::new(post_command));
+    }
+}
+
+unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_TIMER => {
+            let quit = with_app(|a| {
+                if a.exit_event.as_ref().is_some_and(win::event_is_set) {
+                    return true;
+                }
+                let due = a.last_tick.map_or(true, |t| t.elapsed().as_secs() >= a.engine.cfg.interval_sec);
+                if due {
+                    a.tick();
+                }
+                false
+            });
+            if quit == Some(true) {
+                crate::log::write("asked to stop");
+                PostQuitMessage(0);
+            }
+            0
+        }
+        WM_TRAY => {
+            match (lparam & 0xFFFF) as u32 {
+                NIN_SELECT => on_select(hwnd, false),
+                NIN_KEYSELECT => on_select(hwnd, true),
+                WM_CONTEXTMENU => show_menu(hwnd),
+                WM_LBUTTONDBLCLK => {
+                    with_app(|a| a.dblclick_at = Some(Instant::now()));
+                    flyout::close();
+                    dispatch(hwnd, Command::OpenSettings);
+                }
+                _ => {}
+            }
+            0
+        }
+        WM_RUN_COMMAND => {
+            if let Some(cmd) = Command::from_id(wparam as u32) {
+                dispatch(hwnd, cmd);
+            }
+            0
+        }
+        WM_WORK => {
+            let w = *Box::from_raw(lparam as *mut Work);
+            // A modal loop may hold the app state; try again shortly rather than drop it.
+            let mut slot = Some(w);
+            with_app(|a| a.on_work(slot.take().unwrap()));
+            if let Some(w) = slot {
+                post_work(hwnd as isize, w);
+            }
+            0
+        }
+        WM_HOTKEY => {
+            if wparam as i32 == HOTKEY_ID {
+                dispatch(hwnd, Command::FreeMemory);
+            }
+            0
+        }
+        WM_DESTROY => {
+            PostQuitMessage(0);
+            0
+        }
+        _ => {
+            // Explorer restarted: put the icon back.
+            if with_app(|a| a.taskbar_created == msg && msg != 0) == Some(true) {
+                with_app(|a| a.add_icon());
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+    }
+}
+
+/// Run the tray app until Quit or `memguard stop`. Returns at once if a copy is already running.
+pub fn run() {
+    run_with(false);
+}
+
+/// Like `run`, started by the updater: says "Updated to Ather MemGuard {v}" once it is up.
+pub fn run_after_update() {
+    run_with(true);
+}
+
+fn run_with(after_update: bool) {
+    let Some(_instance) = win::acquire_instance(paths::mutex(), 8000) else { return };
+    let exit_event = win::create_event(paths::exit_event());
+
+    unsafe {
+        let class = wide("AtherMemGuardTrayWindow");
+        let hinstance = GetModuleHandleW(null());
+        let mut wc: WNDCLASSW = zeroed();
+        wc.lpfnWndProc = Some(wnd_proc);
+        wc.hInstance = hinstance;
+        wc.lpszClassName = class.as_ptr();
+        RegisterClassW(&wc);
+        let title = wide("Ather MemGuard");
+        let hwnd = CreateWindowExW(0, class.as_ptr(), title.as_ptr(), 0, 0, 0, 0, 0, null_mut(), null_mut(), hinstance, null());
+        if hwnd.is_null() {
+            crate::log::write("could not create the tray window");
+            return;
+        }
+        TRAY_HWND.store(hwnd as isize, Ordering::SeqCst);
+        crate::ui::window::allow_dark_menus();
+
+        let created = wide("TaskbarCreated");
+        let app = App {
+            engine: Engine::new(),
+            hwnd,
+            icon: make_icon(Level::Normal, false),
+            icon_key: (Level::Normal, false),
+            last_tick: None,
+            status: Rc::new(RefCell::new(None)),
+            exit_event,
+            taskbar_created: RegisterWindowMessageW(created.as_ptr()),
+            brain: ToastBrain::default(),
+            hotkey_keys: None,
+            hotkey_ok: false,
+            hotkey_warned: false,
+            updates: Updates {
+                state: Rc::new(RefCell::new(UpdateState::Unknown)),
+                available: None,
+                checking: false,
+                downloading: false,
+                next_auto: Instant::now() + FIRST_UPDATE_CHECK,
+                toast: ToastId(0),
+            },
+            priming: false,
+            dblclick_at: None,
+        };
+        app.add_icon();
+        crate::log::write(&format!("Ather MemGuard {} started", env!("CARGO_PKG_VERSION")));
+        APP.with(|cell| *cell.borrow_mut() = Some(app));
+        toast::set_command_handler(Box::new(post_command));
+        with_app(|a| {
+            a.apply_settings();
+            a.tick();
+            // The settings problem at start (if any) came before the first tick: show it.
+            let first_run = tray_state("first_run_done").and_then(|v| v.as_bool()) != Some(true);
+            if after_update {
+                toast::show(catalog::updated(env!("CARGO_PKG_VERSION")));
+            } else if first_run {
+                toast::show(catalog::first_run(a.engine.cfg.general.prime_hotkey.trim()));
+            }
+            if first_run {
+                set_tray_state("first_run_done", toml::Value::Boolean(true));
+            }
+        });
+        SetTimer(hwnd, TIMER_ID, 1000, None);
+
+        let mut msg: MSG = zeroed();
+        while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        flyout::close();
+        toast::dismiss_all();
+        with_app(|a| a.shutdown());
+        APP.with(|cell| *cell.borrow_mut() = None);
+        TRAY_HWND.store(0, Ordering::SeqCst);
+    }
+}
+
+// ---------------------------------------------------------------- CLI helpers
 
 pub fn status_text(st: &Status) -> String {
     let mut s = format!(
@@ -230,211 +1127,6 @@ pub fn status_text(st: &Status) -> String {
     s
 }
 
-fn message_box(hwnd: HWND, text: &str) {
-    let (t, c) = (wide(text), wide("Ather MemGuard"));
-    unsafe { MessageBoxW(hwnd, t.as_ptr(), c.as_ptr(), MB_OK | MB_ICONINFORMATION) };
-}
-
-fn open_in_notepad(path: &std::path::Path) {
-    let (op, exe, arg) = (wide("open"), wide("notepad.exe"), wide(&format!("\"{}\"", path.display())));
-    unsafe { ShellExecuteW(null_mut(), op.as_ptr(), exe.as_ptr(), arg.as_ptr(), null(), SW_SHOWNORMAL) };
-}
-
-/// Start a program with no inherited handles, so it can't hold a caller's output pipe open.
-pub fn launch_detached(file: &std::path::Path, params: &str, hidden: bool) -> bool {
-    let (op, f, p) = (wide("open"), wide(&file.display().to_string()), wide(params));
-    let show = if hidden { 0 } else { SW_SHOWNORMAL };
-    let r = unsafe { ShellExecuteW(null_mut(), op.as_ptr(), f.as_ptr(), p.as_ptr(), null(), show) };
-    r as usize > 32
-}
-
-fn open_folder(path: &std::path::Path) {
-    let (op, dir) = (wide("open"), wide(&path.display().to_string()));
-    unsafe { ShellExecuteW(null_mut(), op.as_ptr(), dir.as_ptr(), null(), null(), SW_SHOWNORMAL) };
-}
-
-/// Runs a closure on the app state. Returns None if the state is busy (a nested
-/// message loop from a menu or dialog is running) or already gone.
-fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
-    APP.with(|cell| match cell.try_borrow_mut() {
-        Ok(mut guard) => guard.as_mut().map(f),
-        Err(_) => None,
-    })
-}
-
-fn show_menu(hwnd: HWND) {
-    let paused = with_app(|a| a.engine.paused).unwrap_or(false);
-    let cmd = unsafe {
-        let menu = CreatePopupMenu();
-        let add = |id: usize, text: &str| {
-            let w = wide(text);
-            AppendMenuW(menu, MF_STRING, id, w.as_ptr());
-        };
-        add(CMD_STATUS, "Status");
-        add(CMD_PRIME, "Prime now (free RAM for Unreal)");
-        add(CMD_PAUSE, if paused { "Resume" } else { "Pause" });
-        AppendMenuW(menu, MF_SEPARATOR, 0, null());
-        add(CMD_SETTINGS, "Settings");
-        add(CMD_LOG, "Open log");
-        add(CMD_FOLDER, "Open data folder");
-        let startup = wide("Run at Windows startup");
-        AppendMenuW(menu, MF_STRING | if crate::install::is_run_at_startup() { MF_CHECKED } else { 0 }, CMD_STARTUP, startup.as_ptr());
-        AppendMenuW(menu, MF_SEPARATOR, 0, null());
-        add(CMD_EXIT, "Quit Ather MemGuard");
-        let mut pt: POINT = zeroed();
-        GetCursorPos(&mut pt);
-        SetForegroundWindow(hwnd);
-        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, null());
-        DestroyMenu(menu);
-        cmd as usize
-    };
-    run_command(hwnd, cmd);
-}
-
-fn run_command(hwnd: HWND, cmd: usize) {
-    match cmd {
-        CMD_STATUS => {
-            // Take the text out first: the dialog runs its own message loop.
-            let text = with_app(|a| {
-                a.tick();
-                a.status.as_ref().map(status_text)
-            })
-            .flatten();
-            if let Some(text) = text {
-                message_box(hwnd, &text);
-            }
-        }
-        CMD_PRIME => {
-            let cfg = with_app(|a| a.engine.cfg.clone());
-            if let Some(cfg) = cfg {
-                let report = ops::prime(&cfg, None, false);
-                with_app(|a| {
-                    a.balloon(
-                        "Primed for Unreal",
-                        &format!(
-                            "Trimmed {} processes. RAM free {:.1} GB -> {:.1} GB.",
-                            report.trimmed_processes, report.before.ram_free_gb, report.after.ram_free_gb
-                        ),
-                        false,
-                    );
-                    a.tick();
-                });
-            }
-        }
-        CMD_PAUSE => {
-            with_app(|a| {
-                let paused = !a.engine.paused;
-                a.engine.set_paused(paused);
-                a.tick();
-            });
-        }
-        CMD_SETTINGS => open_in_notepad(&paths::config_file()),
-        CMD_LOG => open_in_notepad(&paths::log_file()),
-        CMD_FOLDER => open_folder(&paths::data_dir()),
-        CMD_STARTUP => {
-            let on = !crate::install::is_run_at_startup();
-            let ok = crate::install::set_run_at_startup(on).is_ok();
-            with_app(|a| {
-                if ok {
-                    a.balloon(if on { "Run at startup: On" } else { "Run at startup: Off" }, "Ather MemGuard", false);
-                } else {
-                    a.balloon("Couldn't change run at startup", "Ather MemGuard", true);
-                }
-            });
-        }
-        CMD_EXIT => unsafe { PostQuitMessage(0) },
-        _ => {}
-    }
-}
-
-unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    match msg {
-        WM_TIMER => {
-            let quit = with_app(|a| {
-                if a.exit_event.as_ref().is_some_and(win::event_is_set) {
-                    return true;
-                }
-                let due = a.last_tick.map_or(true, |t| t.elapsed().as_secs() >= a.engine.cfg.interval_sec);
-                if due {
-                    a.tick();
-                }
-                false
-            });
-            if quit == Some(true) {
-                PostQuitMessage(0);
-            }
-            0
-        }
-        WM_TRAY => {
-            match lparam as u32 {
-                WM_RBUTTONUP => show_menu(hwnd),
-                WM_LBUTTONDBLCLK => run_command(hwnd, CMD_STATUS),
-                _ => {}
-            }
-            0
-        }
-        WM_DESTROY => {
-            PostQuitMessage(0);
-            0
-        }
-        _ => {
-            // Explorer restarted: put the icon back.
-            if with_app(|a| a.taskbar_created == msg && msg != 0) == Some(true) {
-                with_app(|a| a.add_icon());
-            }
-            DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
-    }
-}
-
-/// Run the tray app until Exit or `memguard stop`. Returns at once if a copy is already running.
-pub fn run() {
-    let Some(_instance) = win::acquire_instance(paths::mutex(), 8000) else { return };
-    let exit_event = win::create_event(paths::exit_event());
-
-    unsafe {
-        let class = wide("AtherMemGuardTrayWindow");
-        let hinstance = GetModuleHandleW(null());
-        let mut wc: WNDCLASSW = zeroed();
-        wc.lpfnWndProc = Some(wnd_proc);
-        wc.hInstance = hinstance;
-        wc.lpszClassName = class.as_ptr();
-        RegisterClassW(&wc);
-        let title = wide("Ather MemGuard");
-        let hwnd = CreateWindowExW(0, class.as_ptr(), title.as_ptr(), 0, 0, 0, 0, 0, null_mut(), null_mut(), hinstance, null());
-        if hwnd.is_null() {
-            crate::log::write("could not create the tray window");
-            return;
-        }
-
-        let created = wide("TaskbarCreated");
-        let app = App {
-            engine: Engine::new(),
-            hwnd,
-            icon: make_icon(Level::Normal),
-            icon_level: Level::Normal,
-            last_tick: None,
-            status: None,
-            exit_event,
-            taskbar_created: RegisterWindowMessageW(created.as_ptr()),
-            hinted_restart: false,
-        };
-        app.add_icon();
-        crate::log::write(&format!("Ather MemGuard {} started", env!("CARGO_PKG_VERSION")));
-        APP.with(|cell| *cell.borrow_mut() = Some(app));
-        with_app(|a| a.tick());
-        SetTimer(hwnd, TIMER_ID, 1000, None);
-
-        let mut msg: MSG = zeroed();
-        while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-        with_app(|a| a.shutdown());
-        APP.with(|cell| *cell.borrow_mut() = None);
-    }
-}
-
 /// Headless loop for `memguard daemon`: same engine, no tray icon, logs to the console.
 pub fn run_headless() {
     let Some(_instance) = win::acquire_instance(paths::mutex(), 8000) else {
@@ -462,5 +1154,211 @@ pub fn run_headless() {
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
+    }
+}
+
+// ---------------------------------------------------------------- tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::status_source::sample_status;
+    use crate::ui::toast::ToastKind;
+
+    fn view() -> TrayView {
+        TrayView {
+            mode: "editor+build".into(),
+            pressure: Some(Level::Normal),
+            paused: false,
+            paused_until: None,
+            ram_free_gb: 45.1,
+            commit_free_gb: 27.64,
+            hotkey: "Ctrl+Alt+M".into(),
+            update_version: None,
+            updating: false,
+            run_at_startup: true,
+        }
+    }
+
+    fn labels(m: &[MenuEntry]) -> Vec<String> {
+        m.iter()
+            .map(|e| match e {
+                MenuEntry::Status(s) => format!("[{}]", s),
+                MenuEntry::Separator => "-".into(),
+                MenuEntry::Item { label, accel, checked, disabled, .. } => {
+                    let mut s = label.clone();
+                    if !accel.is_empty() {
+                        s += &format!(" <{}>", accel);
+                    }
+                    if *checked {
+                        s = format!("✓ {}", s);
+                    }
+                    if *disabled {
+                        s += " (off)";
+                    }
+                    s
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tooltip_for_each_state() {
+        let mut v = view();
+        assert_eq!(tooltip(&v), "Ather MemGuard\nEditor + build · memory is fine\nRAM free 45.1 GB · commit free 27.6 GB");
+        v.pressure = Some(Level::Elevated);
+        v.mode = "idle".into();
+        assert_eq!(tooltip(&v), "Ather MemGuard\nIdle · memory is tight\nRAM free 45.1 GB · commit free 27.6 GB");
+        v.pressure = Some(Level::Critical);
+        assert!(tooltip(&v).contains("Idle · memory is critical"));
+        v.paused = true;
+        v.paused_until = Some("15:42".into());
+        assert_eq!(tooltip(&v), "Ather MemGuard\nPaused until 15:42\nRAM free 45.1 GB · commit free 27.6 GB");
+        v.paused_until = None;
+        assert!(tooltip(&v).contains("\nPaused until you resume\n"));
+        v.mode = "editor+build+cook".repeat(20);
+        v.paused = false;
+        assert!(tooltip(&v).chars().count() <= 127);
+    }
+
+    #[test]
+    fn menu_for_each_state() {
+        let v = view();
+        assert_eq!(
+            labels(&menu(&v)),
+            [
+                "[Editor + build · memory is fine]",
+                "-",
+                "Free memory now <Ctrl+Alt+M>",
+                "Pause for 30 minutes",
+                "Pause until I resume",
+                "-",
+                "Settings",
+                "Memory history",
+                "Run a checkup",
+                "-",
+                "Check for updates…",
+                "✓ Run at Windows startup",
+                "Quit Ather MemGuard",
+            ]
+        );
+        let mut p = view();
+        p.paused = true;
+        p.hotkey.clear();
+        p.run_at_startup = false;
+        p.update_version = Some("0.2.1".into());
+        p.pressure = Some(Level::Critical);
+        let l = labels(&menu(&p));
+        assert_eq!(l[0], "[Editor + build · memory is critical]");
+        assert_eq!(&l[2..5], ["Free memory now", "Resume", "-"]);
+        assert!(l.contains(&"Update to version 0.2.1…".to_string()));
+        assert!(l.contains(&"Run at Windows startup".to_string()));
+        p.updating = true;
+        assert!(labels(&menu(&p)).contains(&"Updating to version 0.2.1… (off)".to_string()));
+
+        // Every item carries the command its label promises.
+        let cmds: Vec<Command> = menu(&view()).iter().filter_map(|e| if let MenuEntry::Item { cmd, .. } = e { Some(*cmd) } else { None }).collect();
+        assert_eq!(
+            cmds,
+            [
+                Command::FreeMemory,
+                Command::Pause30,
+                Command::PauseUntilResumed,
+                Command::OpenSettings,
+                Command::OpenHistory,
+                Command::OpenDoctor,
+                Command::CheckUpdates,
+                Command::ToggleStartup,
+                Command::Quit
+            ]
+        );
+        let paused: Vec<Command> = menu(&p).iter().filter_map(|e| if let MenuEntry::Item { cmd, .. } = e { Some(*cmd) } else { None }).collect();
+        assert!(paused.contains(&Command::Resume) && !paused.contains(&Command::Pause30) && paused.contains(&Command::InstallUpdate));
+    }
+
+    #[test]
+    fn hotkey_strings() {
+        assert_eq!(parse_hotkey("Ctrl+Alt+M"), Ok((MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'M' as u32)));
+        assert_eq!(parse_hotkey(" ctrl + shift + f9 "), Ok((MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 0x78)));
+        assert_eq!(parse_hotkey("F12"), Ok((MOD_NOREPEAT, 0x7B)));
+        assert_eq!(parse_hotkey("Win+1"), Ok((MOD_WIN | MOD_NOREPEAT, '1' as u32)));
+        assert_eq!(parse_hotkey("Alt+PageDown"), Ok((MOD_ALT | MOD_NOREPEAT, 0x22)));
+        assert_eq!(parse_hotkey("Ctrl+Alt+m").unwrap().1, 'M' as u32);
+        for bad in ["", "M", "Shift+M", "Ctrl+Hyper+M", "Ctrl+Alt+Foo", "Ctrl+", "F25"] {
+            assert!(parse_hotkey(bad).is_err(), "{:?}", bad);
+        }
+        // Everything the settings window can record parses back.
+        use crate::ui::settings::hotkey_text;
+        use crate::ui::window::Mods;
+        let ctrl_alt = Mods { ctrl: true, alt: true, shift: false };
+        for vk in (0x30u16..=0x39).chain(0x41..=0x5A).chain(0x70..=0x87).chain([0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x13]) {
+            let text = hotkey_text(ctrl_alt, false, vk).unwrap();
+            assert_eq!(parse_hotkey(&text), Ok((MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, vk as u32)), "{}", text);
+        }
+        assert_eq!(parse_hotkey(&hotkey_text(Mods { shift: true, ..Default::default() }, true, 0x31).unwrap()), Ok((MOD_SHIFT | MOD_WIN | MOD_NOREPEAT, 0x31)));
+    }
+
+    #[test]
+    fn updates_are_announced_once() {
+        assert!(should_announce("0.2.1", None));
+        assert!(!should_announce("0.2.1", Some("0.2.1")));
+        assert!(!should_announce("0.2.1", Some("0.2.1.0")));
+        assert!(!should_announce("0.2.0", Some("0.2.1")), "an older one is never announced again");
+        assert!(should_announce("0.2.2", Some("0.2.1")));
+        assert!(should_announce("0.10.0", Some("0.9.9")));
+
+        // The remembered version lives in ui-state.toml's [tray] table next to window placements.
+        let text = crate::ui::ui_state::with_rect("", "settings", crate::ui::geom::Rect::new(1, 2, 900, 760));
+        let text = with_tray_value(&text, "last_announced_update", toml::Value::String("0.2.1".into()));
+        let text = with_tray_value(&text, "first_run_done", toml::Value::Boolean(true));
+        assert_eq!(tray_value(&text, "last_announced_update").and_then(|v| v.as_str().map(str::to_string)).as_deref(), Some("0.2.1"));
+        assert_eq!(tray_value(&text, "first_run_done").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(crate::ui::ui_state::parse(&text, "settings"), Some(crate::ui::geom::Rect::new(1, 2, 900, 760)));
+        let text = with_tray_value(&text, "last_announced_update", toml::Value::String("0.2.2".into()));
+        assert_eq!(tray_value(&text, "last_announced_update").unwrap().as_str(), Some("0.2.2"));
+        assert_eq!(tray_value("broken [", "x"), None);
+        assert_eq!(tray_value(&with_tray_value("tray = 3", "k", toml::Value::Integer(1)), "k"), Some(toml::Value::Integer(1)));
+    }
+
+    #[test]
+    fn events_become_catalogue_toasts() {
+        let st = sample_status();
+        let mut b = ToastBrain::default();
+        let ch = |from, to| Event::PressureChanged { from, to };
+        assert_eq!(b.toast_for(&ch(Level::Normal, Level::Elevated), &st), None, "tight shows no toast");
+        assert_eq!(b.toast_for(&ch(Level::Elevated, Level::Normal), &st), None, "no 'fine again' without a critical spell");
+        let crit = b.toast_for(&ch(Level::Elevated, Level::Critical), &st).unwrap();
+        assert_eq!((crit.kind, crit.title.as_str()), (ToastKind::Error, "Memory is critical"));
+        assert_eq!(crit.actions, vec![("Free memory".to_string(), Command::FreeMemory)]);
+        assert_eq!(b.toast_for(&ch(Level::Critical, Level::Elevated), &st), None);
+        let fine = b.toast_for(&ch(Level::Elevated, Level::Normal), &st).unwrap();
+        assert_eq!((fine.title.as_str(), fine.body.as_str()), ("Memory is fine again", "45.1 GB RAM free."));
+        assert_eq!(b.toast_for(&ch(Level::Elevated, Level::Normal), &st), None, "only once");
+
+        let t = b.toast_for(&Event::AutoPrimed { reason: "cook", trimmed: 131, groups_ram_before_gb: 9.8 }, &st).unwrap();
+        assert_eq!((t.title.as_str(), t.body.as_str()), ("Freed memory for the cook", "Held back 131 background processes using 9.8 GB."));
+        let t = b.toast_for(&Event::EditorRestartHint { pid: 21640, committed_gb: 52.0 }, &st).unwrap();
+        assert_eq!((t.kind, t.title.as_str()), (ToastKind::Warning, "Unreal Editor is at 52 GB"));
+        assert!(t.body.starts_with("It has been open 0 h 30 min."));
+        // 27.6 GB commit free at 8 GB an hour: about 3 hours.
+        let t = b.toast_for(&Event::EditorGrowing { pid: 21640, gb_per_hour: 8.0, committed_gb: 43.8 }, &st).unwrap();
+        assert_eq!(t.body, "At this rate memory runs out in about 3 hours.");
+        assert_eq!(t.actions[0].1, Command::OpenHistory);
+        let t = b.toast_for(&Event::SettingsError("settings.toml: bad key".into()), &st).unwrap();
+        assert_eq!((t.kind, t.actions[0].1), (ToastKind::Error, Command::OpenSettingsFile));
+        assert_eq!(b.toast_for(&Event::SettingsReloaded, &st), None);
+    }
+
+    #[test]
+    fn small_words() {
+        assert_eq!(runs_out_text(2.2), "2 hours");
+        assert_eq!(runs_out_text(0.66), "40 minutes");
+        assert_eq!(runs_out_text(1.1), "an hour");
+        assert_eq!(runs_out_text(0.01), "a minute");
+        assert_eq!(runs_out_text(f64::INFINITY), "a few minutes");
+        assert_eq!(clock_plus(15, 12, 30), "15:42");
+        assert_eq!(clock_plus(23, 50, 30), "00:20");
+        assert_eq!(size_words(1_992_294), "1.9 MB");
+        assert_eq!(size_words(2_000), "2 KB");
     }
 }
