@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ather MemGuard UI</title>
+<style>
+  :root {
+    --bg: #0E0E0D; --surface: #1A1B19; --raised: #252623; --selected: #2A2D21; --border: #32342E;
+    --text: #F2EFE8; --dim: #D0CEC7; --muted: #96968E; --accent: #D4FF00; --accent-soft: #E2FF6E;
+    --on-accent: #0E0E0D; --logo-gray: #C9CCCD; --warn: #FFB830; --error: #FF786E;
+    --body: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+    --display: "Bahnschrift SemiCondensed", "Bahnschrift", "Arial Narrow", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #060606; color: var(--text); font: 14px/1.45 var(--body); padding: 32px 16px 80px; }
+  .page { max-width: 1120px; margin: 0 auto; }
+  h1.doc { font: 600 13px var(--display); letter-spacing: .22em; text-transform: uppercase; color: var(--accent); margin: 0 0 6px; }
+  p.doc { color: var(--muted); margin: 0 0 28px; max-width: 70ch; }
+  h2.surface { font: 600 12px var(--display); letter-spacing: .2em; text-transform: uppercase; color: var(--muted); margin: 56px 0 14px; display: flex; gap: 12px; align-items: baseline; }
+  h2.surface span { color: var(--text); letter-spacing: .04em; font: 13px var(--body); text-transform: none; }
+  .win { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; box-shadow: 0 24px 60px rgba(0,0,0,.6); }
+  .titlebar { height: 32px; display: flex; align-items: center; gap: 8px; padding: 0 12px; font-size: 12px; color: var(--dim); }
+  .titlebar .ctl { margin-left: auto; letter-spacing: 14px; color: var(--muted); }
+  .eyebrow { font: 600 11px var(--display); letter-spacing: .28em; text-transform: uppercase; color: var(--muted); }
+  .headline { font: 600 44px/1 var(--display); font-stretch: condensed; text-transform: uppercase; letter-spacing: .01em; margin: 6px 0 0; }
+  .logo { border-radius: 22%; background: var(--bg); border: 1px solid #2C2E28; display: grid; place-items: center; flex: none; }
+  .logo svg { width: 72%; height: 72%; }
+
+  /* settings */
+  .search { height: 60px; background: var(--surface); display: flex; align-items: center; gap: 12px; padding: 0 24px; color: var(--muted); border-bottom: 1px solid var(--border); }
+  .search .caret { width: 2px; height: 20px; background: var(--accent); }
+  .settings-body { padding: 28px 32px 8px; max-height: 1500px; }
+  .hero { display: flex; gap: 18px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+  .now { margin-left: auto; display: grid; grid-template-columns: repeat(4, auto); gap: 6px 22px; text-align: right; }
+  .now b { display: block; font: 600 20px var(--display); letter-spacing: .02em; }
+  .now small { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .12em; font-family: var(--display); }
+  .sec { font: 600 12px var(--display); letter-spacing: .26em; text-transform: uppercase; color: var(--accent); padding: 26px 0 8px; border-bottom: 1px solid var(--border); }
+  .row { min-height: 66px; display: flex; align-items: center; gap: 16px; border-bottom: 1px solid #23241f; padding: 8px 0; }
+  .row .lbl { flex: 1; min-width: 0; }
+  .row .lbl b { font-weight: 600; display: block; }
+  .row .lbl small { color: var(--muted); font-size: 12px; }
+  .row .ctl { width: 280px; display: flex; justify-content: flex-end; align-items: center; gap: 10px; flex: none; }
+  .tag { font: 600 10px var(--display); letter-spacing: .16em; padding: 2px 6px; border: 1px solid var(--border); border-radius: 3px; color: var(--muted); margin-left: 8px; vertical-align: 1px; }
+  .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); margin-left: 8px; vertical-align: 2px; }
+  .toggle { width: 44px; height: 24px; border-radius: 12px; background: var(--raised); border: 1px solid var(--border); position: relative; flex: none; }
+  .toggle::after { content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: var(--muted); }
+  .toggle.on { background: var(--accent); border-color: var(--accent); }
+  .toggle.on::after { left: 23px; background: var(--on-accent); }
+  .seg { display: flex; background: var(--raised); border: 1px solid var(--border); border-radius: 6px; padding: 3px; width: 100%; }
+  .seg span { flex: 1; text-align: center; padding: 6px 0; border-radius: 4px; color: var(--muted); font-weight: 600; font-size: 13px; }
+  .seg .sel { background: var(--accent); color: var(--on-accent); }
+  .pill { background: var(--raised); border: 1px solid var(--border); border-radius: 6px; padding: 7px 12px; min-width: 120px; display: flex; justify-content: space-between; gap: 10px; }
+  .pill i { color: var(--muted); font-style: normal; }
+  .num { background: var(--raised); border: 1px solid var(--border); border-radius: 6px; padding: 7px 12px; width: 96px; text-align: right; }
+  .unit { color: var(--muted); font-size: 12px; width: 62px; }
+  .btn { border: 1px solid var(--border); background: var(--raised); color: var(--text); border-radius: 6px; padding: 8px 16px; font-weight: 600; font-size: 13px; }
+  .btn.primary { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+  .slider { flex: 1; height: 24px; position: relative; }
+  .slider::before { content: ""; position: absolute; left: 0; right: 0; top: 10px; height: 4px; border-radius: 2px; background: var(--raised); }
+  .slider i { position: absolute; left: 0; top: 10px; height: 4px; border-radius: 2px; background: var(--accent); }
+  .slider u { position: absolute; top: 4px; width: 16px; height: 16px; border-radius: 50%; background: var(--text); margin-left: -8px; }
+  .read { width: 92px; text-align: right; font-variant-numeric: tabular-nums; }
+  .read small { display: block; color: var(--muted); font-size: 11px; }
+
+  .group { border: 1px solid var(--border); border-radius: 8px; background: var(--surface); margin: 12px 0; }
+  .ghead { display: flex; align-items: center; gap: 14px; padding: 14px 16px; }
+  .ghead .chev { color: var(--muted); width: 14px; }
+  .ghead b { font-size: 15px; }
+  .ghead small { color: var(--muted); }
+  .usage { flex: 1; min-width: 120px; height: 8px; border-radius: 4px; background: var(--raised); position: relative; }
+  .usage i { position: absolute; inset: 0 auto 0 0; border-radius: 4px; background: var(--accent); }
+  .usage i.over { background: var(--warn); }
+  .usage u { position: absolute; top: -4px; width: 2px; height: 16px; background: var(--text); }
+  .gbody { padding: 0 16px 8px 44px; border-top: 1px solid var(--border); }
+  .gbody .row { min-height: 54px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+  .chip { background: var(--raised); border: 1px solid var(--border); border-radius: 12px; padding: 3px 10px; font-size: 12px; }
+  .chip.add { color: var(--accent); border-style: dashed; }
+  .tiers { display: grid; grid-template-columns: 170px 1fr 92px 110px; gap: 8px 14px; align-items: center; padding: 12px 0; border-bottom: 1px solid #23241f; }
+  .tiers .h { font: 600 10px var(--display); letter-spacing: .2em; color: var(--muted); text-transform: uppercase; }
+  .tiers .t { font-weight: 600; }
+  .tiers .t small { display: block; font-weight: 400; color: var(--muted); font-size: 12px; }
+  .danger { color: var(--error); }
+  .footer { display: flex; justify-content: space-between; padding: 14px 32px; background: var(--surface); border-top: 1px solid var(--border); color: var(--muted); font-size: 12px; }
+
+  /* small surfaces */
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 28px; align-items: start; }
+  .toast { background: var(--surface); border-left: 3px solid var(--accent); border-radius: 4px; padding: 14px 16px; width: 360px; max-width: 100%; box-shadow: 0 12px 30px rgba(0,0,0,.5); margin-bottom: 12px; }
+  .toast.warn { border-left-color: var(--warn); } .toast.err { border-left-color: var(--error); }
+  .toast h4 { font: 600 17px/1.1 var(--display); text-transform: uppercase; letter-spacing: .02em; margin: 0 0 4px; }
+  .toast p { margin: 0; color: var(--dim); font-size: 13px; }
+  .toast .acts { margin-top: 10px; display: flex; gap: 8px; }
+  .toast .btn { padding: 5px 12px; font-size: 12px; }
+
+  .flyout { width: 340px; max-width: 100%; }
+  .flyout .pad { padding: 18px 18px 14px; }
+  .flyout .state { font: 600 30px/1 var(--display); text-transform: uppercase; margin: 4px 0 14px; }
+  .meter { margin: 10px 0; }
+  .meter .top { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .meter .top b { color: var(--text); font-weight: 600; }
+  .bar { height: 6px; border-radius: 3px; background: var(--raised); overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--accent); }
+  .bar i.warn { background: var(--warn); }
+  .flyout .ue { border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); margin: 14px -18px; padding: 12px 18px; background: var(--surface); }
+  .flyout .ue small { color: var(--muted); display: block; }
+  .flyout .gr { display: grid; grid-template-columns: 90px 1fr 64px; gap: 8px; align-items: center; font-size: 12px; margin: 6px 0; }
+  .flyout .gr span:last-child { text-align: right; color: var(--muted); }
+  .flyout .acts { display: flex; gap: 8px; padding: 12px 18px; background: var(--surface); border-top: 1px solid var(--border); }
+  .flyout .acts .btn { flex: 1; text-align: center; padding: 8px 0; }
+
+  .menu { width: 300px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 6px; font-size: 13px; }
+  .menu div { padding: 7px 12px; border-radius: 4px; display: flex; justify-content: space-between; }
+  .menu .dis { color: var(--muted); } .menu .sep { height: 1px; padding: 0; margin: 5px 6px; background: var(--border); }
+  .menu .hot { color: var(--muted); } .menu .hi { background: var(--selected); }
+
+  .setup { width: 520px; max-width: 100%; }
+  .setup .pad { padding: 34px 40px 30px; }
+  .setup p { color: var(--dim); margin: 16px 0 22px; }
+  .setup .opt { display: flex; align-items: center; gap: 14px; padding: 12px 0; border-top: 1px solid var(--border); }
+  .setup .opt div { flex: 1; } .setup .opt small { color: var(--muted); display: block; font-size: 12px; }
+  .setup .go { margin-top: 22px; display: flex; align-items: center; gap: 18px; }
+  .setup .go .btn { padding: 12px 34px; font: 600 16px var(--display); letter-spacing: .12em; }
+  .setup .go a { color: var(--muted); font-size: 13px; text-decoration: underline; }
+
+  .hist .pad { padding: 24px 28px; }
+  .hist .top { display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
+  .ranges { margin-left: auto; display: flex; gap: 4px; background: var(--raised); border: 1px solid var(--border); border-radius: 6px; padding: 3px; }
+  .ranges span { padding: 5px 12px; border-radius: 4px; color: var(--muted); font-weight: 600; font-size: 12px; }
+  .ranges .sel { background: var(--accent); color: var(--on-accent); }
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 12px; color: var(--dim); margin: 10px 0 0; }
+  .legend i { display: inline-block; width: 14px; height: 3px; vertical-align: 3px; margin-right: 6px; }
+  .spark { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-top: 18px; }
+  .spark div { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; }
+  .spark b { display: block; } .spark small { color: var(--muted); font-size: 12px; }
+  svg text { font-family: var(--body); }
+  .note { color: var(--muted); font-size: 12.5px; max-width: 76ch; margin: 12px 0 0; }
+</style>
+</head>
+<body>
+<div class="page">
+  <h1 class="doc">Ather MemGuard · UI design</h1>
+  <p class="doc">Five surfaces, all custom drawn in the Ather look: warm near-black, off-white type, one lime accent. Static mockup; the written spec is in docs/UI.md.</p>
+
+  <!-- ============================================================ SETTINGS -->
+  <h2 class="surface">1 · Settings window <span>one scrolling page, search on top, changes apply as you make them</span></h2>
+  <div class="win">
+    <div class="titlebar">Ather MemGuard — Settings <span class="ctl">— ▢ ✕</span></div>
+    <div class="search"><span></span><span class="caret"></span><span>Search settings…</span></div>
+    <div class="settings-body">
+      <div class="hero">
+        <div class="logo" style="width:64px;height:64px"><svg viewBox="90 212 462 478"><polygon fill="#C9CCCD" points="90,690 270,296 360,296 540,690 460,690 313,368 165,690"/><rect fill="#D4FF00" x="307" y="483" width="13" height="127"/><text x="424" y="382" font-family="Bahnschrift, Arial Narrow" font-weight="700" font-size="230" fill="#D4FF00">5</text></svg></div>
+        <div><div class="eyebrow">Ather MemGuard</div><div class="headline">Settings</div></div>
+        <div class="now">
+          <div><b>EDITOR + BUILD</b><small>Unreal</small></div>
+          <div><b style="color:var(--accent)">NORMAL</b><small>Pressure</small></div>
+          <div><b>45.1 GB</b><small>RAM free</small></div>
+          <div><b>27.6 GB</b><small>Commit free</small></div>
+        </div>
+      </div>
+
+      <div class="sec">General</div>
+      <div class="row"><div class="lbl"><b>How hard to push other apps</b><small>Balanced keeps browsers and chat usable. Aggressive halves every limit and slows other apps while Unreal runs.</small></div>
+        <div class="ctl"><div class="seg"><span>Gentle</span><span class="sel">Balanced</span><span>Aggressive</span></div></div></div>
+      <div class="row"><div class="lbl"><b>Free memory when a build or cook starts</b><small>Trims every app group the moment UnrealBuildTool or a cook begins.</small></div><div class="ctl"><div class="toggle on"></div></div></div>
+      <div class="row"><div class="lbl"><b>Run at Windows startup</b><small>Starts in the tray when you sign in.</small></div><div class="ctl"><div class="toggle on"></div></div></div>
+      <div class="row"><div class="lbl"><b>Notifications</b><small>Memory warnings, updates and hints. Nothing else.</small></div><div class="ctl"><div class="toggle on"></div></div></div>
+      <div class="row"><div class="lbl"><b>Free memory now<span class="dot" title="changed by you"></span></b><small>Shortcut that works in any app.</small></div><div class="ctl"><div class="pill"><span>Ctrl + Alt + M</span></div></div></div>
+
+      <div class="sec">App groups</div>
+      <div class="group">
+        <div class="ghead"><span class="chev">▾</span><div style="width:150px"><b>Browsers</b><br><small>52 processes</small></div>
+          <div class="usage" title="RAM now against the soft cap"><i style="width:68%"></i><u style="left:50%"></u></div>
+          <div class="read">4.1 GB<small>cap 3.1 GB</small></div><div class="pill" style="min-width:96px"><span>Low</span><i>▾</i></div></div>
+        <div class="gbody">
+          <div class="row"><div class="lbl"><b>Apps</b><small>Matched by process name.</small></div><div class="ctl" style="width:420px"><div class="chips"><span class="chip">chrome</span><span class="chip">msedge</span><span class="chip">firefox</span><span class="chip">brave</span><span class="chip">msedgewebview2</span><span class="chip add">+ Add app…</span></div></div></div>
+          <div class="tiers">
+            <span class="h">When</span><span class="h">Soft cap (share of RAM)</span><span class="h" style="text-align:right">Limit</span><span class="h">Speed</span>
+            <span class="t">Always<small>Unreal not running</small></span><div class="slider"><i style="width:38%"></i><u style="left:38%"></u></div><div class="read">4.8%<small>6.1 GB</small></div><div class="pill" style="min-width:0"><span>Normal</span><i>▾</i></div>
+            <span class="t">Unreal is running</span><div class="slider"><i style="width:19%"></i><u style="left:19%"></u></div><div class="read">2.4%<small>3.1 GB</small></div><div class="pill" style="min-width:0"><span>Normal</span><i>▾</i></div>
+            <span class="t">Memory is tight</span><div class="slider"><i style="width:7%"></i><u style="left:7%"></u></div><div class="read">0.8%<small>1.0 GB</small></div><div class="pill" style="min-width:0"><span>Slower</span><i>▾</i></div>
+            <span class="t">Memory is critical</span><div class="slider"><i style="width:2%"></i><u style="left:2%"></u></div><div class="read">0.2%<small>256 MB</small></div><div class="pill" style="min-width:0"><span>Slower</span><i>▾</i></div>
+          </div>
+          <div class="row"><div class="lbl"><b class="danger">Freeze when memory is critical</b><small>The apps stop responding until memory recovers.</small></div><div class="ctl"><div class="toggle"></div></div></div>
+          <div class="row" style="border:0"><div class="lbl"><b class="danger">Hard cap</b><small>Apps that hit a hard cap usually crash. Browser helper processes can't be capped.</small></div><div class="ctl"><div class="num">Off</div><span class="unit">MB</span></div></div>
+        </div>
+      </div>
+      <div class="group"><div class="ghead"><span class="chev">▸</span><div style="width:150px"><b>Chat</b><br><small>34 processes</small></div><div class="usage"><i style="width:34%"></i><u style="left:60%"></u></div><div class="read">1.1 GB<small>cap 1.9 GB</small></div><div class="pill" style="min-width:96px"><span>Very low</span><i>▾</i></div></div></div>
+      <div class="group"><div class="ghead"><span class="chev">▸</span><div style="width:150px"><b>Agents<span class="tag">TEAM</span></b><br><small>26 processes</small></div><div class="usage"><i style="width:0"></i></div><div class="read">6.4 GB<small>no cap</small></div><div class="pill" style="min-width:96px"><span>Low</span><i>▾</i></div></div></div>
+      <div class="group"><div class="ghead"><span class="chev">▸</span><div style="width:150px"><b>Background</b><br><small>19 processes</small></div><div class="usage"><i class="over" style="width:100%"></i><u style="left:80%"></u></div><div class="read">0.8 GB<small>cap 0.6 GB</small></div><div class="pill" style="min-width:96px"><span>Very low</span><i>▾</i></div></div></div>
+      <div class="row"><div class="lbl"><b>Add a group</b><small>Pick apps from what's running now.</small></div><div class="ctl"><span class="btn">Add group…</span></div></div>
+
+      <div class="sec">Unreal</div>
+      <div class="row"><div class="lbl"><b>Never touched</b><small>Unreal's own tools. Listed apps are skipped even if a group names them.</small></div><div class="ctl" style="width:420px"><div class="chips"><span class="chip">UnrealEditor*</span><span class="chip">ShaderCompileWorker</span><span class="chip">dotnet</span><span class="chip">cl</span><span class="chip">link</span><span class="chip">+17</span><span class="chip add">+ Add…</span></div></div></div>
+      <div class="row"><div class="lbl"><b>Suggest restarting the editor above</b><small>One notification when an editor commits more than this.</small></div><div class="ctl"><div class="num">48</div><span class="unit">GB</span></div></div>
+      <div class="row"><div class="lbl"><b>Warn when the editor grows faster than</b><small>Measured over the last 30 minutes.</small></div><div class="ctl"><div class="num">6</div><span class="unit">GB / hour</span></div></div>
+      <div class="row"><div class="lbl"><b>Pause compile workers when memory is critical</b><small>The newest workers wait and resume when memory recovers. The build is slower instead of failing.</small></div><div class="ctl"><div class="toggle"></div></div></div>
+
+      <div class="sec">Updates</div>
+      <div class="row"><div class="lbl"><b>Check for updates automatically</b><small>Once a day. Only the version check is sent.</small></div><div class="ctl"><div class="toggle on"></div></div></div>
+      <div class="row"><div class="lbl"><b>Version 0.2.0</b><small>Up to date. Checked today at 14:02.</small></div><div class="ctl"><span class="btn">Check now</span></div></div>
+
+      <div class="sec">Team and backup</div>
+      <div class="row"><div class="lbl"><b>Team defaults</b><small>A shared file that sets defaults for everyone. Your own changes still win.</small></div><div class="ctl"><span class="btn">Load team file…</span></div></div>
+      <div class="row" style="border:0"><div class="lbl"><b>Your settings</b><small>settings.toml in %APPDATA%\AtherMemGuard</small></div><div class="ctl" style="width:420px"><span class="btn">Export…</span><span class="btn">Import…</span><span class="btn">Open file</span></div></div>
+    </div>
+    <div class="footer"><span>Changes are saved automatically</span><span>Right-click a setting to reset it</span></div>
+  </div>
+  <p class="note">Not drawn, same pattern: Memory pressure (four thresholds), Headroom for editor / build / cook, History (record, keep for N days, open), AI agents (copy setup). A lime dot marks a value you changed; a TEAM tag marks one that comes from the team file.</p>
+
+  <!-- ============================================================ FLYOUT + MENU + TOASTS -->
+  <div class="grid">
+    <div>
+      <h2 class="surface">2 · Tray flyout <span>left-click the icon</span></h2>
+      <div class="win flyout">
+        <div class="pad">
+          <div class="eyebrow">Editor + build</div>
+          <div class="state">Memory is fine</div>
+          <div class="meter"><div class="top"><span>RAM free</span><b>45.1 of 127 GB</b></div><div class="bar"><i style="width:35%"></i></div></div>
+          <div class="meter"><div class="top"><span>Commit free</span><b>27.6 of 144 GB</b></div><div class="bar"><i class="warn" style="width:19%"></i></div></div>
+          <div class="ue"><b>UnrealEditor · 43.8 GB</b><small>Up 30 min · growing 2.1 GB an hour · 3 compile workers</small></div>
+          <div class="gr"><span>Browsers</span><div class="bar"><i style="width:68%"></i></div><span>4.1 GB</span></div>
+          <div class="gr"><span>Chat</span><div class="bar"><i style="width:34%"></i></div><span>1.1 GB</span></div>
+          <div class="gr"><span>Agents</span><div class="bar"><i style="width:80%;background:var(--muted)"></i></div><span>6.4 GB</span></div>
+          <div class="gr"><span>Background</span><div class="bar"><i class="warn" style="width:100%"></i></div><span>0.8 GB</span></div>
+        </div>
+        <div class="acts"><span class="btn primary">Free memory</span><span class="btn">Pause 30 min</span><span class="btn">Settings</span></div>
+      </div>
+
+      <h2 class="surface">3 · Tray menu <span>right-click</span></h2>
+      <div class="menu">
+        <div class="dis"><span>Editor + build · memory is fine</span></div>
+        <div class="sep"></div>
+        <div class="hi"><span>Free memory now</span><span class="hot">Ctrl+Alt+M</span></div>
+        <div><span>Pause for 30 minutes</span></div>
+        <div><span>Pause until I resume</span></div>
+        <div class="sep"></div>
+        <div><span>Settings</span></div>
+        <div><span>Memory history</span></div>
+        <div class="sep"></div>
+        <div><span>Update to version 0.2.1…</span></div>
+        <div><span>✓ Run at Windows startup</span></div>
+        <div><span>Quit Ather MemGuard</span></div>
+      </div>
+    </div>
+
+    <div>
+      <h2 class="surface">4 · Toasts <span>bottom right, never take focus</span></h2>
+      <div class="toast"><h4>Freed memory for the build</h4><p>Trimmed 131 processes. 9.8 GB is back for Unreal.</p></div>
+      <div class="toast warn"><h4>Unreal Editor is at 52 GB</h4><p>It has been open 7 h 30 min. Restarting it gets that memory back.</p></div>
+      <div class="toast warn"><h4>Unreal Editor is growing 8 GB an hour</h4><p>At this rate memory runs out in about 2 hours.</p><div class="acts"><span class="btn">Show history</span></div></div>
+      <div class="toast err"><h4>Memory is critical</h4><p>4.1 GB RAM free, 6.2 GB commit free. Background apps are being trimmed. Don't start a build yet.</p><div class="acts"><span class="btn primary">Free memory</span></div></div>
+      <div class="toast"><h4>Ather MemGuard 0.2.1 is available</h4><p>Auto-prime now also runs before cooks. Click to update (1.9 MB). Your settings stay.</p></div>
+      <div class="toast"><h4>Paused for 30 minutes</h4><p>Other apps are back to normal until 15:42.</p><div class="acts"><span class="btn">Resume now</span></div></div>
+    </div>
+  </div>
+
+  <!-- ============================================================ SETUP -->
+  <h2 class="surface">5 · Setup window <span>the downloaded exe is the app; first run shows this</span></h2>
+  <div class="win setup">
+    <div class="titlebar">Ather MemGuard Setup <span class="ctl">✕</span></div>
+    <div class="pad">
+      <div class="logo" style="width:96px;height:96px;margin-bottom:22px"><svg viewBox="90 212 462 478"><polygon fill="#C9CCCD" points="90,690 270,296 360,296 540,690 460,690 313,368 165,690"/><rect fill="#D4FF00" x="307" y="483" width="13" height="127"/><text x="424" y="382" font-family="Bahnschrift, Arial Narrow" font-weight="700" font-size="230" fill="#D4FF00">5</text></svg></div>
+      <div class="eyebrow">Ather MemGuard · v0.2.0</div>
+      <div class="headline">Install for you</div>
+      <p>Keeps memory free for Unreal Editor, builds and cooks by holding back other apps. Installs just for your Windows account — no admin rights needed.</p>
+      <div class="opt"><div><b>Start with Windows</b><small>Runs quietly in the tray.</small></div><div class="toggle on"></div></div>
+      <div class="opt"><div><b>Add the memguard command</b><small>Lets agents and scripts check and free memory.</small></div><div class="toggle on"></div></div>
+      <div class="go"><span class="btn primary">INSTALL</span><a>Run without installing</a></div>
+    </div>
+  </div>
+  <p class="note">The same window handles Update, Reinstall and Uninstall (headline and button change). After installing: headline "Ready", body "Ather MemGuard is in your tray.", buttons "Open settings" and "Done".</p>
+
+  <!-- ============================================================ HISTORY -->
+  <h2 class="surface">6 · Memory history <span>what happened while you weren't looking</span></h2>
+  <div class="win hist">
+    <div class="titlebar">Ather MemGuard — Memory history <span class="ctl">— ▢ ✕</span></div>
+    <div class="pad">
+      <div class="top">
+        <div><div class="eyebrow">Ather MemGuard</div><div class="headline" style="font-size:34px">Memory history</div></div>
+        <div class="ranges"><span>1 h</span><span class="sel">6 h</span><span>24 h</span><span>7 d</span></div>
+      </div>
+      <svg viewBox="0 0 1000 300" style="width:100%;display:block;background:var(--surface);border:1px solid var(--border);border-radius:6px">
+        <rect x="610" y="20" width="90" height="240" fill="#FFB830" opacity=".10"/><rect x="640" y="20" width="26" height="240" fill="#FF786E" opacity=".16"/>
+        <g stroke="#32342E" stroke-width="1"><line x1="50" y1="20" x2="980" y2="20"/><line x1="50" y1="80" x2="980" y2="80"/><line x1="50" y1="140" x2="980" y2="140"/><line x1="50" y1="200" x2="980" y2="200"/><line x1="50" y1="260" x2="980" y2="260"/></g>
+        <g fill="#96968E" font-size="11"><text x="14" y="24">128</text><text x="20" y="84">96</text><text x="20" y="144">64</text><text x="20" y="204">32</text><text x="26" y="264">0</text>
+          <text x="50" y="282">09:00</text><text x="236" y="282">10:00</text><text x="422" y="282">11:00</text><text x="608" y="282">12:00</text><text x="794" y="282">13:00</text><text x="946" y="282">now</text></g>
+        <polyline fill="none" stroke="#D4FF00" stroke-width="2.5" points="50,250 120,232 200,214 280,196 360,181 440,168 520,158 600,150 660,147 700,146 706,252 760,238 840,222 920,208 980,198"/>
+        <polyline fill="none" stroke="#F2EFE8" stroke-width="1.5" points="50,110 120,128 200,140 280,156 360,170 440,186 520,200 600,224 640,250 660,253 700,236 706,150 760,160 840,170 920,176 980,178"/>
+        <polyline fill="none" stroke="#96968E" stroke-width="1.5" stroke-dasharray="4 4" points="50,150 120,166 200,178 280,192 360,204 440,214 520,224 600,238 650,254 700,244 706,170 760,184 840,196 920,204 980,208"/>
+        <g fill="#D4FF00"><circle cx="560" cy="260" r="4"/><circle cx="640" cy="260" r="4"/></g>
+        <line x1="706" y1="20" x2="706" y2="260" stroke="#F2EFE8" stroke-dasharray="2 4"/><text x="712" y="34" fill="#D0CEC7" font-size="11">Editor restarted</text>
+        <text x="614" y="34" fill="#FFB830" font-size="11">tight</text>
+      </svg>
+      <div class="legend"><span><i style="background:var(--accent)"></i>Unreal committed</span><span><i style="background:var(--text)"></i>RAM free</span><span><i style="background:var(--muted)"></i>Commit free</span><span><i style="background:var(--accent);height:8px;width:8px;border-radius:50%;vertical-align:0"></i>Memory freed</span><span><i style="background:var(--warn);height:10px;opacity:.4;vertical-align:-1px"></i>Memory tight or critical</span></div>
+      <div class="spark">
+        <div><b>Unreal Editor</b><small>Now 43.8 GB · peak 60.9 GB · growing 2.1 GB an hour</small></div>
+        <div><b>Browsers</b><small>Now 4.1 GB · peak 6.3 GB · trimmed 14 times</small></div>
+        <div><b>Chat</b><small>Now 1.1 GB · peak 3.2 GB · trimmed 9 times</small></div>
+        <div><b>Agents</b><small>Now 6.4 GB · peak 11.2 GB · trimmed twice</small></div>
+      </div>
+    </div>
+    <div class="footer"><span>Recorded every 10 seconds, kept for 7 days</span><span>Open the CSV folder</span></div>
+  </div>
+</div>
+</body>
+</html>
