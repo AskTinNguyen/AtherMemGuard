@@ -866,11 +866,26 @@ pub mod catalog {
 
     /// A watched drive changed level (`disk::level_change_words` gives the words). Getting
     /// fuller offers the checkup; one toast per drive at a time.
-    pub fn disk_level(title: &str, body: &str, worse: bool) -> Toast {
+    /// One toast per drive: two drives changing level in the same poll each get theirs.
+    pub fn disk_level(title: &str, body: &str, worse: bool, volume: &str) -> Toast {
+        let key = disk_key(volume);
         if worse {
-            keyed(with(toast(ToastKind::Warning, title.to_string(), body.to_string()), "Open the checkup", Command::OpenDoctor), "disk")
+            keyed(with(toast(ToastKind::Warning, title.to_string(), body.to_string()), "Open the checkup", Command::OpenDoctor), key)
         } else {
-            keyed(toast(ToastKind::Info, title.to_string(), body.to_string()), "disk")
+            keyed(toast(ToastKind::Info, title.to_string(), body.to_string()), key)
+        }
+    }
+
+    /// "disk:D" for "D:", "disk" for a drive without a letter.
+    pub fn disk_key(volume: &str) -> &'static str {
+        const KEYS: [&str; 26] = [
+            "disk:A", "disk:B", "disk:C", "disk:D", "disk:E", "disk:F", "disk:G", "disk:H", "disk:I", "disk:J", "disk:K", "disk:L", "disk:M",
+            "disk:N", "disk:O", "disk:P", "disk:Q", "disk:R", "disk:S", "disk:T", "disk:U", "disk:V", "disk:W", "disk:X", "disk:Y", "disk:Z",
+        ];
+        let mut c = volume.chars();
+        match (c.next(), c.next()) {
+            (Some(l), Some(':')) if l.is_ascii_alphabetic() => KEYS[(l.to_ascii_uppercase() as u8 - b'A') as usize],
+            _ => "disk",
         }
     }
 
@@ -1126,5 +1141,20 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod disk_toast_tests {
+    use super::catalog::{disk_key, disk_level};
+
+    #[test]
+    fn each_drive_gets_its_own_toast() {
+        assert_eq!(disk_key("D:"), "disk:D");
+        assert_eq!(disk_key("c:"), "disk:C");
+        assert_eq!(disk_key(r"\?\Volume{1234}\"), "disk");
+        let d = disk_level("D: is almost full", "body", true, "D:");
+        let c = disk_level("C: is low on space", "body", true, "C:");
+        assert_ne!(d.key, c.key, "two drives in one poll must not replace each other");
     }
 }

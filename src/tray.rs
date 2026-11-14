@@ -1198,7 +1198,7 @@ impl App {
                 for (v, from, to) in self.disk_watch.update(&vols, &s) {
                     crate::log::write(&format!("disk: {} {} -> {} ({:.1} GB free)", v.name(), from.label(), to.label(), v.free_gb));
                     if let Some((title, body)) = crate::disk::level_change_words(&v, from, to, cook) {
-                        toast::show(catalog::disk_level(&title, &body, to > from));
+                        toast::show(catalog::disk_level(&title, &body, to > from, &v.name()));
                     }
                 }
                 self.engine.set_disk(Some(crate::disk::brief(&vols, &s)));

@@ -725,9 +725,11 @@ pub fn brief(vols: &[Volume], s: &DiskSettings) -> DiskBrief {
 }
 
 /// The flyout's disk line from a status `disk` block: the watched drive that needs attention
-/// most, the Dev Drive when all are fine. "D: Dev Drive · 370 GB free".
+/// most (the Dev Drive first among equals), the Dev Drive when all are fine.
+/// "D: Dev Drive · 370 GB free". Other drives that need attention are counted, not hidden.
 pub fn brief_line(b: &DiskBrief) -> Option<(String, Level)> {
-    let worst = b.volumes.iter().max_by(|a, c| a.level.cmp(&c.level).then(c.free_pct.total_cmp(&a.free_pct)))?;
+    let dev = |v: &BriefVolume| v.roles.iter().any(|r| r == "dev_drive");
+    let worst = b.volumes.iter().max_by(|a, c| a.level.cmp(&c.level).then(dev(a).cmp(&dev(c))).then(c.free_pct.total_cmp(&a.free_pct)))?;
     let v = if worst.level == Level::Normal { b.volumes.iter().find(|v| v.roles.iter().any(|r| r == "dev_drive")).unwrap_or(worst) } else { worst };
     let kind = if v.roles.iter().any(|r| r == "dev_drive") {
         " Dev Drive"
@@ -741,7 +743,13 @@ pub fn brief_line(b: &DiskBrief) -> Option<(String, Level)> {
         Level::Elevated => " · getting full",
         Level::Critical => " · almost full",
     };
-    Some((format!("{}{} · {:.0} GB free{}", v.volume, kind, v.free_gb.floor(), state), v.level))
+    let others = b.volumes.iter().filter(|o| o.level != Level::Normal && o.volume != v.volume).count();
+    let more = match others {
+        0 => String::new(),
+        1 => " · 1 more drive low".into(),
+        n => format!(" · {} more drives low", n),
+    };
+    Some((format!("{}{} · {:.0} GB free{}{}", v.volume, kind, v.free_gb.floor(), state, more), v.level))
 }
 
 /// The disk block for `memguard status` and `memguard_status`, or `None` when disk watching is off.
@@ -1041,5 +1049,43 @@ mod tests {
         assert!(!checks[0].ok);
         assert_eq!(checks[0].roles, vec!["project", "temp"]);
         assert!(gate_checks(None, 100.0, &[], 20.0).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod brief_line_tests {
+    use super::*;
+
+    fn vol(name: &str, level: Level, free_gb: f64, free_pct: f64, roles: &[&str]) -> BriefVolume {
+        BriefVolume { volume: name.into(), free_gb, free_pct, level, roles: roles.iter().map(|r| r.to_string()).collect() }
+    }
+
+    #[test]
+    fn dev_drive_first_among_equals_and_others_are_counted() {
+        let b = DiskBrief {
+            level: Level::Critical,
+            volumes: vec![vol("C:", Level::Critical, 292.4, 15.4, &["system"]), vol("D:", Level::Critical, 447.3, 23.4, &["dev_drive", "projects"])],
+        };
+        let (line, level) = brief_line(&b).unwrap();
+        assert_eq!(line, "D: Dev Drive · 447 GB free · almost full · 1 more drive low");
+        assert_eq!(level, Level::Critical);
+    }
+
+    #[test]
+    fn worse_drive_still_wins_over_the_dev_drive() {
+        let b = DiskBrief {
+            level: Level::Critical,
+            volumes: vec![vol("C:", Level::Critical, 20.0, 1.0, &["system"]), vol("D:", Level::Elevated, 140.0, 7.3, &["dev_drive"])],
+        };
+        assert_eq!(brief_line(&b).unwrap().0, "C: system drive · 20 GB free · almost full · 1 more drive low");
+    }
+
+    #[test]
+    fn all_fine_shows_the_dev_drive_alone() {
+        let b = DiskBrief {
+            level: Level::Normal,
+            volumes: vec![vol("C:", Level::Normal, 292.4, 15.4, &["system"]), vol("D:", Level::Normal, 447.3, 23.4, &["dev_drive"])],
+        };
+        assert_eq!(brief_line(&b).unwrap().0, "D: Dev Drive · 447 GB free");
     }
 }
