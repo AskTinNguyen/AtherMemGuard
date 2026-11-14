@@ -17,6 +17,7 @@ use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
 use super::canvas::{Align, Canvas};
+use super::commands::Command;
 use super::geom::{Pt, Rect};
 use super::kit::{format_gb, Button, ButtonStyle, Dialog, Pill, Scroll, WState};
 use super::setup::{indeterminate_bar, paint_link, wake, wrap_hard};
@@ -112,6 +113,20 @@ pub struct Finding {
     pub company: String,
     /// Addition: where "How to fix" goes for THIS PC rows.
     pub help_url: Option<String>,
+    /// Addition: a THIS PC row whose link runs a command instead ("Show me how" on the RAM
+    /// check rows writes and opens the RAM report). Wins over `help_url`.
+    pub help_command: Option<Command>,
+}
+
+/// The link a THIS PC row shows, if any.
+pub fn help_link(f: &Finding) -> Option<&'static str> {
+    if f.help_command.is_some() {
+        Some("Show me how")
+    } else if f.help_url.is_some() {
+        Some("How to fix")
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -448,6 +463,7 @@ impl FakeDoctor {
             needs_admin: false,
             company: String::new(),
             help_url: None,
+            help_command: None,
         };
         use ActionKind as A;
         use FindingKind as K;
@@ -471,10 +487,22 @@ impl FakeDoctor {
             f("app:dropbox", K::App, V::HoldBack, "Dropbox", "Cloud sync. Held back so syncing doesn't compete with Unreal.", 3, 420, &[A::HoldBack], false),
             f("ue:orphans", K::Unreal, V::Close, "3 leftover Unreal helpers from a closed editor", "ShaderCompileWorker processes with no editor left to use them.", 3, 1230, &[A::End], false),
             f("sys:pagefile", K::System, V::Keep, "The page file is small for this much RAM.", "Windows can only promise apps 144 GB. Big cooks can fail even with RAM free.", 0, 0, &[], false),
+            f(
+                "sys:ram",
+                K::System,
+                V::Review,
+                "Your RAM is running at 4800 MHz. The kit is rated for 6000 MHz.",
+                "The kit's fast profile (EXPO) looks switched off in the BIOS, so the memory runs at its slower default. Turning it on takes about five minutes and is safe to try: if it doesn't work, the BIOS goes back by itself.",
+                0,
+                0,
+                &[],
+                false,
+            ),
         ];
         findings[7].needs_admin = true;
         findings[9].company = "Northwind Systems".into();
         findings[13].help_url = Some("https://github.com/AskTinNguyen/AtherMemGuard/blob/main/docs/PAGEFILE.md".into());
+        findings[14].help_command = Some(Command::ShowRamReport);
         let reclaim: u64 = findings.iter().filter(|f| f.kind == K::App || f.kind == K::Unreal).filter(|f| f.verdict != V::HoldBack).map(|f| f.ram_mb).sum();
         Report { time: "2026-11-14 14:02:11".into(), system, findings, reclaimable_ram_gb: reclaim as f64 / 1024.0, reclaimable_commit_gb: reclaim as f64 * 1.25 / 1024.0 }
     }
@@ -620,11 +648,14 @@ pub struct DoctorWindow {
     anim: f32,
     items: Vec<Item>,
     menu_row: Option<usize>,
+    /// Where commands from rows go (the tray's dispatcher); a no-op by default.
+    commands: Box<dyn Fn(Command)>,
 }
 
 impl DoctorWindow {
     pub fn new(source: Box<dyn DoctorSource>) -> DoctorWindow {
         DoctorWindow {
+            commands: Box::new(|_| {}),
             source: Arc::new(Mutex::new(source)),
             model: None,
             confirm: None,
@@ -644,6 +675,12 @@ impl DoctorWindow {
             items: Vec::new(),
             menu_row: None,
         }
+    }
+
+    /// Send commands from rows ("Show me how") to `commands`.
+    pub fn with_commands(mut self, commands: Box<dyn Fn(Command)>) -> DoctorWindow {
+        self.commands = commands;
+        self
     }
 
     pub fn items(&self) -> &[Item] {
@@ -873,7 +910,11 @@ impl DoctorWindow {
         let st = &m.rows[i];
         let cb = c.s(20.0);
         let tx = x0 + cb + c.s(16.0);
-        let ctl_w = c.s(280.0).min((x1 - tx) / 2);
+        let mut ctl_w = c.s(280.0).min((x1 - tx) / 2);
+        if sec == SectionKind::ThisPc {
+            // Notes with at most a link: the text gets the room a pill would take.
+            ctl_w = help_link(f).map_or(0, |l| c.measure(l, F_HINT).0 + c.s(2.0)).min(ctl_w);
+        }
         let gap = c.s(16.0);
         let text_w = x1 - tx - ctl_w - gap;
         let gb = format_gb(f.ram_mb as f64 / 1024.0);
@@ -908,8 +949,8 @@ impl DoctorWindow {
         } else if f.needs_admin {
             Right::Note(vec!["Needs an administrator".into()], MUTED, None)
         } else if f.kind == FindingKind::System {
-            match &f.help_url {
-                Some(_) => Right::Link("How to fix".into(), Act::HowToFix(i)),
+            match help_link(f) {
+                Some(label) => Right::Link(label.into(), Act::HowToFix(i)),
                 None => Right::Nothing,
             }
         } else {
@@ -1175,7 +1216,10 @@ impl DoctorWindow {
             }
             Act::EndAnyway(i) => self.confirm = Some(Confirm::End(i)),
             Act::HowToFix(i) => {
-                if let Some(url) = self.model.as_ref().and_then(|m| m.report.findings[i].help_url.clone()) {
+                let Some(f) = self.model.as_ref().and_then(|m| m.report.findings.get(i)) else { return };
+                if let Some(cmd) = f.help_command {
+                    (self.commands)(cmd);
+                } else if let Some(url) = f.help_url.clone() {
                     host.shell_open(&url);
                 }
             }
@@ -1363,14 +1407,14 @@ impl Surface for DoctorWindow {
 }
 
 /// Open the checkup window (it scans right away), or bring the open one to the front.
-/// Call on the UI thread.
-pub fn open_doctor(source: Box<dyn DoctorSource>) -> HWND {
+/// Call on the UI thread. `commands` receives what rows ask for ("Show me how").
+pub fn open_doctor(source: Box<dyn DoctorSource>, commands: Box<dyn Fn(Command)>) -> HWND {
     if let Some(h) = window::find(KIND) {
         window::bring_to_front(h);
         return h;
     }
     let spec = WindowSpec { kind: KIND, title: TITLE.into(), size: (760, 720), min_size: (620, 480), placement: super::ui_state::load(KIND), resizable: true };
-    window::open(spec, Box::new(DoctorWindow::new(source)))
+    window::open(spec, Box::new(DoctorWindow::new(source).with_commands(commands)))
 }
 
 /// Paint the window at `w` (96-DPI px) wide and `h` high, or the whole page with `h == None`.
@@ -1527,6 +1571,36 @@ mod tests {
         w.activate(Act::Undo, &mut host);
         assert!(!w.can_undo);
         assert_eq!(w.model.as_ref().unwrap().rows.iter().filter(|r| !r.outcomes.is_empty()).count(), 0, "undo re-scans");
+    }
+
+    #[test]
+    fn this_pc_links() {
+        let sent: std::rc::Rc<std::cell::RefCell<Vec<Command>>> = Default::default();
+        let log = sent.clone();
+        let mut w = DoctorWindow::new(Box::new(FakeDoctor::new())).with_commands(Box::new(move |c| log.borrow_mut().push(c)));
+        let mut host = Host::detached((760, 720), Scale(1.0));
+        w.scan(None);
+        let c = Canvas::new(760, 3000, Scale(1.0));
+        w.layout(&c);
+        let m = w.model.clone().unwrap();
+        let ram = idx(&m, "sys:ram");
+        let page = idx(&m, "sys:pagefile");
+        assert_eq!(help_link(&m.report.findings[ram]), Some("Show me how"));
+        assert_eq!(help_link(&m.report.findings[page]), Some("How to fix"));
+        assert!(!m.selectable(ram) && !m.rows[ram].checked, "the RAM row is a note, never a pick");
+        let link = |w: &DoctorWindow, i: usize| {
+            w.items().iter().find(|it| it.act == Some(Act::HowToFix(i))).map(|it| it.paint.clone())
+        };
+        assert_eq!(link(&w, ram), Some(Paint::Link { label: "Show me how".into(), color: MUTED }));
+        // "Show me how" sends the command (the tray writes and opens the page); it opens nothing itself.
+        w.activate(Act::HowToFix(ram), &mut host);
+        assert_eq!(*sent.borrow(), vec![Command::ShowRamReport]);
+        assert!(host.shell_targets().is_empty());
+        // "How to fix" opens its page and sends nothing.
+        w.activate(Act::HowToFix(page), &mut host);
+        assert_eq!(sent.borrow().len(), 1);
+        assert_eq!(host.shell_targets().len(), 1);
+        assert!(host.shell_targets()[0].ends_with("PAGEFILE.md"));
     }
 
     fn check_layout(w: &mut DoctorWindow, scale: f32, width: i32, ctx: &str) {

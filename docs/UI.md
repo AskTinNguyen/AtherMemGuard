@@ -292,7 +292,7 @@ downsampled to at most 1500 points).
 | WORTH A LOOK | verdict `review` | Unchecked · app name, company, "X GB" · pill: "Close" / "Hold back" / "Leave it" (Leave it adds it to `[doctor] keep`) |
 | HELD BACK, NOT CLOSED | `hold_back` apps not yet in a group | Checked · "Hold back" (adds the app to the matching group) |
 | UNREAL | leftovers | "3 leftover Unreal helpers from a closed editor · 1.2 GB" · "End them" |
-| THIS PC | system | Text rows, each with a link: "The page file is small for this much RAM." → "How to fix" |
+| THIS PC | system | Text rows, each with a link: "The page file is small for this much RAM." → "How to fix". The RAM check's rows (`sys:ram`: the report's headline over its summary, and `sys:ram:<what>` for each problem such as old Intel microcode; only with `general.check_ram_speed` on) → "Show me how", which writes `ram-report.html` to the data folder and opens it in the browser (`Command::ShowRamReport`) |
 
 - Rows whose finding is `recommended` start checked. The footer shows the running total of
   what is checked, "Selected: frees about {x} GB", on the left; on the right the primary

@@ -818,6 +818,12 @@ pub mod catalog {
         keyed(toast(ToastKind::Error, "Couldn't save that setting".into(), message.to_string()), "save")
     }
 
+    /// "Show me how" couldn't write the RAM report page. Not in the catalogue table: the person
+    /// just clicked and needs an answer.
+    pub fn ram_report_failed(message: &str) -> Toast {
+        keyed(toast(ToastKind::Error, "Couldn't open the RAM report".into(), message.to_string()), "ram")
+    }
+
     /// "Steam, Spotify and Blender"
     fn and_list(names: &[String]) -> String {
         match names {

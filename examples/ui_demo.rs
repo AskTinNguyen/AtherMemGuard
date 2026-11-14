@@ -89,7 +89,7 @@ fn main() {
     if has("--doctor") {
         use athermemguard::ui::doctor::{open_doctor, FakeDoctor};
         let src = if has("--clear") { FakeDoctor::all_clear() } else { FakeDoctor::new() };
-        let hwnd = open_doctor(Box::new(src.with_delay(std::time::Duration::from_millis(1200))));
+        let hwnd = open_doctor(Box::new(src.with_delay(std::time::Duration::from_millis(1200))), Box::new(|cmd| println!("command: {:?}", cmd)));
         close_later(hwnd, arg("--close-after"));
         window::run_until_closed(hwnd);
         return;

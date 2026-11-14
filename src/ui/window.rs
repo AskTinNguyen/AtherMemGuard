@@ -148,6 +148,11 @@ impl Host {
     pub fn detached(size: (i32, i32), scale: Scale) -> Host {
         Host { hwnd: null_mut(), scale, size, cursor: None, requests: Vec::new() }
     }
+    /// What `shell_open` was asked to open so far (tests).
+    #[cfg(test)]
+    pub(crate) fn shell_targets(&self) -> Vec<String> {
+        self.requests.iter().filter_map(|r| if let Request::Shell(t) = r { Some(t.clone()) } else { None }).collect()
+    }
     pub fn invalidate(&mut self) {
         self.requests.push(Request::Invalidate);
     }

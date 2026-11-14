@@ -52,6 +52,8 @@ const TIMER_ID: usize = 1;
 const HOTKEY_ID: i32 = 1;
 const FIRST_UPDATE_CHECK: Duration = Duration::from_secs(60);
 const UPDATE_EVERY: Duration = Duration::from_secs(24 * 3600);
+/// The RAM report page "Show me how" writes into the data folder.
+pub const RAM_REPORT_FILE: &str = "ram-report.html";
 pub const RELEASES_URL: &str = "https://github.com/AskTinNguyen/AtherMemGuard/releases/latest";
 
 /// The tray window, for posting commands from closures (toasts, flyout, settings window).
@@ -455,7 +457,34 @@ pub fn open_history_window() {
 pub fn open_doctor_window() {
     flyout::close();
     let tray = TRAY_HWND.load(Ordering::SeqCst);
-    crate::ui::doctor::open_doctor(Box::new(RealDoctor::new(tray)));
+    crate::ui::doctor::open_doctor(Box::new(RealDoctor::new(tray)), Box::new(post_command));
+}
+
+/// Write the RAM report page to `path` (atomically, creating the folder).
+pub fn write_ram_report(path: &Path, r: &crate::ramcheck::RamReport) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+    }
+    let tmp = path.with_extension("html.tmp");
+    std::fs::write(&tmp, crate::ramcheck::render_html(r)).map_err(|e| format!("{}: {}", tmp.display(), e))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {}", path.display(), e)
+    })
+}
+
+/// "Show me how" on the RAM check's toast and checkup row: write the report page to the data
+/// folder now (the scan only reads) and open it in the default browser.
+pub fn show_ram_report() {
+    let path = paths::data_dir().join(RAM_REPORT_FILE);
+    match write_ram_report(&path, crate::ramcheck::check_cached()) {
+        Ok(()) => shell_open(&path.display().to_string()),
+        Err(e) => {
+            crate::log::write(&format!("couldn't write the RAM report: {}", e));
+            // The person just clicked: say so even with notifications off.
+            toast::show_always(catalog::ram_report_failed(&e));
+        }
+    }
 }
 
 /// "Undo" on the "Checkup done" toast: reverse the last cleanup on a worker thread.
@@ -635,6 +664,7 @@ pub mod doctor_map {
             needs_admin,
             company: f.company.clone(),
             help_url: if f.kind == real::FindingKind::System { help_url(&f.id) } else { None },
+            help_command: (f.kind == real::FindingKind::System && real::is_ram_finding(&f.id)).then_some(crate::ui::Command::ShowRamReport),
         }
     }
 
@@ -1213,6 +1243,7 @@ fn dispatch(hwnd: HWND, cmd: Command) {
         Command::Quit => unsafe { PostQuitMessage(0) },
         Command::OpenReleasesPage => shell_open(RELEASES_URL),
         Command::OpenSettingsFile => open_in_notepad(&paths::config_file()),
+        Command::ShowRamReport => show_ram_report(),
     }
 }
 
@@ -1816,6 +1847,8 @@ mod tests {
                 real_finding("ue:orphans", K::Unreal, V::Close, "3 leftover Unreal helpers", 1230, &[A::End]),
                 real_finding("sys:pagefile", K::System, V::Review, "The page file is small for this much RAM", 0, &[]),
                 real_finding("sys:git", K::System, V::Review, "25 git processes are running", 0, &[]),
+                real_finding("sys:ram", K::System, V::Review, "Your RAM is running at 4800 MHz. The kit is rated for 6000 MHz.", 0, &[]),
+                real_finding("sys:ram:microcode", K::System, V::Review, "Update the BIOS before changing memory settings", 0, &[]),
             ],
             reclaimable_ram_gb: 5.5,
             reclaimable_commit_gb: 11.0,
@@ -1852,6 +1885,16 @@ mod tests {
         assert!(f("sys:pagefile").help_url.as_deref().is_some_and(|u| u.starts_with("https://learn.microsoft.com/")));
         assert_eq!(f("sys:git").help_url, None);
         assert_eq!(f("app:steam").help_url, None);
+        // The RAM check's rows say "Show me how" and run the same command as its toast.
+        for id in ["sys:ram", "sys:ram:microcode"] {
+            assert_eq!(f(id).help_command, Some(Command::ShowRamReport), "{}", id);
+            assert_eq!(vm::help_link(f(id)), Some("Show me how"));
+            assert_eq!(vm::section_of(f(id)), Some(SectionKind::ThisPc));
+        }
+        assert_eq!(f("sys:pagefile").help_command, None);
+        assert_eq!(vm::help_link(f("sys:pagefile")), Some("How to fix"));
+        assert_eq!(vm::help_link(f("sys:git")), None);
+        assert_eq!(f("app:steam").help_command, None);
 
         // Every section shows, in order, and the window's pre-checks follow `recommended`.
         let m = vm::DoctorModel::new(v.clone());
@@ -1929,6 +1972,21 @@ mod tests {
         // The day lives in ui-state.toml's [tray] table.
         let text = with_tray_value("", "last_nudge_day", toml::Value::String("2026-11-14".into()));
         assert_eq!(tray_value(&text, "last_nudge_day").unwrap().as_str(), Some("2026-11-14"));
+    }
+
+    #[test]
+    fn ram_report_page_is_written_where_asked() {
+        let dir = std::env::temp_dir().join(format!("amg-ramreport-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("sub").join(RAM_REPORT_FILE);
+        let r = crate::ramcheck::check_from(&crate::smbios::Smbios::default(), "", None, (2026, 11, 14));
+        write_ram_report(&path, &r).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, crate::ramcheck::render_html(&r));
+        assert!(!path.with_extension("html.tmp").exists());
+        // Again over the old page.
+        write_ram_report(&path, &r).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

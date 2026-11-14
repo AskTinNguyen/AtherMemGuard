@@ -763,7 +763,7 @@ fn outcome_line(o: &athermemguard::doctor::Outcome) -> String {
 type SectionPick = fn(&athermemguard::doctor::Finding) -> bool;
 
 fn print_doctor_report(r: &athermemguard::doctor::Report) {
-    use athermemguard::doctor::{mem_label, Finding, FindingKind, Verdict};
+    use athermemguard::doctor::{self, mem_label, Finding, FindingKind, Verdict};
     let s = &r.system;
     println!("Ather MemGuard checkup   {}", r.time);
     println!(
@@ -785,6 +785,7 @@ fn print_doctor_report(r: &athermemguard::doctor::Report) {
         ("UNREAL", |f| f.kind == FindingKind::Unreal),
         ("THIS PC", |f| f.kind == FindingKind::System),
     ];
+    let mut ram_hint_shown = false;
     for (title, pick) in sections {
         let items: Vec<&Finding> = r.findings.iter().filter(|f| pick(f)).collect();
         if items.is_empty() {
@@ -811,6 +812,10 @@ fn print_doctor_report(r: &athermemguard::doctor::Report) {
             }
             println!("{}", head.trim_end());
             println!("      {}", f.detail);
+            if doctor::is_ram_finding(&f.id) && !ram_hint_shown {
+                ram_hint_shown = true;
+                println!("      Run `memguard ram` for the steps: what to change in the BIOS, and how to check it worked.");
+            }
             if !f.actions.is_empty() {
                 let acts: Vec<String> = f
                     .actions
