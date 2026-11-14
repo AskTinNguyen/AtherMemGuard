@@ -7,11 +7,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::Serialize;
 
-use crate::config::{any_matches, Config, Cpu, Group, MemPriority, Policy};
+use crate::config::{any_matches, limit_mb, scale_soft_cap, Config, Cpu, Group, MemPriority, Policy, Preset};
+use crate::history::History;
 use crate::win::{self, Proc, SysInfo};
 
 const GB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -176,12 +177,12 @@ pub fn snapshot() -> Snapshot {
 
 // ---------------------------------------------------------------- analysis (no side effects)
 
-fn overlay(e: &mut Effective, p: &Option<Policy>) {
+fn overlay(e: &mut Effective, p: &Option<Policy>, ram_total_mb: u64) {
     if let Some(p) = p {
         if let Some(v) = p.priority {
             e.priority = v;
         }
-        if let Some(v) = p.trim_above_mb {
+        if let Some(v) = limit_mb(p.trim_above_mb, p.trim_above_pct, ram_total_mb) {
             e.trim_above_mb = v;
         }
         if let Some(v) = p.cpu {
@@ -193,21 +194,29 @@ fn overlay(e: &mut Effective, p: &Option<Policy>) {
     }
 }
 
-pub fn effective(g: &Group, ue_active: bool, level: Level) -> Effective {
+/// The policy a group gets now. Soft caps resolve from MB or percent of `ram_total_mb`
+/// (MB wins within one table), then the preset scales them and the 128 MB floor applies.
+/// The aggressive preset also lowers CPU priority (`below`) while Unreal is running, unless
+/// the group already has a stronger CPU setting.
+pub fn effective(g: &Group, ue_active: bool, level: Level, preset: Preset, ram_total_mb: u64) -> Effective {
     let mut e = Effective {
         priority: g.priority.unwrap_or(MemPriority::Normal),
-        trim_above_mb: g.trim_above_mb.unwrap_or(0),
+        trim_above_mb: limit_mb(g.trim_above_mb, g.trim_above_pct, ram_total_mb).unwrap_or(0),
         cpu: g.cpu.unwrap_or(Cpu::Normal),
         suspend: g.suspend.unwrap_or(false),
     };
     if ue_active {
-        overlay(&mut e, &g.ue);
+        overlay(&mut e, &g.ue, ram_total_mb);
     }
     if level >= Level::Elevated {
-        overlay(&mut e, &g.elevated);
+        overlay(&mut e, &g.elevated, ram_total_mb);
     }
     if level >= Level::Critical {
-        overlay(&mut e, &g.critical);
+        overlay(&mut e, &g.critical, ram_total_mb);
+    }
+    e.trim_above_mb = scale_soft_cap(e.trim_above_mb, preset);
+    if preset == Preset::Aggressive && ue_active && e.cpu == Cpu::Normal {
+        e.cpu = Cpu::Below;
     }
     e
 }
@@ -294,9 +303,9 @@ pub fn analyze(cfg: &Config, snap: &Snapshot) -> Status {
     let level = pressure_level(cfg, &snap.sys);
     let ue_active = act.any();
 
+    let ram_total_mb = snap.sys.ram_total / MB;
     let groups: Vec<GroupStatus> = cfg
-        .groups
-        .iter()
+        .active_groups()
         .map(|g| {
             let members: Vec<&Proc> =
                 snap.procs.iter().filter(|p| any_matches(&g.processes, &p.name) && !is_protected(cfg, p)).collect();
@@ -305,7 +314,7 @@ pub fn analyze(cfg: &Config, snap: &Snapshot) -> Status {
                 processes: members.len(),
                 ram_mb: members.iter().map(|p| p.ram).sum::<u64>() / MB,
                 committed_mb: members.iter().map(|p| p.committed).sum::<u64>() / MB,
-                policy: effective(g, ue_active, level),
+                policy: effective(g, ue_active, level, cfg.general.preset, ram_total_mb),
                 hard_cap_mb: g.hard_cap_mb,
                 hard_cap_per_process_mb: g.hard_cap_per_process_mb,
                 suspended: false,
@@ -359,11 +368,95 @@ pub fn analyze(cfg: &Config, snap: &Snapshot) -> Status {
     }
 }
 
+// ---------------------------------------------------------------- events
+
+/// Things the UI may want to tell the user about. Collected by `Engine::tick`, handed out by
+/// `Engine::take_events`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Event {
+    PressureChanged { from: Level, to: Level },
+    AutoPrimed { reason: &'static str /* "build" | "cook" */, trimmed: usize, groups_ram_before_gb: f64 },
+    EditorRestartHint { pid: u32, committed_gb: f64 },
+    EditorGrowing { pid: u32, gb_per_hour: f64, committed_gb: f64 },
+    SettingsReloaded,
+    SettingsError(String),
+}
+
+/// Events kept when nobody takes them; the oldest are dropped first.
+const MAX_EVENTS: usize = 256;
+
+/// Which workload just started: `activities.build` or `activities.cook` going from false to
+/// true. The first observation (`prev` = None) is a baseline, not a start.
+pub fn auto_prime_reason(prev: Option<Activities>, now: Activities) -> Option<&'static str> {
+    let prev = prev?;
+    if now.build && !prev.build {
+        Some("build")
+    } else if now.cook && !prev.cook {
+        Some("cook")
+    } else {
+        None
+    }
+}
+
+/// Once-per-editor-process hints. A hint fires when its condition starts and can fire again
+/// for the same process only after it has cleared (the growth hint clears below half the
+/// alert rate, so a slope hovering at the threshold doesn't repeat it).
+#[derive(Default)]
+struct Hints {
+    restart: HashSet<u32>,
+    growing: HashSet<u32>,
+}
+
+impl Hints {
+    fn update(&mut self, cfg: &Config, st: &Status, growth: impl Fn(u32) -> Option<f64>) -> Vec<Event> {
+        let editors: Vec<&UeProcess> = st.ue.processes.iter().filter(|p| p.kind == "editor").collect();
+        let alive: HashSet<u32> = editors.iter().map(|p| p.pid).collect();
+        self.restart.retain(|pid| alive.contains(pid));
+        self.growing.retain(|pid| alive.contains(pid));
+        let mut out = Vec::new();
+        let hint_gb = cfg.ue.editor_restart_hint_gb;
+        let alert = cfg.ue.editor_growth_alert_gb_per_hour;
+        for p in editors {
+            if hint_gb > 0.0 && p.committed_gb >= hint_gb {
+                if self.restart.insert(p.pid) {
+                    out.push(Event::EditorRestartHint { pid: p.pid, committed_gb: p.committed_gb });
+                }
+            } else {
+                self.restart.remove(&p.pid);
+            }
+            match growth(p.pid).filter(|_| alert > 0.0) {
+                Some(g) if g >= alert => {
+                    if self.growing.insert(p.pid) {
+                        out.push(Event::EditorGrowing {
+                            pid: p.pid,
+                            gb_per_hour: (g * 10.0).round() / 10.0,
+                            committed_gb: p.committed_gb,
+                        });
+                    }
+                }
+                Some(g) if g >= alert / 2.0 => {}
+                _ => {
+                    self.growing.remove(&p.pid);
+                }
+            }
+        }
+        out
+    }
+}
+
 // ---------------------------------------------------------------- enforcement
+
+/// Modification times of settings.toml and team.toml, to notice edits.
+type Stamp = (Option<SystemTime>, Option<SystemTime>);
+
+fn settings_stamp() -> Stamp {
+    let m = |p: std::path::PathBuf| fs::metadata(p).and_then(|m| m.modified()).ok();
+    (m(crate::paths::config_file()), m(crate::config::team_file()))
+}
 
 pub struct Engine {
     pub cfg: Config,
-    cfg_stamp: Option<SystemTime>,
+    cfg_stamp: Option<Stamp>,
     jobs: HashMap<String, win::Job>,
     last_trim: HashMap<String, Instant>,
     /// Cooldown multiplier per group, doubled each time a trim doesn't stick.
@@ -375,12 +468,30 @@ pub struct Engine {
     workers_paused: HashSet<u32>,
     cap_misses: HashMap<String, usize>,
     pub paused: bool,
+    /// When a timed pause ends; `None` while running or paused until resumed.
+    paused_until: Option<Instant>,
+    prev_activities: Option<Activities>,
+    prev_level: Option<Level>,
+    hints: Hints,
+    events: Vec<Event>,
+    history: History,
 }
 
 impl Engine {
+    /// The engine for the background app: layered settings from the data folder and the
+    /// memory history in `history\`.
     pub fn new() -> Engine {
-        let mut e = Engine {
-            cfg: Config::builtin(),
+        let mut e = Engine::with_config(Config::builtin());
+        e.reload(true);
+        e.history = History::open_default(e.cfg.history.keep_days);
+        e
+    }
+
+    /// An engine with these settings and an in-memory history. Reads no files and touches
+    /// no processes until `tick`, `reload` or `restore_all` is called.
+    pub fn with_config(cfg: Config) -> Engine {
+        Engine {
+            cfg,
             cfg_stamp: None,
             jobs: HashMap::new(),
             last_trim: HashMap::new(),
@@ -391,25 +502,49 @@ impl Engine {
             workers_paused: HashSet::new(),
             cap_misses: HashMap::new(),
             paused: false,
-        };
-        e.reload(true);
-        e
+            paused_until: None,
+            prev_activities: None,
+            prev_level: None,
+            hints: Hints::default(),
+            events: Vec::new(),
+            history: History::in_memory(),
+        }
     }
 
-    /// Re-read settings.toml if it changed on disk.
+    fn push_event(&mut self, e: Event) {
+        if self.events.len() >= MAX_EVENTS {
+            self.events.remove(0);
+        }
+        self.events.push(e);
+    }
+
+    /// Events since the last call, oldest first.
+    pub fn take_events(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// The memory history this engine records.
+    pub fn history(&self) -> &History {
+        &self.history
+    }
+
+    /// Re-read the settings if settings.toml or team.toml changed on disk.
     pub fn reload(&mut self, force: bool) {
-        let path = crate::paths::config_file();
-        let stamp = fs::metadata(&path).and_then(|m| m.modified()).ok();
-        if !force && stamp.is_some() && stamp == self.cfg_stamp {
+        let stamp = settings_stamp();
+        if !force && self.cfg_stamp == Some(stamp) {
             return;
         }
-        match Config::load() {
-            Ok(cfg) => {
-                if self.cfg_stamp.is_some() {
+        let first = self.cfg_stamp.is_none();
+        match crate::config::load_layered() {
+            Ok((cfg, warnings)) => {
+                for w in &warnings {
+                    crate::log::write(&format!("settings: {}", w));
+                }
+                if !first {
                     self.restore_all(); // undo the old settings before applying new ones
                 }
                 self.jobs.clear();
-                for g in &cfg.groups {
+                for g in cfg.active_groups() {
                     if g.hard_cap_mb > 0 || g.hard_cap_per_process_mb > 0 {
                         let name = format!("Local\\AtherMemGuard-{}", g.name);
                         match win::Job::create(Some(&name), g.hard_cap_per_process_mb * MB, g.hard_cap_mb * MB, false) {
@@ -420,26 +555,81 @@ impl Engine {
                         }
                     }
                 }
-                crate::log::write(&format!("settings loaded: {} groups, every {} s", cfg.groups.len(), cfg.interval_sec));
+                crate::log::write(&format!(
+                    "settings loaded: {} groups, preset {}, every {} s",
+                    cfg.active_groups().count(),
+                    cfg.general.preset.label(),
+                    cfg.interval_sec
+                ));
+                self.history.set_keep_days(cfg.history.keep_days);
                 self.cfg = cfg;
+                if !first {
+                    self.push_event(Event::SettingsReloaded);
+                }
             }
-            Err(e) => crate::log::write(&format!("settings error, keeping previous settings: {}", e)),
+            Err(e) => {
+                crate::log::write(&format!("settings error, keeping previous settings: {}", e));
+                self.push_event(Event::SettingsError(e));
+            }
         }
-        self.cfg_stamp = fs::metadata(&path).and_then(|m| m.modified()).ok();
+        // Loading may have written the template or migrated the file: stamp after it.
+        self.cfg_stamp = Some(settings_stamp());
     }
 
-    /// One pass: measure, decide, enforce, publish status.json.
+    /// One pass: measure, decide, enforce, record history, publish status.json.
     pub fn tick(&mut self) -> Status {
         self.reload(false);
+        if self.pause_expired(Instant::now()) {
+            self.set_paused(false);
+        }
         let snap = snapshot();
         let mut st = analyze(&self.cfg, &snap);
         st.daemon = true;
         st.paused = self.paused;
+        if self.cfg.history.enabled {
+            self.history.record(&st);
+        } else {
+            self.history.record_memory(&st);
+        }
+        let prime_reason = self.observe(&st);
         if !self.paused {
             self.apply(&snap, &mut st);
+            if let Some(reason) = prime_reason {
+                self.auto_prime(reason, &snap, &st);
+            }
         }
         write_status(&st);
         st
+    }
+
+    /// Compare this status with the previous one: queue pressure and editor events, and say
+    /// whether a build or cook just started and auto-prime should run.
+    fn observe(&mut self, st: &Status) -> Option<&'static str> {
+        if let Some(prev) = self.prev_level {
+            if prev != st.pressure {
+                self.push_event(Event::PressureChanged { from: prev, to: st.pressure });
+            }
+        }
+        self.prev_level = Some(st.pressure);
+        let reason = auto_prime_reason(self.prev_activities, st.activities);
+        self.prev_activities = Some(st.activities);
+        let history = &self.history;
+        let hints = self.hints.update(&self.cfg, st, |pid| history.editor_growth_gb_per_hour(pid));
+        for e in hints {
+            self.push_event(e);
+        }
+        reason.filter(|_| self.cfg.general.auto_prime && !self.paused)
+    }
+
+    /// Trim every group once because a build or cook just started.
+    fn auto_prime(&mut self, reason: &'static str, snap: &Snapshot, st: &Status) {
+        let groups_ram_before_gb = (st.groups.iter().map(|g| g.ram_mb).sum::<u64>() as f64 / 102.4).round() / 10.0;
+        let trimmed = crate::ops::trim_groups(&self.cfg, &snap.procs);
+        crate::log::write(&format!(
+            "auto-prime: {} started, trimmed {} processes (app groups held {:.1} GB)",
+            reason, trimmed, groups_ram_before_gb
+        ));
+        self.push_event(Event::AutoPrimed { reason, trimmed, groups_ram_before_gb });
     }
 
     fn apply(&mut self, snap: &Snapshot, st: &mut Status) {
@@ -596,19 +786,42 @@ impl Engine {
             self.restore_cpu(pid);
         }
         let procs = win::list_processes();
-        for g in &self.cfg.groups {
+        for g in self.cfg.active_groups() {
             for p in procs.iter().filter(|p| any_matches(&g.processes, &p.name) && !is_protected(&self.cfg, p)) {
                 win::set_memory_priority(p.pid, MemPriority::Normal.value());
             }
         }
     }
 
+    /// Pause until resumed (`true`) or resume now (`false`). Pausing puts every app back to
+    /// normal.
     pub fn set_paused(&mut self, paused: bool) {
         self.paused = paused;
+        self.paused_until = None;
         if paused {
             self.restore_all();
         }
         crate::log::write(if paused { "paused, apps restored to normal" } else { "resumed" });
+    }
+
+    /// Pause for a while; the engine resumes by itself on the first tick after `d`.
+    pub fn pause_for(&mut self, d: Duration) {
+        self.set_paused(true);
+        self.paused_until = Some(Instant::now() + d);
+        crate::log::write(&format!("paused for {} min", d.as_secs().div_ceil(60)));
+    }
+
+    /// When a timed pause ends. `None` when running or paused until resumed.
+    pub fn pause_until(&self) -> Option<Instant> {
+        if self.paused {
+            self.paused_until
+        } else {
+            None
+        }
+    }
+
+    fn pause_expired(&self, now: Instant) -> bool {
+        self.paused && self.paused_until.is_some_and(|t| now >= t)
     }
 }
 
@@ -652,14 +865,215 @@ mod tests {
     fn policy_overrides_stack() {
         let cfg = Config::builtin();
         let browsers = &cfg.groups[0];
-        let idle = effective(browsers, false, Level::Normal);
-        assert_eq!((idle.priority, idle.trim_above_mb, idle.cpu), (MemPriority::Low, 6144, Cpu::Normal));
-        let ue = effective(browsers, true, Level::Normal);
-        assert_eq!(ue.trim_above_mb, 3072);
-        let elevated = effective(browsers, true, Level::Elevated);
-        assert_eq!((elevated.trim_above_mb, elevated.cpu), (1024, Cpu::Below));
-        let critical = effective(browsers, true, Level::Critical);
-        assert_eq!((critical.trim_above_mb, critical.cpu, critical.suspend), (256, Cpu::Below, false));
+        let ram = 128 * 1024;
+        let b = Preset::Balanced;
+        let idle = effective(browsers, false, Level::Normal, b, ram);
+        assert_eq!((idle.priority, idle.trim_above_mb, idle.cpu), (MemPriority::Low, 6291, Cpu::Normal));
+        let ue = effective(browsers, true, Level::Normal, b, ram);
+        assert_eq!(ue.trim_above_mb, 3146);
+        let elevated = effective(browsers, true, Level::Elevated, b, ram);
+        assert_eq!((elevated.trim_above_mb, elevated.cpu), (1049, Cpu::Below));
+        let critical = effective(browsers, true, Level::Critical, b, ram);
+        assert_eq!((critical.trim_above_mb, critical.cpu, critical.suspend), (262, Cpu::Below, false));
+    }
+
+    #[test]
+    fn soft_caps_scale_with_ram_and_preset() {
+        let cfg = Config::builtin();
+        let browsers = &cfg.groups[0];
+        let chat = &cfg.groups[1];
+        // Browsers idle soft cap (4.8%) and Chat critical (0.05%, under the floor).
+        let cases = [(16u64, 786u64), (32, 1573), (64, 3146), (128, 6291)];
+        for (gb, mb) in cases {
+            let ram = gb * 1024;
+            let at = |p: Preset| effective(browsers, false, Level::Normal, p, ram).trim_above_mb;
+            assert_eq!(at(Preset::Balanced), mb, "{} GB", gb);
+            assert_eq!(at(Preset::Gentle), mb * 2, "{} GB", gb);
+            assert_eq!(at(Preset::Aggressive), ((mb as f64 * 0.5).round() as u64).max(128), "{} GB", gb);
+            assert_eq!(effective(chat, true, Level::Critical, Preset::Balanced, ram).trim_above_mb, 128);
+        }
+        // Agents have no base soft cap: 0 stays off under every preset.
+        let agents = &cfg.groups[2];
+        assert_eq!(effective(agents, true, Level::Normal, Preset::Aggressive, 16 * 1024).trim_above_mb, 0);
+        // MB wins over percent within one table.
+        let mut g = browsers.clone();
+        g.trim_above_mb = Some(2000);
+        assert_eq!(effective(&g, false, Level::Normal, Preset::Balanced, 64 * 1024).trim_above_mb, 2000);
+        assert_eq!(effective(&g, false, Level::Normal, Preset::Aggressive, 64 * 1024).trim_above_mb, 1000);
+    }
+
+    #[test]
+    fn aggressive_lowers_cpu_while_unreal_runs() {
+        let cfg = Config::builtin();
+        let ram = 32 * 1024;
+        let browsers = &cfg.groups[0];
+        let background = &cfg.groups[3]; // cpu = "eco", stronger than below: kept
+        assert_eq!(effective(browsers, false, Level::Normal, Preset::Aggressive, ram).cpu, Cpu::Normal);
+        assert_eq!(effective(browsers, true, Level::Normal, Preset::Aggressive, ram).cpu, Cpu::Below);
+        assert_eq!(effective(browsers, true, Level::Normal, Preset::Balanced, ram).cpu, Cpu::Normal);
+        assert_eq!(effective(background, true, Level::Normal, Preset::Aggressive, ram).cpu, Cpu::Eco);
+    }
+
+    #[test]
+    fn auto_prime_fires_on_rising_edge_only() {
+        let a = |editor, build, cook| Activities { editor, build, cook };
+        assert_eq!(auto_prime_reason(None, a(false, true, false)), None); // first tick is a baseline
+        assert_eq!(auto_prime_reason(Some(a(false, false, false)), a(false, true, false)), Some("build"));
+        assert_eq!(auto_prime_reason(Some(a(true, false, false)), a(true, false, true)), Some("cook"));
+        assert_eq!(auto_prime_reason(Some(a(false, true, false)), a(false, true, false)), None);
+        assert_eq!(auto_prime_reason(Some(a(false, true, false)), a(false, true, true)), Some("cook"));
+        assert_eq!(auto_prime_reason(Some(a(false, true, true)), a(false, false, false)), None);
+        assert_eq!(auto_prime_reason(Some(a(false, false, false)), a(true, false, false)), None);
+        assert_eq!(auto_prime_reason(Some(a(false, false, false)), a(false, true, true)), Some("build"));
+    }
+
+    fn status(level: Level, act: Activities, editors: &[(u32, f64)]) -> Status {
+        Status {
+            time: "2026-11-14 12:00:00".into(),
+            daemon: true,
+            paused: false,
+            mode: act.label(),
+            activities: act,
+            pressure: level,
+            system: SystemStatus::from(&sys(32, 10, 48, 20)),
+            ue: UeStatus {
+                processes: editors
+                    .iter()
+                    .map(|&(pid, gb)| UeProcess {
+                        pid,
+                        name: "UnrealEditor".into(),
+                        kind: "editor",
+                        committed_gb: gb,
+                        ram_gb: gb,
+                        uptime_min: 60,
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            groups: Vec::new(),
+            advice: Vec::new(),
+            worker_pids: Vec::new(),
+        }
+    }
+
+    fn test_engine() -> Engine {
+        let mut cfg = Config::builtin();
+        cfg.groups.clear(); // nothing to touch even if restore_all runs
+        Engine::with_config(cfg)
+    }
+
+    #[test]
+    fn observe_queues_pressure_and_auto_prime() {
+        let mut e = test_engine();
+        let idle = Activities::default();
+        let build = Activities { build: true, ..Default::default() };
+        assert_eq!(e.observe(&status(Level::Normal, idle, &[])), None);
+        assert!(e.take_events().is_empty());
+        assert_eq!(e.observe(&status(Level::Elevated, build, &[])), Some("build"));
+        assert_eq!(e.take_events(), vec![Event::PressureChanged { from: Level::Normal, to: Level::Elevated }]);
+        assert_eq!(e.observe(&status(Level::Elevated, build, &[])), None);
+        assert!(e.take_events().is_empty());
+        // Turned off in settings: no auto-prime.
+        e.cfg.general.auto_prime = false;
+        e.observe(&status(Level::Elevated, idle, &[]));
+        assert_eq!(e.observe(&status(Level::Elevated, build, &[])), None);
+        // Paused: no auto-prime either.
+        e.cfg.general.auto_prime = true;
+        e.observe(&status(Level::Elevated, idle, &[]));
+        e.paused = true;
+        assert_eq!(e.observe(&status(Level::Elevated, build, &[])), None);
+    }
+
+    #[test]
+    fn restart_hint_fires_once_per_process_until_it_clears() {
+        let mut e = test_engine();
+        e.cfg.ue.editor_restart_hint_gb = 48.0;
+        e.cfg.ue.editor_growth_alert_gb_per_hour = 0.0;
+        let act = Activities { editor: true, ..Default::default() };
+        let hints = |e: &mut Engine, editors: &[(u32, f64)]| {
+            e.observe(&status(Level::Normal, act, editors));
+            e.take_events()
+        };
+        assert!(hints(&mut e, &[(10, 40.0)]).is_empty());
+        assert_eq!(hints(&mut e, &[(10, 50.0)]), vec![Event::EditorRestartHint { pid: 10, committed_gb: 50.0 }]);
+        assert!(hints(&mut e, &[(10, 55.0)]).is_empty());
+        // A second editor gets its own hint.
+        assert_eq!(hints(&mut e, &[(10, 55.0), (11, 60.0)]), vec![Event::EditorRestartHint { pid: 11, committed_gb: 60.0 }]);
+        // Cleared (memory dropped), then over again: fires again.
+        assert!(hints(&mut e, &[(10, 30.0), (11, 60.0)]).is_empty());
+        assert_eq!(hints(&mut e, &[(10, 49.0), (11, 60.0)]), vec![Event::EditorRestartHint { pid: 10, committed_gb: 49.0 }]);
+        // The process exits; a new one with a recycled PID can be hinted again.
+        assert!(hints(&mut e, &[]).is_empty());
+        assert_eq!(hints(&mut e, &[(11, 60.0)]).len(), 1);
+    }
+
+    #[test]
+    fn growth_hint_fires_once_with_hysteresis() {
+        let mut hints = Hints::default();
+        let mut cfg = Config::builtin();
+        cfg.ue.editor_growth_alert_gb_per_hour = 6.0;
+        cfg.ue.editor_restart_hint_gb = 0.0;
+        let st = status(Level::Normal, Activities { editor: true, ..Default::default() }, &[(10, 30.0)]);
+        let mut run = |g: Option<f64>| hints.update(&cfg, &st, |_| g);
+        assert!(run(None).is_empty());
+        assert!(run(Some(5.0)).is_empty());
+        assert_eq!(run(Some(7.04)), vec![Event::EditorGrowing { pid: 10, gb_per_hour: 7.0, committed_gb: 30.0 }]);
+        assert!(run(Some(8.0)).is_empty());
+        assert!(run(Some(4.0)).is_empty()); // below the alert but above half: not cleared
+        assert!(run(Some(6.5)).is_empty());
+        assert!(run(Some(2.0)).is_empty()); // cleared
+        assert_eq!(run(Some(6.0)).len(), 1);
+        // 0 = off.
+        cfg.ue.editor_growth_alert_gb_per_hour = 0.0;
+        let mut hints = Hints::default();
+        assert!(hints.update(&cfg, &st, |_| Some(100.0)).is_empty());
+    }
+
+    #[test]
+    fn growth_hint_uses_history() {
+        let mut e = test_engine();
+        e.cfg.ue.editor_restart_hint_gb = 0.0;
+        e.cfg.ue.editor_growth_alert_gb_per_hour = 6.0;
+        let act = Activities { editor: true, ..Default::default() };
+        let mut fired = Vec::new();
+        for i in 0..=120 {
+            let gb = 20.0 + 12.0 * (i * 10) as f64 / 3600.0; // 12 GB/h
+            let mut s = crate::history::Sample::from_status(&status(Level::Normal, act, &[(10, gb)]), 1_794_000_000 + i * 10);
+            s.time = "2026-11-14 12:00:00".into();
+            e.history.push(s);
+            e.observe(&status(Level::Normal, act, &[(10, gb)]));
+            fired.extend(e.take_events());
+        }
+        assert_eq!(fired.len(), 1, "{:?}", fired);
+        assert!(matches!(fired[0], Event::EditorGrowing { pid: 10, gb_per_hour, .. } if (gb_per_hour - 12.0).abs() < 0.2));
+    }
+
+    #[test]
+    fn timed_pause_expires() {
+        let mut e = test_engine();
+        assert_eq!(e.pause_until(), None);
+        e.pause_for(Duration::from_secs(1800));
+        assert!(e.paused);
+        let until = e.pause_until().unwrap();
+        assert!(!e.pause_expired(until - Duration::from_secs(1)));
+        assert!(e.pause_expired(until));
+        assert!(e.pause_expired(until + Duration::from_secs(60)));
+        // Resuming by hand clears the timer; pausing indefinitely has none.
+        e.set_paused(false);
+        assert_eq!(e.pause_until(), None);
+        e.set_paused(true);
+        assert_eq!(e.pause_until(), None);
+        assert!(!e.pause_expired(Instant::now() + Duration::from_secs(86_400)));
+    }
+
+    #[test]
+    fn events_are_capped() {
+        let mut e = test_engine();
+        for _ in 0..(MAX_EVENTS + 10) {
+            e.push_event(Event::SettingsReloaded);
+        }
+        assert_eq!(e.take_events().len(), MAX_EVENTS);
+        assert!(e.take_events().is_empty());
     }
 
     #[test]

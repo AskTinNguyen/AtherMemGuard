@@ -35,7 +35,7 @@ when memory gets tight and 256 MB when it's critical.
 | Control | What it does | Risk |
 |---|---|---|
 | `priority` | Windows takes RAM from lower-priority apps first | None |
-| `trim_above_mb` (soft cap) | Over the limit, the group's memory is pushed to the compressed store / page file | A short lag when you switch back to the app |
+| `trim_above_pct` / `trim_above_mb` (soft cap) | Over the limit, the group's memory is pushed to the compressed store / page file | A short lag when you switch back to the app |
 | `cpu` (throttle) | `below` / `idle` CPU priority, or `eco` (Windows efficiency mode) | App runs slower while throttled |
 | `suspend` | Freezes the group until pressure drops | App is unresponsive while frozen. Off by default |
 | `hard_cap_mb`, `hard_cap_per_process_mb` | Job Object limit on committed memory | The app crashes when it hits the cap. Off by default |
@@ -66,6 +66,8 @@ memguard run --cap-gb 48 [--per-process-cap-gb N] [--priority low] [--cpu below]
                                   run a command (and its children) under a hard memory cap;
                                   the command's exit code is passed through
 memguard advise [--json]            suggested -MaxParallelActions for the memory available now
+memguard history [--hours 1] [--json]    memory history the background app recorded
+memguard config show | set | reset | export | import | team    see Settings
 memguard stop | daemon | config [--check | --reset] | install | uninstall
 ```
 
@@ -80,9 +82,78 @@ The tray app also writes `%APPDATA%\AtherMemGuard\status.json` every interval, w
 
 ## Settings
 
-`%APPDATA%\AtherMemGuard\settings.toml` (tray menu → Settings). Saved changes apply within one
-interval; a mistake keeps the previous settings and is reported in the log. `memguard config --check`
-validates the file. The default file documents every key.
+Your settings are in `%APPDATA%\AtherMemGuard\settings.toml` (tray menu → Settings). Saved changes apply
+within one interval. If a change has a mistake, MemGuard keeps the previous settings and reports it in the log.
+
+**Layers.** The settings in effect are the built-in defaults, then `team.toml` in the same folder if your
+team gave you one, then your `settings.toml`. Each layer only changes the keys it sets. Tables merge key by
+key, and `[[group]]` entries merge by `name`: a group with a built-in name changes only the keys you set,
+and a new name adds a group. A new `settings.toml` is mostly comments: it documents every key, and only
+`[general] preset` is set. A 0.1 settings file you never edited is replaced by the new template the first time
+0.2 runs, and the old file is kept as `settings.toml.bak`. A 0.1 file you edited stays as it is and still works,
+on top of the new defaults.
+
+**Presets.** `[general] preset = "gentle" | "balanced" | "aggressive"` scales every soft cap: ×2, ×1 or ×0.5.
+Aggressive also gives every group `cpu = "below"` while Unreal is running, unless the group already has a
+stronger CPU setting (`idle`, `eco`).
+
+**Limits that scale with RAM.** A group, or its `[group.ue]`, `[group.elevated]` and `[group.critical]`
+overrides, can set its soft cap as `trim_above_pct` (percent of total RAM) or as `trim_above_mb`. If one table
+sets both, MB is used. A layer that sets either replaces the soft cap from the layers below it. After the preset,
+a soft cap is never below 128 MB (0 still means off). The built-in groups use percentages, so the browser cap is
+4.8% of RAM: about 6 GB on a 128 GB PC and 1.5 GB on a 32 GB PC. `enabled = false` makes MemGuard leave a group
+alone.
+
+New keys in 0.2:
+
+```toml
+[general]
+preset = "balanced"            # gentle | balanced | aggressive
+notifications = true           # toasts for pressure changes, updates and hints
+auto_prime = true              # trim every group the moment a build or cook starts
+prime_hotkey = "Ctrl+Alt+M"    # empty = no hotkey
+
+[updates]
+check_automatically = true
+manifest_url = ""              # empty = the built-in GitHub URL
+
+[history]
+enabled = true                 # keep a memory history in history\YYYY-MM-DD.csv
+keep_days = 7                  # day files this old are deleted
+
+[ue]
+editor_growth_alert_gb_per_hour = 6   # tell you when an editor keeps growing this fast; 0 = off
+
+[[group]]
+name = "Browsers"
+enabled = true
+trim_above_pct = 4.8
+```
+
+**Changing settings from the command line.** You can edit the file, or use these commands, which keep your
+comments:
+
+```
+memguard config                      where settings.toml is
+memguard config --check              check every layer and report the first problem
+memguard config --reset              replace settings.toml with the template (old file kept as .bak)
+memguard config show                 print the settings in effect, all layers merged
+memguard config set general.preset aggressive
+memguard config set group.Browsers.trim_above_pct 3
+memguard config set group.Browsers.ue.trim_above_mb 2048
+memguard config reset group.Browsers.trim_above_pct   go back to the team or built-in value
+memguard config export my-settings.toml      the settings in effect, as one file
+memguard config import my-settings.toml      check it, keep settings.toml as .bak, replace it
+memguard config team team.toml               check it and install it as team.toml
+```
+
+`config set` reads the value as TOML when it can (`3`, `true`, `["chrome", "msedge"]`) and as text otherwise
+(`aggressive`). It writes nothing if the result would be invalid.
+
+**History.** The background app records memory every interval: in memory for the last 24 hours, and in a CSV
+file per day in `%APPDATA%\AtherMemGuard\history`. `memguard history [--hours N] [--json]` prints it. When an
+editor's committed memory keeps growing (a least-squares slope over 30 minutes, at least 10 minutes of samples)
+faster than `editor_growth_alert_gb_per_hour`, MemGuard says so once for that editor process.
 
 The `[prime]` headroom targets and the 3 GB-per-compile-action figure in `memguard advise` are starting
 points, not measurements of your project. Tune them.

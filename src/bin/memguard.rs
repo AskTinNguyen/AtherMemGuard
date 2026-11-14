@@ -48,6 +48,125 @@ enum CpuArg {
     Eco,
 }
 
+// ---------------------------------------------------------------- config subcommands (0.2)
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Print the settings in effect (built-in defaults, team.toml and settings.toml merged)
+    Show,
+    /// Write the settings in effect to a file, to share or keep
+    Export { file: std::path::PathBuf },
+    /// Replace settings.toml with a file (checked first; the old one is kept as .bak)
+    Import { file: std::path::PathBuf },
+    /// Install a file as team.toml: defaults for everyone, under your own settings
+    Team { file: std::path::PathBuf },
+    /// Set one value in settings.toml, e.g. `general.preset aggressive` or
+    /// `group.Browsers.trim_above_pct 3`
+    Set { path: String, value: String },
+    /// Remove your value for a setting, so the team or built-in value applies again
+    Reset { path: String },
+}
+
+/// A value from the command line: TOML if it parses (`3`, `true`, `["a", "b"]`, `"x"`),
+/// otherwise a plain string (`aggressive`).
+fn cli_value(s: &str) -> toml_edit::Item {
+    match s.trim().parse::<toml_edit::Value>() {
+        Ok(v) => toml_edit::Item::Value(v),
+        Err(_) => toml_edit::value(s),
+    }
+}
+
+fn config_cmd(action: ConfigCmd) -> ExitCode {
+    use athermemguard::config as c;
+    let result = match action {
+        ConfigCmd::Show => c::effective_toml().map(|text| print!("{}", text)),
+        ConfigCmd::Export { file } => {
+            c::export_to(&file).map(|_| println!("Wrote the settings in effect to {}.", file.display()))
+        }
+        ConfigCmd::Import { file } => c::import_from(&file).map(|_| {
+            println!("Imported {}. Your previous settings are in settings.toml.bak.", file.display())
+        }),
+        ConfigCmd::Team { file } => c::install_team_file(&file).map(|_| {
+            println!("Installed {} as {}. Your own settings still win over it.", file.display(), c::team_file().display())
+        }),
+        ConfigCmd::Set { path, value } => c::set_user_value(&path, cli_value(&value)).map(|_| {
+            println!("Set {} = {}. Ather MemGuard picks it up within one interval.", path, value)
+        }),
+        ConfigCmd::Reset { path } => c::reset_user_value(&path).map(|_| {
+            let from = match c::value_layer(&path) {
+                c::Layer::Team => "team.toml",
+                _ => "the built-in default",
+            };
+            println!("{} now comes from {}.", path, from)
+        }),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{}", e);
+            ExitCode::from(1)
+        }
+    }
+}
+
+// ---------------------------------------------------------------- history subcommand (0.2)
+
+fn history_cmd(hours: u64, json: bool) -> ExitCode {
+    let samples = athermemguard::history::load_since(Duration::from_secs(hours.max(1) * 3600));
+    if json {
+        print_json(&samples);
+        return ExitCode::SUCCESS;
+    }
+    if samples.is_empty() {
+        println!(
+            "No memory history for the last {} h. The background app records it every interval in {}.",
+            hours.max(1),
+            athermemguard::history::history_dir().display()
+        );
+        return ExitCode::SUCCESS;
+    }
+    // Keep the table short: at most about 120 rows, always ending with the latest sample.
+    let step = samples.len().div_ceil(120).max(1);
+    let last = samples.len() - 1;
+    let rows: Vec<&athermemguard::history::Sample> =
+        samples.iter().enumerate().filter(|(i, _)| (last - i) % step == 0).map(|(_, s)| s).collect();
+    let groups: Vec<String> = rows.last().map(|s| s.groups.iter().map(|g| g.name.clone()).collect()).unwrap_or_default();
+    let mut header = format!(
+        "{:<19}  {:<12} {:<8} {:>8} {:>8} {:>8} {:>8} {:>7}",
+        "time", "mode", "pressure", "RAM free", "commit", "UE", "editor", "workers"
+    );
+    for g in &groups {
+        header.push_str(&format!(" {:>10}", g));
+    }
+    println!("{}", header);
+    for s in rows {
+        let mut line = format!(
+            "{:<19}  {:<12} {:<8} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>7}",
+            s.time,
+            s.mode,
+            s.pressure.label(),
+            s.ram_free_gb,
+            s.commit_free_gb,
+            s.ue_committed_gb,
+            s.editor_committed_gb,
+            s.workers
+        );
+        for g in &groups {
+            match s.groups.iter().find(|x| &x.name == g) {
+                Some(x) => line.push_str(&format!(" {:>10.2}", x.ram_gb)),
+                None => line.push_str(&format!(" {:>10}", "-")),
+            }
+        }
+        println!("{}", line);
+    }
+    println!(
+        "{} samples{}; GB. RAM free and commit are free memory; UE, editor and groups are memory in use.",
+        samples.len(),
+        if step > 1 { format!(", every {}th shown", step) } else { String::new() }
+    );
+    ExitCode::SUCCESS
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Show memory, what Unreal is doing, and what each app group is getting
@@ -128,14 +247,26 @@ enum Cmd {
     /// Write the app icon to a file (used by the build)
     #[command(hide = true)]
     WriteIcon { path: std::path::PathBuf },
-    /// Show where the settings file is, or check it for mistakes
+    /// Show where the settings file is, check it, or change it
+    #[command(args_conflicts_with_subcommands = true)]
     Config {
-        /// Validate settings.toml and report the first problem
+        /// Validate the settings (built-in, team.toml, settings.toml) and report the first problem
         #[arg(long)]
         check: bool,
-        /// Replace settings.toml with the built-in defaults (the old file is kept as .bak)
+        /// Replace settings.toml with the default template (the old file is kept as .bak)
         #[arg(long)]
         reset: bool,
+        #[command(subcommand)]
+        action: Option<ConfigCmd>,
+    },
+    /// Show the memory history the background app records
+    History {
+        /// How far back, in hours
+        #[arg(long, default_value_t = 1)]
+        hours: u64,
+        /// Machine-readable output (every sample)
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -407,7 +538,11 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
 
-        Cmd::Config { check, reset } => {
+        Cmd::Config { action: Some(action), .. } => config_cmd(action),
+
+        Cmd::History { hours, json } => history_cmd(hours, json),
+
+        Cmd::Config { check, reset, action: None } => {
             let path = paths::config_file();
             if reset {
                 if path.exists() {
@@ -423,9 +558,12 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             if check {
-                return match Config::load() {
-                    Ok(cfg) => {
+                return match athermemguard::config::load_layered() {
+                    Ok((cfg, warnings)) => {
                         println!("{} is valid: {} groups.", path.display(), cfg.groups.len());
+                        for w in warnings {
+                            println!("note: {}", w);
+                        }
                         ExitCode::SUCCESS
                     }
                     Err(e) => {

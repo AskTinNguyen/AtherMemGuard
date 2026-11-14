@@ -72,6 +72,28 @@ fn find_orphans<'a>(cfg: &Config, procs: &'a [win::Proc]) -> Vec<&'a win::Proc> 
         .collect()
 }
 
+//// Give every enabled group's processes the lowest memory priority the group ever gets and
+/// trim them, whatever the current pressure. Returns how many processes were trimmed. Used
+/// by `prime` and by the engine's auto-prime.
+pub fn trim_groups(cfg: &Config, procs: &[win::Proc]) -> usize {
+    let mut trimmed = 0usize;
+    for g in cfg.active_groups() {
+        let lowest = [&g.critical, &g.elevated, &g.ue]
+            .iter()
+            .filter_map(|p| p.as_ref().and_then(|p| p.priority))
+            .chain(g.priority)
+            .min_by_key(|p| p.value())
+            .unwrap_or(MemPriority::Low);
+        for p in procs.iter().filter(|p| any_matches(&g.processes, &p.name) && !is_protected(cfg, p)) {
+            win::set_memory_priority(p.pid, lowest.value());
+            if win::trim(p.pid) {
+                trimmed += 1;
+            }
+        }
+    }
+    trimmed
+}
+
 /// Free as much RAM as possible for Unreal right now: every group gets its lowest
 /// memory priority and is trimmed, whatever the current pressure level.
 pub fn prime(cfg: &Config, target: Option<&str>, kill_orphans: bool) -> PrimeReport {
@@ -80,21 +102,7 @@ pub fn prime(cfg: &Config, target: Option<&str>, kill_orphans: bool) -> PrimeRep
     let groups_gb = |st: &crate::engine::Status| (st.groups.iter().map(|g| g.ram_mb).sum::<u64>() as f64 / 102.4).round() / 10.0;
     let groups_ram_before_gb = groups_gb(&analyze(cfg, &before_snap));
 
-    let mut trimmed = 0usize;
-    for g in &cfg.groups {
-        let lowest = [&g.critical, &g.elevated, &g.ue]
-            .iter()
-            .filter_map(|p| p.as_ref().and_then(|p| p.priority))
-            .chain(g.priority)
-            .min_by_key(|p| p.value())
-            .unwrap_or(MemPriority::Low);
-        for p in before_snap.procs.iter().filter(|p| any_matches(&g.processes, &p.name) && !is_protected(cfg, p)) {
-            win::set_memory_priority(p.pid, lowest.value());
-            if win::trim(p.pid) {
-                trimmed += 1;
-            }
-        }
-    }
+    let trimmed = trim_groups(cfg, &before_snap.procs);
 
     let mut orphans = Vec::new();
     for p in find_orphans(cfg, &before_snap.procs) {
