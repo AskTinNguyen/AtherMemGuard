@@ -3,6 +3,20 @@
 Keeps a Windows PC primed for agentic Unreal Engine work: the editor, local builds and cooks get
 memory first, and everything else (browsers, chat apps, agent apps, launchers) gives it up.
 
+**Download:** [the latest release](https://github.com/AskTinNguyen/AtherMemGuard/releases/latest) has
+`AtherMemGuard-Setup-<version>.exe`. What changed in each version is in [RELEASE_NOTES.md](RELEASE_NOTES.md).
+
+What it does, in short:
+
+- **Holds other apps back** so Unreal gets the memory: soft caps that tighten while the editor runs and as
+  memory gets tight, with presets and team defaults. See [How it decides](#how-it-decides).
+- **Frees memory when a build or cook starts**, and on demand from the tray or a shortcut.
+- **Checkup:** finds apps Unreal work doesn't need and offers to close them, stop them starting with
+  Windows, or keep them closed while Unreal runs. Everything it does can be undone.
+- **RAM and BIOS check:** tells you if your RAM runs slower than it was sold to run, with the BIOS steps.
+- **Memory history** and an alert when the editor keeps growing.
+- **For agents:** a command line and an MCP server, so an agent can wait for headroom before a build or cook.
+
 Two small programs, no admin rights, no runtime to install:
 
 - `AtherMemGuard.exe`: the background app. Sits in the tray, checks every 10 seconds, enforces the rules.
@@ -47,7 +61,8 @@ paused. Its tooltip says the Unreal mode, the pressure and RAM / commit free.
 - **Right-click** opens the menu: Free memory now, Pause for 30 minutes, Pause until I resume, Settings,
   Memory history, Run a checkup, Check for updates, Run at Windows startup, Quit.
 - **Double-click** opens Settings.
-- **Ctrl+Alt+M** (change it in Settings) frees memory from anywhere.
+- **Ctrl+Alt+M** (change it in Settings) frees memory from anywhere. If another app already uses that
+  shortcut, a toast says so once and the shortcut stays off until you pick another.
 
 Toasts appear bottom right, only when something changed that you'd want to know: memory became critical (and
 fine again), memory was freed for a build or cook, the editor is big or growing fast, an update is ready, a
@@ -147,6 +162,23 @@ teammates who can reach its releases**; for everyone else the check fails quietl
 the version it has. Teams can host the files elsewhere and point `[updates] manifest_url` at their own
 `latest.json`.
 
+## Known limits
+
+- **Not code-signed.** SmartScreen warns once per download.
+- **Updates need reachable releases.** See [Updates](#updates).
+- **Soft caps free RAM, not commit.** If Windows runs out of commit (apps fail with RAM still free), the fix
+  is a larger page file; the checkup says when yours is small.
+- **Checkup:** startup tasks of Microsoft Store apps aren't listed. A background app with no window may
+  ignore the request to close; the result then says "still open". An app on the "close whenever Unreal is
+  running" list is closed even if it is a console program.
+- **RAM and BIOS check:** it recognises the common kits from G.Skill, Corsair, Kingston, Crucial, TeamGroup,
+  ADATA, Patriot, Samsung, SK hynix and Micron; anything else is reported as "couldn't tell", never guessed.
+  It can't know the newest BIOS version, only how old yours is. BIOS menu names differ between board
+  models, so treat the steps as a guide to where the setting lives.
+- **Silent install from scripts:** `--install` starts the tray app, which keeps running. A script that
+  waits for the whole process tree (PowerShell's `Start-Process -Wait`) will wait forever; wait on the
+  installer process itself, or pass `--no-start`.
+
 ## How it decides
 
 Every interval MemGuard works out two things:
@@ -214,7 +246,8 @@ The tray app also writes `%APPDATA%\AtherMemGuard\status.json` every interval, w
 
 `memguard mcp` is an MCP server over stdio, so Claude Code, Codex and other coding agents can call
 MemGuard as tools: `memguard_status`, `memguard_prime`, `memguard_wait`, `memguard_advise`,
-`memguard_history`, `memguard_doctor` and `memguard_ram` (both read-only). The agent
+`memguard_history`, `memguard_doctor` and `memguard_ram`. Only `memguard_prime` and `memguard_wait` with
+`prime` change anything (they free memory); the rest are read-only. The agent
 starts it by itself; there is no port and nothing to enable. Run `memguard agent-setup` for ready-to-paste
 setup, or add it to Claude Code with:
 
@@ -244,7 +277,7 @@ memguard doctor --undo [<undo id>]       reverse the last cleanup, or one action
 What it reports:
 
 - **Not needed for Unreal** (`close`): game launchers, Spotify, Widgets, Copilot, Phone Link, lighting and
-  peripheral suites, GPU overlays and similar, from a built-in catalogue of over 150 process names.
+  peripheral suites, GPU overlays and similar, from a built-in catalogue of 142 apps.
 - **Starts with Windows**: Run-key and Startup-folder entries for those apps. Yours can be switched off the
   way Task Manager does it; machine-wide ones need an administrator and are only reported.
 - **Big tools you might not be using** (`heavy_tool`): Blender, Maya, Photoshop, Docker, WSL, local AI
