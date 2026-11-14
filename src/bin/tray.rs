@@ -102,12 +102,7 @@ fn main() {
         Command::Install(opts) => run_install(opts),
         Command::UiSnapshots(dir) => {
             let dir = std::path::Path::new(&dir);
-            // INTEGRATION: drop the flyout call once ui::snapshots::write_all includes it.
-            let result = athermemguard::ui::snapshots::write_all(dir).and_then(|mut a| {
-                a.extend(athermemguard::ui::flyout::snapshots(dir)?);
-                Ok(a)
-            });
-            match result {
+            match athermemguard::ui::snapshots::write_all(dir) {
                 Ok(files) => {
                     log::write(&format!("wrote {} UI snapshots to {}", files.len(), dir.display()));
                     0

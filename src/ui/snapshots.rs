@@ -1,4 +1,4 @@
-//! Paint every Part D surface off-screen with fixed sample data and save PNGs for review.
+//! Paint every UI surface (settings, toasts, setup, history, checkup, flyout) off-screen with fixed sample data and save PNGs for review.
 //! `cargo run --example ui_snapshots -- <dir>`. Nothing here reads the live machine or
 //! writes settings: the data is `FakeStore` + `sample_status()`.
 
@@ -127,6 +127,8 @@ pub fn write_all(dir: &Path) -> Result<Vec<PathBuf>, String> {
         }
         save("doctor-confirm", &doctor::render(&mut d, scale, 760, Some(720)))?;
     }
+    // The flyout, every sample state at both scales.
+    out.extend(super::flyout::snapshots(dir)?);
     Ok(out)
 }
 

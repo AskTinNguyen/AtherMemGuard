@@ -417,11 +417,13 @@ pub struct FakeDoctor {
     pub clear: bool,
     pub delay: Duration,
     applied: Mutex<bool>,
+    /// What is left to free after the last `apply`.
+    after_apply: Mutex<Option<f64>>,
 }
 
 impl FakeDoctor {
     pub fn new() -> FakeDoctor {
-        FakeDoctor { clear: false, delay: Duration::ZERO, applied: Mutex::new(false) }
+        FakeDoctor { clear: false, delay: Duration::ZERO, applied: Mutex::new(false), after_apply: Mutex::new(None) }
     }
     pub fn all_clear() -> FakeDoctor {
         FakeDoctor { clear: true, ..FakeDoctor::new() }
@@ -509,7 +511,19 @@ impl DoctorSource for FakeDoctor {
     fn apply(&self, picks: &[(String, ActionKind)], force: bool) -> Vec<Outcome> {
         std::thread::sleep(self.delay);
         *self.applied.lock().unwrap() = true;
-        picks.iter().map(|(id, k)| FakeDoctor::outcome(id, *k, force)).collect()
+        let outs: Vec<Outcome> = picks.iter().map(|(id, k)| FakeDoctor::outcome(id, *k, force)).collect();
+        // Like the real one: what closed or ended no longer counts as "could be freed".
+        let r = FakeDoctor::report(self.clear);
+        let mut freed: Vec<&str> = outs
+            .iter()
+            .filter(|o| o.status == OutcomeStatus::Done && matches!(o.action, ActionKind::Close | ActionKind::End))
+            .map(|o| o.finding_id.as_str())
+            .collect();
+        freed.sort_unstable();
+        freed.dedup();
+        let freed_mb: u64 = freed.iter().filter_map(|id| r.findings.iter().find(|f| f.id == *id)).map(|f| f.ram_mb).sum();
+        *self.after_apply.lock().unwrap() = Some((r.reclaimable_ram_gb - freed_mb as f64 / 1024.0).max(0.0));
+        outs
     }
     fn undo_last(&self) -> Vec<Outcome> {
         std::thread::sleep(self.delay);
@@ -518,6 +532,9 @@ impl DoctorSource for FakeDoctor {
     }
     fn can_undo(&self) -> bool {
         *self.applied.lock().unwrap()
+    }
+    fn reclaimable_after_apply(&self) -> Option<f64> {
+        self.after_apply.lock().unwrap().take()
     }
 }
 
