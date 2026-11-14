@@ -669,7 +669,8 @@ pub fn find_orphans<'a>(cfg: &Config, procs: &'a [Proc]) -> Vec<&'a Proc> {
             let candidate = any_matches(&cfg.ue.workers, &p.name)
                 || lower.starts_with("unrealeditor-cmd")
                 || lower.starts_with("crashreportclient");
-            if !candidate || p.created == 0 {
+            // One we can't open we couldn't end either (and 0.2.0 never saw its parent link).
+            if !candidate || !p.queryable || p.created == 0 {
                 return false;
             }
             match by_pid.get(&p.ppid) {
@@ -1922,7 +1923,7 @@ mod tests {
     const GIB: u64 = 1024 * MB;
 
     fn proc(pid: u32, ppid: u32, name: &str, committed_mb: u64) -> Proc {
-        Proc { pid, ppid, name: name.into(), ram: committed_mb * MB / 2, committed: committed_mb * MB, created: 1000 + pid as u64 }
+        Proc { pid, ppid, name: name.into(), ram: committed_mb * MB / 2, committed: committed_mb * MB, created: 1000 + pid as u64, queryable: true }
     }
 
     fn input(procs: Vec<Proc>) -> ScanInput {
@@ -2403,13 +2404,13 @@ mod tests {
     #[test]
     fn self_tree_walks_parents_and_stops_at_recycled_pids() {
         let procs = vec![
-            Proc { pid: 1, ppid: 0, name: "root".into(), ram: 0, committed: 0, created: 10 },
-            Proc { pid: 5, ppid: 1, name: "claude".into(), ram: 0, committed: 0, created: 20 },
-            Proc { pid: 9, ppid: 5, name: "bash".into(), ram: 0, committed: 0, created: 30 },
-            Proc { pid: 12, ppid: 9, name: "memguard".into(), ram: 0, committed: 0, created: 40 },
-            Proc { pid: 13, ppid: 5, name: "sibling".into(), ram: 0, committed: 0, created: 41 },
-            Proc { pid: 20, ppid: 21, name: "child-of-new".into(), ram: 0, committed: 0, created: 50 },
-            Proc { pid: 21, ppid: 1, name: "recycled".into(), ram: 0, committed: 0, created: 60 },
+            Proc { pid: 1, ppid: 0, name: "root".into(), ram: 0, committed: 0, created: 10, queryable: true },
+            Proc { pid: 5, ppid: 1, name: "claude".into(), ram: 0, committed: 0, created: 20, queryable: true },
+            Proc { pid: 9, ppid: 5, name: "bash".into(), ram: 0, committed: 0, created: 30, queryable: true },
+            Proc { pid: 12, ppid: 9, name: "memguard".into(), ram: 0, committed: 0, created: 40, queryable: true },
+            Proc { pid: 13, ppid: 5, name: "sibling".into(), ram: 0, committed: 0, created: 41, queryable: true },
+            Proc { pid: 20, ppid: 21, name: "child-of-new".into(), ram: 0, committed: 0, created: 50, queryable: true },
+            Proc { pid: 21, ppid: 1, name: "recycled".into(), ram: 0, committed: 0, created: 60, queryable: true },
         ];
         assert_eq!(self_tree(&procs, 12), HashSet::from([12, 9, 5, 1]));
         assert_eq!(self_tree(&procs, 20), HashSet::from([20]));

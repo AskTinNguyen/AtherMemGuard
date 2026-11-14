@@ -40,7 +40,8 @@ impl Startup {
 pub type ProcessLister = fn() -> Vec<(String, u64)>;
 
 fn live_processes() -> Vec<(String, u64)> {
-    crate::win::list_processes().into_iter().map(|p| (p.name, p.ram)).collect()
+    // Processes we can't open (services, elevated apps) aren't ones MemGuard can manage.
+    crate::win::list_processes().into_iter().filter(|p| p.queryable).map(|p| (p.name, p.ram)).collect()
 }
 
 type Stamp = (Option<SystemTime>, Option<SystemTime>);

@@ -34,6 +34,10 @@ fn main() {
         std::hint::black_box(win::list_processes());
     });
     println!("list_processes            {:8.3} ms", ms);
+    let ms = median_ms(iters, || {
+        std::hint::black_box(win::list_processes_toolhelp());
+    });
+    println!("list_processes (Toolhelp) {:8.3} ms", ms);
 
     let snap = Snapshot { sys: win::sys_info(), procs: procs.clone(), now: win::now_filetime() };
     let ms = median_ms(iters, || {

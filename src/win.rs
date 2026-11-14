@@ -1,8 +1,10 @@
 //! Safe wrappers over the Win32 / NT calls AtherMemGuard uses. All `unsafe` lives here and in `tray`.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
+use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, SYSTEMTIME, WAIT_ABANDONED, WAIT_OBJECT_0,
@@ -40,6 +42,7 @@ extern "system" {
     fn NtSuspendProcess(process: HANDLE) -> i32;
     fn NtResumeProcess(process: HANDLE) -> i32;
     fn NtQueryInformationProcess(process: HANDLE, class: u32, info: *mut c_void, len: u32, ret: *mut u32) -> i32;
+    fn NtQuerySystemInformation(class: u32, info: *mut c_void, len: u32, ret: *mut u32) -> i32;
 }
 
 /// Owned kernel handle, closed on drop.
@@ -139,10 +142,169 @@ pub struct Proc {
     pub committed: u64,
     /// Creation time as FILETIME, 0 if unknown.
     pub created: u64,
+    /// We can open it for query (PROCESS_QUERY_LIMITED_INFORMATION). Processes we can't
+    /// open (elevated, protected, other users) can't be trimmed, re-prioritized or ended
+    /// by us either, so the engine leaves them out of groups and orphans.
+    pub queryable: bool,
 }
 
-/// Every process on the machine with its memory use. Processes we can't open report zeros.
+const SYSTEM_PROCESS_INFORMATION_CLASS: u32 = 5;
+const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
+
+/// The documented head of SYSTEM_PROCESS_INFORMATION with the fields windows-sys hides in
+/// `Reserved` arrays named (layout as in the NT headers). Thread entries follow it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SystemProcessInformation {
+    next_entry_offset: u32,
+    number_of_threads: u32,
+    working_set_private_size: i64,
+    hard_fault_count: u32,
+    number_of_threads_high_watermark: u32,
+    cycle_time: u64,
+    create_time: i64,
+    user_time: i64,
+    kernel_time: i64,
+    image_name_length: u16,
+    image_name_maximum_length: u16,
+    image_name_buffer: usize,
+    base_priority: i32,
+    unique_process_id: usize,
+    inherited_from_unique_process_id: usize,
+    handle_count: u32,
+    session_id: u32,
+    unique_process_key: usize,
+    peak_virtual_size: usize,
+    virtual_size: usize,
+    page_fault_count: u32,
+    peak_working_set_size: usize,
+    working_set_size: usize,
+    quota_peak_paged_pool_usage: usize,
+    quota_paged_pool_usage: usize,
+    quota_peak_non_paged_pool_usage: usize,
+    quota_non_paged_pool_usage: usize,
+    /// The commit charge: the same number as PROCESS_MEMORY_COUNTERS_EX.PrivateUsage.
+    pagefile_usage: usize,
+    peak_pagefile_usage: usize,
+    private_page_count: usize,
+}
+
+/// One entry of a SystemProcessInformation buffer, before the "can we open it" check.
+#[derive(Debug, Clone, PartialEq)]
+struct SpiEntry {
+    pid: u32,
+    ppid: u32,
+    name: String,
+    ram: u64,
+    committed: u64,
+    created: u64,
+}
+
+/// Walk a SystemProcessInformation buffer. `buf` is the buffer as the kernel filled it: the
+/// image name pointers point into it. Entries or names that fall outside it are skipped.
+fn parse_spi(buf: &[u8]) -> Vec<SpiEntry> {
+    let mut out = Vec::with_capacity(512);
+    let base = buf.as_ptr() as usize;
+    let mut off = 0usize;
+    loop {
+        if off.checked_add(size_of::<SystemProcessInformation>()).map_or(true, |end| end > buf.len()) {
+            break;
+        }
+        // SAFETY: the range was bounds-checked above, and read_unaligned copes with any
+        // alignment of the caller's buffer.
+        let e: SystemProcessInformation = unsafe { std::ptr::read_unaligned(buf[off..].as_ptr() as *const _) };
+        let pid = e.unique_process_id as u32;
+        let len = e.image_name_length as usize & !1;
+        let mut name = if e.image_name_buffer == 0 || len == 0 {
+            if pid == 0 { "[System Process]".to_string() } else { String::new() }
+        } else {
+            match e.image_name_buffer.checked_sub(base).filter(|&start| start.checked_add(len).is_some_and(|end| end <= buf.len())) {
+                Some(start) => {
+                    let units: Vec<u16> =
+                        buf[start..start + len].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                    String::from_utf16_lossy(&units)
+                }
+                None => String::new(),
+            }
+        };
+        if name.len() >= 4 && name.get(name.len() - 4..).is_some_and(|t| t.eq_ignore_ascii_case(".exe")) {
+            name.truncate(name.len() - 4);
+        }
+        out.push(SpiEntry {
+            pid,
+            ppid: e.inherited_from_unique_process_id as u32,
+            name,
+            ram: e.working_set_size as u64,
+            committed: e.pagefile_usage as u64,
+            created: e.create_time.max(0) as u64,
+        });
+        if e.next_entry_offset == 0 {
+            break;
+        }
+        off += e.next_entry_offset as usize;
+    }
+    out
+}
+
+/// The query buffer, reused between calls (8-byte aligned), and which processes we could
+/// open, by (pid, creation time). Whether a process can be opened doesn't change during its
+/// life, so each one is tried once.
+struct ListState {
+    buf: Vec<u64>,
+    queryable: HashMap<(u32, u64), bool>,
+}
+
+static LIST_STATE: Mutex<Option<ListState>> = Mutex::new(None);
+
+/// Every process on the machine with its memory use, from one
+/// NtQuerySystemInformation(SystemProcessInformation) call.
 pub fn list_processes() -> Vec<Proc> {
+    let mut guard = LIST_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let state = guard.get_or_insert_with(|| ListState { buf: vec![0u64; 128 * 1024], queryable: HashMap::new() }); // 1 MB
+    let mut ret = 0u32;
+    let mut status = STATUS_INFO_LENGTH_MISMATCH;
+    for _ in 0..8 {
+        let bytes = (state.buf.len() * 8).min(u32::MAX as usize) as u32;
+        status = unsafe {
+            NtQuerySystemInformation(SYSTEM_PROCESS_INFORMATION_CLASS, state.buf.as_mut_ptr() as *mut c_void, bytes, &mut ret)
+        };
+        if status != STATUS_INFO_LENGTH_MISMATCH {
+            break;
+        }
+        // Processes start between calls: ask for what it said plus some room.
+        let want = (ret as usize).max(state.buf.len() * 8) + 64 * 1024;
+        state.buf = vec![0u64; want.div_ceil(8)];
+    }
+    if status < 0 {
+        return Vec::new();
+    }
+    let len = (ret as usize).min(state.buf.len() * 8);
+    // SAFETY: a u64 buffer viewed as bytes, within its length.
+    let bytes = unsafe { std::slice::from_raw_parts(state.buf.as_ptr() as *const u8, len) };
+    let entries = parse_spi(bytes);
+
+    let mut seen = HashMap::with_capacity(entries.len());
+    let out = entries
+        .into_iter()
+        .map(|e| {
+            let key = (e.pid, e.created);
+            let queryable = match state.queryable.get(&key) {
+                Some(&q) => q,
+                None => e.pid != 0 && open(e.pid, PROCESS_QUERY_LIMITED_INFORMATION).is_some(),
+            };
+            seen.insert(key, queryable);
+            Proc { pid: e.pid, ppid: e.ppid, name: e.name, ram: e.ram, committed: e.committed, created: e.created, queryable }
+        })
+        .collect();
+    state.queryable = seen;
+    out
+}
+
+/// The process list the way 0.2.0 read it: a Toolhelp snapshot, then OpenProcess,
+/// K32GetProcessMemoryInfo and GetProcessTimes per process. Processes we can't open report
+/// zeros. Kept to compare with `list_processes` (tests and `examples/tick_bench`).
+#[doc(hidden)]
+pub fn list_processes_toolhelp() -> Vec<Proc> {
     let mut out = Vec::with_capacity(512);
     let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snap == INVALID_HANDLE_VALUE {
@@ -158,17 +320,21 @@ pub fn list_processes() -> Vec<Proc> {
         if name.to_ascii_lowercase().ends_with(".exe") {
             name.truncate(name.len() - 4);
         }
-        let mut p = Proc { pid: e.th32ProcessID, ppid: e.th32ParentProcessID, name, ram: 0, committed: 0, created: 0 };
+        let mut p = Proc {
+            pid: e.th32ProcessID,
+            ppid: e.th32ParentProcessID,
+            name,
+            ram: 0,
+            committed: 0,
+            created: 0,
+            queryable: false,
+        };
         if p.pid != 0 {
             if let Some(h) = open(p.pid, PROCESS_QUERY_LIMITED_INFORMATION) {
-                let mut mc: PROCESS_MEMORY_COUNTERS_EX = unsafe { zeroed() };
-                mc.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
-                let got = unsafe {
-                    K32GetProcessMemoryInfo(h.0, &mut mc as *mut _ as *mut PROCESS_MEMORY_COUNTERS, mc.cb)
-                };
-                if got != 0 {
-                    p.ram = mc.WorkingSetSize as u64;
-                    p.committed = mc.PrivateUsage as u64;
+                p.queryable = true;
+                if let Some((ram, committed)) = memory_counters(&h) {
+                    p.ram = ram;
+                    p.committed = committed;
                 }
                 let (mut c, mut x, mut k, mut u): (FILETIME, FILETIME, FILETIME, FILETIME) =
                     unsafe { (zeroed(), zeroed(), zeroed(), zeroed()) };
@@ -181,6 +347,14 @@ pub fn list_processes() -> Vec<Proc> {
         ok = unsafe { Process32NextW(snap.0, &mut e) };
     }
     out
+}
+
+/// (working set, private commit) in bytes from K32GetProcessMemoryInfo.
+fn memory_counters(h: &Handle) -> Option<(u64, u64)> {
+    let mut mc: PROCESS_MEMORY_COUNTERS_EX = unsafe { zeroed() };
+    mc.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+    let got = unsafe { K32GetProcessMemoryInfo(h.0, &mut mc as *mut _ as *mut PROCESS_MEMORY_COUNTERS, mc.cb) };
+    (got != 0).then_some((mc.WorkingSetSize as u64, mc.PrivateUsage as u64))
 }
 
 /// Full command line of a process, or None if it can't be read.
@@ -438,4 +612,125 @@ pub fn allow_any_foreground() {
 
 pub fn null_handle() -> HANDLE {
     null_mut()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SPI: usize = size_of::<SystemProcessInformation>();
+
+    /// A SystemProcessInformation buffer laid out like the kernel's: each entry, room for
+    /// "threads", then its name, with the name pointers aimed into the buffer.
+    fn synthetic(entries: &[(u32, u32, Option<&str>, u64, u64, i64)]) -> Vec<u64> {
+        let mut buf = vec![0u64; 1024];
+        let base = buf.as_mut_ptr() as *mut u8;
+        let mut off = 0usize;
+        for (i, &(pid, ppid, name, ws, commit, created)) in entries.iter().enumerate() {
+            let name16: Vec<u16> = name.map(|n| n.encode_utf16().collect()).unwrap_or_default();
+            let name_off = off + SPI + 64; // 64 bytes of pretend thread entries
+            let size = (name_off - off + name16.len() * 2 + 7) & !7;
+            let mut e: SystemProcessInformation = unsafe { zeroed() };
+            e.next_entry_offset = if i + 1 == entries.len() { 0 } else { size as u32 };
+            e.unique_process_id = pid as usize;
+            e.inherited_from_unique_process_id = ppid as usize;
+            e.working_set_size = ws as usize;
+            e.pagefile_usage = commit as usize;
+            e.create_time = created;
+            if name.is_some() {
+                e.image_name_length = (name16.len() * 2) as u16;
+                e.image_name_maximum_length = e.image_name_length + 2;
+                e.image_name_buffer = base as usize + name_off;
+            }
+            unsafe {
+                std::ptr::write_unaligned(base.add(off) as *mut SystemProcessInformation, e);
+                for (j, c) in name16.iter().enumerate() {
+                    std::ptr::write_unaligned(base.add(name_off + j * 2) as *mut u16, *c);
+                }
+            }
+            off += size;
+        }
+        buf
+    }
+
+    fn bytes(buf: &[u64]) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 8) }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn spi_layout_matches_the_nt_headers() {
+        assert_eq!(SPI, 208);
+        assert_eq!(std::mem::offset_of!(SystemProcessInformation, create_time), 32);
+        assert_eq!(std::mem::offset_of!(SystemProcessInformation, image_name_buffer), 64);
+        assert_eq!(std::mem::offset_of!(SystemProcessInformation, unique_process_id), 80);
+        assert_eq!(std::mem::offset_of!(SystemProcessInformation, inherited_from_unique_process_id), 88);
+        assert_eq!(std::mem::offset_of!(SystemProcessInformation, working_set_size), 144);
+        assert_eq!(std::mem::offset_of!(SystemProcessInformation, pagefile_usage), 184);
+    }
+
+    #[test]
+    fn parse_spi_walks_entries() {
+        let buf = synthetic(&[
+            (0, 0, None, 8192, 0, 0),
+            (4, 0, Some("System"), 1 << 20, 2 << 20, 5),
+            (1234, 4, Some("Chrome.EXE"), 300 << 20, 200 << 20, 1_000_000),
+            (5678, 1234, Some("UnrealEditor-Cmd.exe"), 1, 2, 3),
+            (91, 1, Some("exe"), 0, 0, 7),
+        ]);
+        let got = parse_spi(bytes(&buf));
+        let short: Vec<(u32, u32, &str, u64, u64, u64)> =
+            got.iter().map(|e| (e.pid, e.ppid, e.name.as_str(), e.ram, e.committed, e.created)).collect();
+        assert_eq!(
+            short,
+            [
+                (0, 0, "[System Process]", 8192, 0, 0),
+                (4, 0, "System", 1 << 20, 2 << 20, 5),
+                (1234, 4, "Chrome", 300 << 20, 200 << 20, 1_000_000),
+                (5678, 1234, "UnrealEditor-Cmd", 1, 2, 3),
+                (91, 1, "exe", 0, 0, 7),
+            ]
+        );
+        // A truncated buffer yields what fits and never reads past the end.
+        assert_eq!(parse_spi(&bytes(&buf)[..SPI + 10]).len(), 1);
+        assert!(parse_spi(&[]).is_empty());
+    }
+
+    #[test]
+    fn live_list_matches_the_per_process_calls() {
+        let me = current_pid();
+        let procs = list_processes();
+        let p = procs.iter().find(|p| p.pid == me).expect("our own process is listed");
+        assert!(p.queryable && p.ram > 0 && p.committed > 0 && p.created > 0, "{:?}", p);
+        let h = open(me, PROCESS_QUERY_LIMITED_INFORMATION).unwrap();
+        let (_, private) = memory_counters(&h).unwrap();
+        // PagefileUsage is the same counter as PrivateUsage (commit charge).
+        assert!(p.committed.abs_diff(private) < 1024 * 1024, "{} vs {}", p.committed, private);
+        assert!(procs.iter().any(|p| p.pid == 0 && p.name == "[System Process]" && !p.queryable));
+        let old = list_processes_toolhelp();
+        let o = old.iter().find(|o| o.pid == me).unwrap();
+        assert_eq!((o.ppid, &o.name, o.created), (p.ppid, &p.name, p.created));
+        // Whatever we could open before, we still can; whatever we couldn't, we still can't.
+        for o in old.iter().filter(|o| o.pid != 0) {
+            if let Some(n) = procs.iter().find(|n| n.pid == o.pid && n.created == o.created) {
+                assert_eq!(n.queryable, o.queryable, "{:?} vs {:?}", n, o);
+            }
+        }
+    }
+
+    #[test]
+    fn spawned_child_reports_us_as_parent() {
+        let mut child = std::process::Command::new("ping")
+            .args(["-t", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("start ping");
+        let found = list_processes().into_iter().find(|p| p.pid == child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        let p = found.expect("ping is listed");
+        assert_eq!(p.ppid, current_pid());
+        assert_eq!(p.name.to_ascii_lowercase(), "ping");
+        assert!(p.queryable && p.created > 0);
+    }
 }

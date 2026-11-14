@@ -311,8 +311,12 @@ pub fn analyze(cfg: &Config, snap: &Snapshot) -> Status {
     let groups: Vec<GroupStatus> = cfg
         .active_groups()
         .map(|g| {
-            let members: Vec<&Proc> =
-                snap.procs.iter().filter(|p| any_matches(&g.processes, &p.name) && !is_protected(cfg, p)).collect();
+            // Processes we can't open can't be trimmed or re-prioritized: they don't count.
+            let members: Vec<&Proc> = snap
+                .procs
+                .iter()
+                .filter(|p| p.queryable && any_matches(&g.processes, &p.name) && !is_protected(cfg, p))
+                .collect();
             GroupStatus {
                 name: g.name.clone(),
                 processes: members.len(),
@@ -701,9 +705,7 @@ impl Engine {
                 let since = self.last_trim.get(&gs.name).map(|t| t.elapsed().as_secs());
                 let due = since.map_or(true, |s| s >= cooldown * backoff);
                 if due {
-                    for &pid in &gs.pids {
-                        win::trim(pid);
-                    }
+                    let trimmed = count_ok(&gs.pids, win::trim);
                     let next = match since {
                         Some(s) if !critical && s < cooldown * backoff * 3 => (backoff * 2).min(16),
                         _ => 1,
@@ -711,12 +713,13 @@ impl Engine {
                     self.trim_backoff.insert(gs.name.clone(), next);
                     self.last_trim.insert(gs.name.clone(), Instant::now());
                     crate::log::write(&format!(
-                        "[{}] RAM {} MB > {} MB ({}, {}): trimmed {} processes",
+                        "[{}] RAM {} MB > {} MB ({}, {}): trimmed {} of {} processes",
                         gs.name,
                         gs.ram_mb,
                         eff.trim_above_mb,
                         st.mode,
                         st.pressure.label(),
+                        trimmed,
                         gs.pids.len()
                     ));
                 }
@@ -800,7 +803,7 @@ impl Engine {
         }
         let procs = win::list_processes();
         for g in self.cfg.active_groups() {
-            for p in procs.iter().filter(|p| any_matches(&g.processes, &p.name) && !is_protected(&self.cfg, p)) {
+            for p in procs.iter().filter(|p| p.queryable && any_matches(&g.processes, &p.name) && !is_protected(&self.cfg, p)) {
                 win::set_memory_priority(p.pid, MemPriority::Normal.value());
             }
         }
@@ -842,6 +845,11 @@ impl Default for Engine {
     fn default() -> Self {
         Engine::new()
     }
+}
+
+/// Run `f` on every pid; how many succeeded.
+fn count_ok(pids: &[u32], mut f: impl FnMut(u32) -> bool) -> usize {
+    pids.iter().filter(|&&pid| f(pid)).count()
 }
 
 /// Publish the latest status for agents and `memguard status`. Written atomically.
@@ -1094,10 +1102,28 @@ mod tests {
     }
 
     #[test]
+    fn trim_log_counts_successes() {
+        assert_eq!(count_ok(&[4, 8, 12, 16], |pid| pid != 8), 3);
+        assert_eq!(count_ok(&[], |_| true), 0);
+    }
+
+    #[test]
+    fn unopenable_processes_stay_out_of_groups() {
+        let cfg = Config::builtin();
+        let pattern = cfg.groups[0].processes[0].trim_end_matches('*').to_string();
+        let gb = 1024 * 1024 * 1024;
+        let p = |pid: u32, queryable: bool| Proc { pid, ppid: 1, name: pattern.clone(), ram: gb, committed: gb, created: 1, queryable };
+        let snap = Snapshot { sys: sys(32, 20, 48, 10), procs: vec![p(100, true), p(104, false)], now: 2 };
+        let st = analyze(&cfg, &snap);
+        let g = st.groups.iter().find(|g| g.name == cfg.groups[0].name).unwrap();
+        assert_eq!((g.processes, g.ram_mb, g.committed_mb), (1, 1024, 1024));
+    }
+
+    #[test]
     fn ue_processes_are_protected_even_if_listed() {
         let mut cfg = Config::builtin();
         cfg.groups[0].processes.push("UnrealEditor".into());
-        let p = |name: &str| Proc { pid: 4242, ppid: 1, name: name.into(), ram: 0, committed: 0, created: 0 };
+        let p = |name: &str| Proc { pid: 4242, ppid: 1, name: name.into(), ram: 0, committed: 0, created: 0, queryable: true };
         assert!(is_protected(&cfg, &p("UnrealEditor")));
         assert!(is_protected(&cfg, &p("UnrealEditor-Cmd")));
         assert!(is_protected(&cfg, &p("ShaderCompileWorker")));

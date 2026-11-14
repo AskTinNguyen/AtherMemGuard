@@ -60,7 +60,8 @@ fn find_orphans<'a>(cfg: &Config, procs: &'a [win::Proc]) -> Vec<&'a win::Proc> 
             let candidate = any_matches(&cfg.ue.workers, &p.name)
                 || lower.starts_with("unrealeditor-cmd")
                 || lower.starts_with("crashreportclient");
-            if !candidate || p.created == 0 {
+            // One we can't open we couldn't end either (and 0.2.0 never saw its parent link).
+            if !candidate || !p.queryable || p.created == 0 {
                 return false;
             }
             match by_pid.get(&p.ppid) {
@@ -84,7 +85,7 @@ pub fn trim_groups(cfg: &Config, procs: &[win::Proc]) -> usize {
             .chain(g.priority)
             .min_by_key(|p| p.value())
             .unwrap_or(MemPriority::Low);
-        for p in procs.iter().filter(|p| any_matches(&g.processes, &p.name) && !is_protected(cfg, p)) {
+        for p in procs.iter().filter(|p| p.queryable && any_matches(&g.processes, &p.name) && !is_protected(cfg, p)) {
             win::set_memory_priority(p.pid, lowest.value());
             if win::trim(p.pid) {
                 trimmed += 1;
