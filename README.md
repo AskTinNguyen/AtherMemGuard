@@ -1,4 +1,4 @@
-﻿# Ather MemGuard
+# Ather MemGuard
 
 Keeps a Windows PC primed for agentic Unreal Engine work: the editor, local builds and cooks get
 memory first, and everything else (browsers, chat apps, agent apps, launchers) gives it up.
@@ -18,7 +18,7 @@ memguard install --add-to-path
 
 This copies them to `%LOCALAPPDATA%\Programs\AtherMemGuard`, starts the tray app at sign-in, starts it now,
 adds an entry under Settings > Apps, and (with `--add-to-path`) puts `memguard` on your user PATH. `memguard uninstall` reverses all of it;
-settings and the log are kept. The files are unsigned, so SmartScreen may ask once (More info â†’ Run anyway).
+settings and the log are kept. The files are unsigned, so SmartScreen may ask once (More info → Run anyway).
 
 ## How it decides
 
@@ -46,7 +46,7 @@ Things worth knowing:
 - Unreal's own processes are on a protect list and are never touched, even if a group lists them.
 - Priority and trimming free **RAM**, not **commit charge**. Only hard caps, closing apps or a bigger
   page file change commit. `memguard status` warns when the page file is small for the RAM.
-- If a group climbs straight back over its soft cap, that memory is in use; MemGuard backs off (up to 16Ã—
+- If a group climbs straight back over its soft cap, that memory is in use; MemGuard backs off (up to 16×
   the cooldown) instead of trimming it over and over.
 - Browser and Electron helper processes are sandboxed and refuse to join a Job Object, so hard caps
   only partly cover those apps. The log says how many processes a cap covers.
@@ -153,7 +153,7 @@ you before anything is fixed.
 
 ## Settings
 
-`%APPDATA%\AtherMemGuard\settings.toml` (tray menu â†’ Settings). Saved changes apply within one
+`%APPDATA%\AtherMemGuard\settings.toml` (tray menu → Settings). Saved changes apply within one
 interval; a mistake keeps the previous settings and is reported in the log. `memguard config --check`
 validates the file. The default file documents every key.
 
