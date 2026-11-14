@@ -446,19 +446,24 @@ pub fn post_command(cmd: Command) {
 
 // ---------------------------------------------------------------- memory history and checkup windows
 
-/// Memory history for the window. Ranges up to 24 hours come from the engine's in-memory
-/// history (filled from disk at start), longer ones from the daily CSV files. Called on the
-/// tray thread.
-struct TrayHistory;
+/// Memory history for the window. The last 24 hours come from the engine's in-memory
+/// history (filled from disk at start), older samples from the daily CSV files, each past
+/// day read once. Called on the tray thread.
+#[derive(Default)]
+struct TrayHistory {
+    days: RefCell<crate::history::DayCache>,
+}
 
 impl crate::ui::history::HistorySource for TrayHistory {
     fn samples(&self, since: Duration) -> Vec<crate::history::Sample> {
-        if since <= Duration::from_secs(24 * 3600) {
-            if let Some(s) = with_app(|a| a.engine.history().series(since)) {
-                return s;
-            }
-        }
-        crate::history::load_since(since)
+        let mut days = self.days.borrow_mut();
+        with_app(|a| a.engine.history().series_with_days(since, &mut days)).unwrap_or_else(|| crate::history::load_since(since))
+    }
+    fn latest_unix(&self) -> Option<i64> {
+        with_app(|a| a.engine.history().latest().map(|s| s.unix)).flatten()
+    }
+    fn samples_after(&self, after: i64) -> Option<Vec<crate::history::Sample>> {
+        with_app(|a| a.engine.history().series_after(after)).flatten()
     }
     fn interval_sec(&self) -> u64 {
         with_app(|a| a.engine.cfg.interval_sec).unwrap_or(10)
@@ -476,7 +481,7 @@ impl crate::ui::history::HistorySource for TrayHistory {
 
 pub fn open_history_window() {
     flyout::close();
-    crate::ui::history::open_history(Box::new(TrayHistory));
+    crate::ui::history::open_history(Box::new(TrayHistory::default()));
 }
 
 pub fn open_doctor_window() {

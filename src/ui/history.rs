@@ -45,6 +45,16 @@ pub trait HistorySource {
     fn now_unix(&self) -> i64 {
         crate::history::now_unix()
     }
+    /// Time of the newest sample, if the source knows it cheaply. While it stays the same
+    /// the window doesn't reload. `None`: reload every time.
+    fn latest_unix(&self) -> Option<i64> {
+        None
+    }
+    /// Samples newer than `after`, if the source can tell (the window then appends them
+    /// instead of reloading the range). `None`: reload.
+    fn samples_after(&self, _after: i64) -> Option<Vec<Sample>> {
+        None
+    }
 }
 
 /// Reads the CSV files in the data folder. Settings come from the caller's `Config` so the
@@ -560,6 +570,8 @@ pub struct HistoryWindow {
     scale: Scale,
     size: (i32, i32),
     layout: Layout,
+    /// `latest_unix` of the source when the samples were last read.
+    loaded_latest: Option<i64>,
 }
 
 impl HistoryWindow {
@@ -580,6 +592,7 @@ impl HistoryWindow {
             scale: Scale(1.0),
             size: (960, 600),
             layout: Layout::default(),
+            loaded_latest: None,
         };
         w.reload();
         w
@@ -600,8 +613,36 @@ impl HistoryWindow {
 
     /// Read the samples for the current range again.
     pub fn reload(&mut self) {
+        self.loaded_latest = self.source.latest_unix();
         self.now = self.source.now_unix();
         self.samples = self.source.samples(Duration::from_secs(self.range.secs() as u64));
+        self.derive();
+    }
+
+    /// Catch up with the source: nothing when it has no newer sample, the new samples
+    /// appended when it can hand them out, a full reload otherwise. True if anything changed.
+    pub fn refresh(&mut self) -> bool {
+        let latest = self.source.latest_unix();
+        if latest.is_some() && latest == self.loaded_latest {
+            return false;
+        }
+        let newer = self.samples.last().and_then(|s| self.source.samples_after(s.unix));
+        let Some(newer) = newer else {
+            self.reload();
+            return true;
+        };
+        self.loaded_latest = latest;
+        self.now = self.source.now_unix();
+        self.samples.extend(newer);
+        let from = self.now - self.range.secs();
+        let old = self.samples.partition_point(|s| s.unix < from);
+        self.samples.drain(..old);
+        self.derive();
+        true
+    }
+
+    /// Everything drawn from the samples.
+    fn derive(&mut self) {
         self.offset = self.samples.last().map(offset_from).unwrap_or(0);
         self.freed = freed_markers(&self.samples);
         self.starts = editor_starts(&self.samples);
@@ -987,8 +1028,9 @@ impl Surface for HistoryWindow {
                 host.invalidate();
             }
             Event::Timer(TIMER_REFRESH) => {
-                self.reload();
-                host.invalidate();
+                if self.refresh() {
+                    host.invalidate();
+                }
             }
             Event::MouseMove(p) => {
                 self.mouse = Some(p);
@@ -1079,6 +1121,64 @@ pub fn render(win: &mut HistoryWindow, scale: Scale, w: i32, h: i32) -> Canvas {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
+
+    /// A source like the tray's: knows its newest sample and can hand out newer ones.
+    struct Live {
+        all: RefCell<Vec<Sample>>,
+        full_reads: Cell<usize>,
+    }
+
+    impl HistorySource for std::rc::Rc<Live> {
+        fn samples(&self, since: Duration) -> Vec<Sample> {
+            self.full_reads.set(self.full_reads.get() + 1);
+            let from = self.now_unix() - since.as_secs() as i64;
+            self.all.borrow().iter().filter(|s| s.unix >= from).cloned().collect()
+        }
+        fn interval_sec(&self) -> u64 {
+            10
+        }
+        fn keep_days(&self) -> u32 {
+            7
+        }
+        fn ram_total_gb(&self) -> f64 {
+            64.0
+        }
+        fn folder(&self) -> PathBuf {
+            std::env::temp_dir()
+        }
+        fn now_unix(&self) -> i64 {
+            self.all.borrow().last().map_or(0, |s| s.unix)
+        }
+        fn latest_unix(&self) -> Option<i64> {
+            self.all.borrow().last().map(|s| s.unix)
+        }
+        fn samples_after(&self, after: i64) -> Option<Vec<Sample>> {
+            Some(self.all.borrow().iter().filter(|s| s.unix > after).cloned().collect())
+        }
+    }
+
+    #[test]
+    fn refresh_reads_only_what_is_new() {
+        let t0 = 1_794_000_000;
+        let live = std::rc::Rc::new(Live { all: RefCell::new((0..400).map(|i| sample(t0 + i * 10, 10.0, 2.0)).collect()), full_reads: Cell::new(0) });
+        let mut w = HistoryWindow::new(Box::new(live.clone()));
+        w.set_range(Range::H1);
+        let reads = live.full_reads.get();
+        assert_eq!(w.samples.len(), 361);
+        // No new sample: nothing to do.
+        assert!(!w.refresh());
+        // New samples are appended, the oldest drop out of the hour, no full read.
+        live.all.borrow_mut().extend((400..403).map(|i| sample(t0 + i * 10, 11.0, 2.0)));
+        assert!(w.refresh());
+        assert_eq!(live.full_reads.get(), reads);
+        assert_eq!(w.samples.len(), 361);
+        assert_eq!(w.samples.last().unwrap().unix, t0 + 4020);
+        let mut fresh = HistoryWindow::new(Box::new(live.clone()));
+        fresh.set_range(Range::H1);
+        assert_eq!(fresh.samples, w.samples);
+        assert_eq!(fresh.cards, w.cards);
+    }
 
     fn sample(unix: i64, editor: f64, groups: f64) -> Sample {
         Sample {

@@ -6,7 +6,7 @@
 //! group. When the set of groups changes during a day, a new header line is written and
 //! the rows after it follow that header.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -198,6 +198,48 @@ impl History {
         self.ring.back()
     }
 
+    /// Samples newer than `after` (unix seconds), oldest first. `None` when the ring doesn't
+    /// reach back that far, so it can't say what came after.
+    pub fn series_after(&self, after: i64) -> Option<Vec<Sample>> {
+        if self.ring.front().is_some_and(|f| f.unix > after) {
+            return None;
+        }
+        let n = self.ring.iter().rev().take_while(|s| s.unix > after).count();
+        Some(self.ring.iter().skip(self.ring.len() - n).cloned().collect())
+    }
+
+    /// Samples from the last `since`, any length: the ring for what it holds, the day files
+    /// for what is older. Past days don't change, so each is read once into `cache`.
+    pub fn series_with_days(&self, since: Duration, cache: &mut DayCache) -> Vec<Sample> {
+        let dir = self.dir.clone().unwrap_or_else(history_dir);
+        self.series_with_days_at(&dir, now_unix(), local_offset_secs(), since, cache)
+    }
+
+    fn series_with_days_at(&self, dir: &Path, now: i64, offset: i64, since: Duration, cache: &mut DayCache) -> Vec<Sample> {
+        let from = now - since.as_secs() as i64;
+        let ring_start = self.ring.front().map_or(now + 1, |s| s.unix);
+        let mut out = Vec::new();
+        if from < ring_start {
+            let today = (now + offset).div_euclid(DAY_SECS);
+            let first_day = (from + offset).div_euclid(DAY_SECS);
+            let last_day = (ring_start + offset).div_euclid(DAY_SECS).min(today);
+            cache.days.retain(|&d, _| d >= first_day && d < today);
+            for day in first_day..=last_day {
+                let fresh;
+                let samples = if day < today {
+                    cache.days.entry(day).or_insert_with(|| load_day_from(dir, &date_string(day), offset).unwrap_or_default())
+                } else {
+                    fresh = load_day_from(dir, &date_string(day), offset).unwrap_or_default();
+                    &fresh
+                };
+                out.extend(samples.iter().filter(|s| s.unix >= from && s.unix < ring_start).cloned());
+            }
+            out.sort_by_key(|s| s.unix);
+        }
+        out.extend(self.ring.iter().filter(|s| s.unix >= from && s.unix <= now).cloned());
+        out
+    }
+
     /// Every sample in one day's file. `date` is `YYYY-MM-DD` (local date).
     pub fn load_day(&self, date: &str) -> Result<Vec<Sample>, String> {
         let dir = self.dir.clone().unwrap_or_else(history_dir);
@@ -234,6 +276,12 @@ impl History {
         let late = slope_per_hour(&points[mid..])?;
         Some(slope.min(2.0 * early).min(2.0 * late))
     }
+}
+
+/// Parsed day files by day number, for `History::series_with_days`.
+#[derive(Default)]
+pub struct DayCache {
+    days: HashMap<i64, Vec<Sample>>,
 }
 
 /// Least-squares slope of y over x (seconds), per hour.
@@ -699,6 +747,39 @@ mod tests {
         assert_eq!(load_since_from(&dir, Duration::from_secs(15), T0 + 20, 0).len(), 2);
         assert!(load_day_from(&dir, "nope", 0).is_err());
         assert!(load_day_from(&dir, "1999-01-01", 0).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn series_after_and_long_series_from_cached_days() {
+        let dir = temp_dir();
+        // Two past days on disk, then a ring that holds the last hours.
+        let mut disk = History::new(dir.clone(), 7);
+        for i in 0..48 {
+            disk.push(sample(T0 - 2 * DAY_SECS + i * 3600, &[]));
+        }
+        let mut h = History::in_memory();
+        for i in 0..6 {
+            h.push(sample(T0 + i * 600, &[]));
+        }
+        let now = T0 + 3000;
+        let mut cache = DayCache::default();
+        let all = h.series_with_days_at(&dir, now, 0, Duration::from_secs(3 * DAY_SECS as u64), &mut cache);
+        assert_eq!(all.len(), 48 + 6);
+        assert!(all.windows(2).all(|w| w[0].unix < w[1].unix));
+        assert_eq!(all.last().unwrap().unix, T0 + 3000);
+        // A changed past-day file isn't read again: past days don't change.
+        let first = all[0].date().to_string();
+        fs::write(dir.join(format!("{}.csv", first)), "").unwrap();
+        let again = h.series_with_days_at(&dir, now, 0, Duration::from_secs(3 * DAY_SECS as u64), &mut cache);
+        assert_eq!(again, all);
+        // A short range comes from the ring alone.
+        assert_eq!(h.series_with_days_at(&dir, now, 0, Duration::from_secs(1200), &mut cache).len(), 3);
+
+        assert_eq!(h.series_after(T0 + 1800).unwrap().iter().map(|s| s.unix).collect::<Vec<_>>(), [T0 + 2400, T0 + 3000]);
+        assert!(h.series_after(T0 + 3000).unwrap().is_empty());
+        assert_eq!(h.series_after(T0).unwrap().len(), 5);
+        assert!(h.series_after(T0 - 1).is_none(), "older than the ring");
         let _ = fs::remove_dir_all(&dir);
     }
 
