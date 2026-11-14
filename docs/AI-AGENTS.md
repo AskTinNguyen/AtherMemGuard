@@ -16,6 +16,8 @@ Run this to get the exact commands for this PC, with the full path to `memguard.
 memguard agent-setup
 ```
 
+**Copy setup** in the app's settings (AI agents) puts the same text on the clipboard.
+
 ### Claude Code
 
 For all your projects:
@@ -200,6 +202,42 @@ Example result:
 ```
 
 The 3 GB per compile action is a starting estimate, not a measurement of your project.
+
+### `memguard_history`
+
+Read-only. What memory did over the last hours, as the background app recorded it: one sample per
+interval (every 10 seconds by default). Use it to explain a slow or failed build after the fact, to see
+whether the editor keeps growing, or to check how long memory has been tight. The samples are the same
+as `memguard history --json` gives.
+
+| Argument | Type | Meaning |
+|---|---|---|
+| `hours` | number, default 1 | How far back to look; values over 168 (a week) are cut to 168 |
+
+```json
+{ "name": "memguard_history", "arguments": { "hours": 6 } }
+```
+
+Example result (shortened):
+
+```json
+{
+  "hours": 6.0,
+  "total_samples": 2160,
+  "step": 3,
+  "samples": [
+    {
+      "unix": 1794744000, "time": "2026-11-14 12:00:00", "mode": "editor+build", "pressure": "elevated",
+      "ram_free_gb": 11.3, "commit_free_gb": 21.0, "ue_committed_gb": 61.4, "editor_committed_gb": 58.2,
+      "workers": 18, "groups": [ { "name": "Browsers", "ram_gb": 4.1 } ]
+    }
+  ]
+}
+```
+
+More than 720 samples are thinned evenly: `step` says every how many samples one is kept, and the
+newest sample is always included. An empty `samples` list means nothing was recorded for that span
+(the background app wasn't running, or history is off in settings).
 
 ## Troubleshooting
 

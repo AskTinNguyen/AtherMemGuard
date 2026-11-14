@@ -243,6 +243,24 @@ pub struct Layout {
 
 pub const CHECKUP_LABEL: &str = "Run a checkup";
 
+/// At most two lines, breaking between " · " parts rather than inside one when it can.
+fn wrap_segments(c: &Canvas, s: &str, f: Font, width: i32) -> Vec<String> {
+    if c.measure(s, f).0 <= width {
+        return vec![s.to_string()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for seg in s.split(" · ") {
+        match lines.last_mut() {
+            Some(cur) if c.measure(&format!("{} · {}", cur, seg), f).0 <= width => *cur = format!("{} · {}", cur, seg),
+            _ => lines.push(seg.to_string()),
+        }
+    }
+    if lines.len() > 2 || lines.iter().any(|l| c.measure(l, f).0 > width) {
+        return c.wrap_lines(s, f, width, 2);
+    }
+    lines
+}
+
 pub fn layout(c: &Canvas, d: &FlyoutData) -> Layout {
     let w = c.s(WIDTH);
     let pad = c.s(PAD);
@@ -275,7 +293,7 @@ pub fn layout(c: &Canvas, d: &FlyoutData) -> Layout {
     let ue_title = Rect::new(pad, y, inner, th);
     y += th;
     // Wraps to a second line when it is long ("Up 7 h 30 min · growing 9.4 GB an hour · …").
-    let ue_detail_lines = if d.ue_detail.is_empty() { Vec::new() } else { c.wrap_lines(&d.ue_detail, F_HINT, inner, 2) };
+    let ue_detail_lines = if d.ue_detail.is_empty() { Vec::new() } else { wrap_segments(c, &d.ue_detail, F_HINT, inner) };
     let ue_detail = if ue_detail_lines.is_empty() {
         None
     } else {

@@ -462,6 +462,8 @@ struct App {
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
+    /// Worker results that arrived while the app state was busy.
+    static PENDING: RefCell<Vec<Work>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Runs a closure on the app state. Returns None if the state is busy (a nested message loop
@@ -924,6 +926,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 if due {
                     a.tick();
                 }
+                for w in PENDING.with(|p| std::mem::take(&mut *p.borrow_mut())) {
+                    a.on_work(w);
+                }
                 false
             });
             if quit == Some(true) {
@@ -954,11 +959,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         WM_WORK => {
             let w = *Box::from_raw(lparam as *mut Work);
-            // A modal loop may hold the app state; try again shortly rather than drop it.
+            // If a nested message loop holds the app state, the next timer tick handles it.
             let mut slot = Some(w);
             with_app(|a| a.on_work(slot.take().unwrap()));
             if let Some(w) = slot {
-                post_work(hwnd as isize, w);
+                PENDING.with(|p| p.borrow_mut().push(w));
             }
             0
         }
