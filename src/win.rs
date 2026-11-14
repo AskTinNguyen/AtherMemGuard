@@ -619,6 +619,7 @@ mod tests {
     use super::*;
 
     const SPI: usize = size_of::<SystemProcessInformation>();
+    const MB: u64 = 1024 * 1024;
 
     /// A SystemProcessInformation buffer laid out like the kernel's: each entry, room for
     /// "threads", then its name, with the name pointers aimed into the buffer.
@@ -702,10 +703,16 @@ mod tests {
         let procs = list_processes();
         let p = procs.iter().find(|p| p.pid == me).expect("our own process is listed");
         assert!(p.queryable && p.ram > 0 && p.committed > 0 && p.created > 0, "{:?}", p);
+        // PagefileUsage is the same counter as PrivateUsage (commit charge). Other tests
+        // allocate in parallel, so read it on both sides of the list and allow a few tries.
         let h = open(me, PROCESS_QUERY_LIMITED_INFORMATION).unwrap();
-        let (_, private) = memory_counters(&h).unwrap();
-        // PagefileUsage is the same counter as PrivateUsage (commit charge).
-        assert!(p.committed.abs_diff(private) < 1024 * 1024, "{} vs {}", p.committed, private);
+        let close = (0..10).any(|_| {
+            let before = memory_counters(&h).unwrap().1;
+            let listed = list_processes().into_iter().find(|p| p.pid == me).unwrap().committed;
+            let after = memory_counters(&h).unwrap().1;
+            listed + MB >= before.min(after) && listed <= before.max(after) + MB
+        });
+        assert!(close, "committed {} vs PrivateUsage {}", p.committed, memory_counters(&h).unwrap().1);
         assert!(procs.iter().any(|p| p.pid == 0 && p.name == "[System Process]" && !p.queryable));
         let old = list_processes_toolhelp();
         let o = old.iter().find(|o| o.pid == me).unwrap();
