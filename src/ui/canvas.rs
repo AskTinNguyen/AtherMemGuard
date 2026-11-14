@@ -485,14 +485,18 @@ impl Canvas {
         unsafe { self.draw(r, s, f, c, h | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 0) };
     }
 
-    /// Letter-spaced single line (eyebrows, section headers), vertically centred.
+    /// Letter-spaced single line (eyebrows, section headers), vertically centred. Positioned
+    /// by measuring (DrawText's own fitting ignores the character extra and cuts letters).
     pub fn spaced_text(&mut self, r: Rect, s: &str, f: Font, c: Rgb, extra: i32, align: Align) {
-        let h = match align {
-            Align::Left => DT_LEFT,
-            Align::Center => DT_CENTER,
-            Align::Right => DT_RIGHT,
+        let (w, _) = self.measure_spaced(s, f, extra);
+        let w = w - extra; // no trailing space after the last letter
+        let x = match align {
+            Align::Left => r.x,
+            Align::Center => r.x + (r.w - w) / 2,
+            Align::Right => r.right() - w,
         };
-        unsafe { self.draw(r, s, f, c, h | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, extra) };
+        let rr = Rect::new(x, r.y, w + extra + 2, r.h);
+        unsafe { self.draw(rr, s, f, c, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP, extra) };
     }
 
     /// Break `s` into lines no wider than `width`, at most `max_lines`; the last line gets
