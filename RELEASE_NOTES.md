@@ -1,37 +1,26 @@
-# Ather MemGuard 0.2.2 (Windows)
+# Ather MemGuard 0.2.3 (Windows)
 
-**Get it:** if you have 0.2.0, it updates itself within a day (or right away from the tray menu: **Check for updates**). New to it? Download `AtherMemGuard-Setup-0.2.2.exe` below and run it. It installs for you only, in a few seconds, with no admin rights, and starts in the tray.
+**Get it:** if you have 0.2.x, it updates itself within a day (or right away from the tray menu: **Check for updates**). New to it? Download `AtherMemGuard-Setup-0.2.3.exe` below and run it. It installs for you only, in a few seconds, with no admin rights, and starts in the tray.
 - **SmartScreen:** the exe isn't code-signed yet, so SmartScreen asks once: **More info › Run anyway**.
-- **Portable:** `AtherMemGuard-0.2.2-portable.zip` runs from any folder without installing.
+- **Portable:** `AtherMemGuard-0.2.3-portable.zip` runs from any folder without installing.
 
 ## What's new
 
-### See where all your RAM goes
-- **The tray flyout accounts for every GB in use.** "RAM in use 92.6 of 96 GB" sits over one bar split by what holds it, and the list under it adds up to the total: Unreal (editor, compile workers, other), **Other apps** with the biggest ones named, each app group, **Windows file cache**, **Windows and drivers**, memory Windows squeezed, and what Windows can't say whose it is.
-- **Unreal is shown as RAM in use**, like everything else, with what Windows has promised it on the line below.
-- **When memory is critical**, a red box says what to do and what it gets back: "Emptying Windows' file cache gets about 31.5 GB back, closing Rider and Visual Studio about 3.7 GB."
-- **Commit free** moved to the bottom, with what it means: room left for apps to ask for more memory (RAM plus the page file). When it runs out, apps crash even if RAM is free.
-- `memguard status` prints the same breakdown, and `memguard status --json` has it under `ram` (without app names).
+### Disk space and your Dev Drive
+- **Watches free space** on your Dev Drive, the system drive and every drive that holds a project, the Unreal cache (DDC, Zen) or TEMP, once a minute. The flyout shows one line, "D: Dev Drive · 446 GB free", in amber or red when a drive gets low, and counts any other low drive.
+- **A toast when a drive gets low**, one per drive and once per change: "Your Dev Drive is almost full. D: has 38 GB free, and a cook usually needs 100 GB." When C: is low it also says why it matters for memory: Windows may not be able to grow the page file.
+- **Dev Drive health** in the checkup and `memguard disk`: whether the drive is trusted, whether Defender's performance mode is on, and whether your Unreal and toolchain caches sit on C:. Fixes that need an administrator are shown as the exact command to run; MemGuard changes none of these itself.
+- **Disk checkup:** `memguard disk checkup --path D:\lanes\my-lane` tells you what a project, lane or cache holds and how much deleting it would free. On a Dev Drive many files share space through block cloning, so a 659 GB lane can free 91 GB: MemGuard counts shared and hard-linked data once and says how sure each number is. It only reports; it never deletes or moves anything.
+- **Builds and cooks wait for disk space too:** `memguard wait --for cook` also checks free space on the project's drive (100 GB for a cook, 50 for a build, 20 for the editor by default; change it with `disk_gb` under `[prime]`). Disk space doesn't free itself, so a shortfall answers at once instead of waiting.
+- **For agents:** `memguard_disk`, `memguard_disk_checkup` and `memguard_disk_plan` are new read-only MCP tools, and `memguard_wait` and `memguard_status` include disk. See `docs/AI-AGENTS.md`.
+- **Good to know:** on a Dev Drive, space from deleted files can take a long time to show up as free, and can come back in bulk later. "Frees" numbers are predictions, and MemGuard labels them that way.
 
-### Empty Windows' file cache
-- Windows keeps file data it has read in RAM, and that doesn't count as free. On a busy Unreal PC it can hold tens of GB: on one 96 GB machine it held 44 GB.
-- **Empty it now** under "Windows file cache" in the flyout, **Empty Windows file cache…** in the tray menu, or `memguard flush-cache` empties it. On that machine RAM free went from 31 to 73 GB.
-- Windows asks for administrator permission each time, and nothing does this on its own. Nothing is lost: Windows reads the files again when they're needed.
-
-### Lighter in the background
-- **About half the CPU** in the tray: each check reads every process in one call instead of opening each one, and only sets an app's priority when it needs to change (and again every minute, for apps that reset their own).
-- **Settings window:** the blinking cursor no longer repaints the whole window, so keeping Settings open costs much less.
-- **Memory history window:** reads only the new samples instead of the whole day again, and past days once.
-
-### Fewer false alarms
-- **Editor growth alert:** no longer fires while the editor is loading a project. It waits until the editor has run for 10 minutes, needs 20 minutes of samples, and only warns when memory keeps growing, not after a single jump. A restarted editor gets its own count.
+### Act on what holds your RAM
+- **Click a row in the flyout** for what can be done about it: end leftover Unreal helpers, free one app group now, close an app or hold it back with a group (with Undo), or empty Windows' caches. Results come back as toasts.
+- **Which drivers use it?** `memguard drivers` and a new report page break "Windows and drivers" into kernel pools, driver code and Windows processes, with the drivers that likely own the biggest pool tags. No admin rights needed.
 
 ### Fixes
-- Apps MemGuard can't control (ones running as administrator) are left out of app groups, their totals and the checkup's suggestions, instead of being counted and then failing.
-- Moving a group from **Low** or **Very low** CPU to **Efficiency mode** now gives its apps their normal priority back.
-- An app that matches two groups follows the first one instead of switching back and forth.
-- The log says how many apps were actually trimmed ("trimmed 18 of 22 processes").
-- Settings and team files that use the `[disk]` settings of the next version load in this one.
+- The flyout's advice line wraps to four lines instead of being cut off.
 
 ## Checksums
 
