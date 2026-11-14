@@ -138,6 +138,11 @@ pub trait DoctorSource: Send + 'static {
     fn apply(&self, picks: &[(String, ActionKind)], force: bool) -> Vec<Outcome>;
     fn undo_last(&self) -> Vec<Outcome>;
     fn can_undo(&self) -> bool;
+    /// Addition: what could still be freed after the last `apply` (from a fresh scan), so the
+    /// hero number goes down while the rows keep showing their results. `None` = unchanged.
+    fn reclaimable_after_apply(&self) -> Option<f64> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------- selection model (pure)
@@ -571,7 +576,7 @@ impl Item {
 
 enum Job {
     Scanned(Report, bool),
-    Applied(Vec<Outcome>, bool),
+    Applied(Vec<Outcome>, bool, Option<f64>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -677,7 +682,13 @@ impl DoctorWindow {
         let picks = m.begin_apply();
         let force = picks.iter().any(|(_, k)| *k == ActionKind::End);
         self.working = true;
-        self.run(move |s| Job::Applied(s.apply(&picks, force), s.can_undo()), host);
+        self.run(
+            move |s| {
+                let outs = s.apply(&picks, force);
+                Job::Applied(outs, s.can_undo(), s.reclaimable_after_apply())
+            },
+            host,
+        );
     }
 
     /// "End it anyway" after the confirmation.
@@ -686,7 +697,13 @@ impl DoctorWindow {
         let id = m.report.findings[i].id.clone();
         m.begin_one(i);
         self.working = true;
-        self.run(move |s| Job::Applied(s.apply(&[(id, ActionKind::End)], true), s.can_undo()), host);
+        self.run(
+            move |s| {
+                let outs = s.apply(&[(id, ActionKind::End)], true);
+                Job::Applied(outs, s.can_undo(), s.reclaimable_after_apply())
+            },
+            host,
+        );
     }
 
     pub fn undo(&mut self, host: Option<&mut Host>) {
@@ -711,9 +728,12 @@ impl DoctorWindow {
                 self.scroll.y = 0;
                 self.focus = None;
             }
-            Job::Applied(outs, can_undo) => {
+            Job::Applied(outs, can_undo, reclaimable) => {
                 if let Some(m) = self.model.as_mut() {
                     m.apply_outcomes(outs);
+                    if let Some(gb) = reclaimable {
+                        m.report.reclaimable_ram_gb = gb;
+                    }
                 }
                 self.can_undo = can_undo;
                 self.working = false;

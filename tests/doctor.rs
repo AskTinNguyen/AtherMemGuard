@@ -76,6 +76,7 @@ fn app_finding(id: &str, name: &str, pids: Vec<u32>, actions: &[ActionKind]) -> 
         has_window: false,
         group: None,
         startup: None,
+        company: String::new(),
     }
 }
 

@@ -192,6 +192,9 @@ pub struct Finding {
     /// The startup entry, for `Startup` findings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup: Option<startup::Entry>,
+    /// Company from the exe's version info, for unknown apps under "Worth a look"; may be empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub company: String,
 }
 
 impl Finding {
@@ -213,6 +216,7 @@ impl Finding {
             has_window: false,
             group: None,
             startup: None,
+            company: String::new(),
         }
     }
 
@@ -758,8 +762,10 @@ pub fn build_report(
             pids = loose.iter().map(|p| p.pid).collect();
         }
         let desc = acc.entry.map(|e| e.description.clone()).unwrap_or_default();
+        let described = if verdict == Verdict::Review && auto { acc.pids.first().and_then(|&pid| describe(pid)) } else { None };
+        let company = described.as_ref().map(|(_, c)| c.trim().to_string()).unwrap_or_default();
         let mut detail = match verdict {
-            Verdict::Review if auto => match acc.pids.first().and_then(|&pid| describe(pid)) {
+            Verdict::Review if auto => match described {
                 Some((d, c)) if !d.is_empty() && !c.is_empty() => {
                     format!("{} from {}. Ather MemGuard doesn't know this app; check what it is before you close it.", d, c)
                 }
@@ -826,6 +832,7 @@ pub fn build_report(
         f.pids = pids;
         f.has_window = acc.visible > 0;
         f.group = group;
+        f.company = company;
         findings.push(f);
     }
 
@@ -1345,7 +1352,7 @@ pub fn dry_run(report: &Report, picks: &[(String, ActionKind)], force: bool) -> 
 
 /// Settings for the "never act on" checks, read without writing anything (unlike
 /// `Config::load`, which creates a missing settings file). Broken or missing = built-in.
-fn load_config_readonly() -> Config {
+pub fn load_config_readonly() -> Config {
     // The effective settings: built-in defaults, then the team file, then the user's file.
     // Read without `Config::load`, which would create or migrate the settings file.
     let user = fs::read_to_string(paths::config_file()).unwrap_or_default();
@@ -2086,6 +2093,7 @@ mod tests {
         let mystery = r.finding("app:mysteryapp").unwrap();
         assert_eq!(mystery.verdict, Verdict::Review);
         assert!(mystery.detail.contains("Mystery Tool from Contoso"), "{}", mystery.detail);
+        assert_eq!(mystery.company, "Contoso");
         assert!(!mystery.recommended);
         assert!(mystery.offers(ActionKind::LeaveIt) && !mystery.offers(ActionKind::BlockWhileUnreal));
 

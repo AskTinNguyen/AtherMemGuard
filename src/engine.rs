@@ -475,6 +475,8 @@ pub struct Engine {
     hints: Hints,
     events: Vec<Event>,
     history: History,
+    /// The process list of the last tick, for watchers in the tray (the doctor's guard).
+    last_procs: Vec<Proc>,
 }
 
 impl Engine {
@@ -508,6 +510,7 @@ impl Engine {
             hints: Hints::default(),
             events: Vec::new(),
             history: History::in_memory(),
+            last_procs: Vec::new(),
         }
     }
 
@@ -526,6 +529,11 @@ impl Engine {
     /// The memory history this engine records.
     pub fn history(&self) -> &History {
         &self.history
+    }
+
+    /// The processes seen by the last `tick`.
+    pub fn last_procs(&self) -> &[Proc] {
+        &self.last_procs
     }
 
     /// Re-read the settings if settings.toml or team.toml changed on disk.
@@ -599,6 +607,7 @@ impl Engine {
             }
         }
         write_status(&st);
+        self.last_procs = snap.procs;
         st
     }
 

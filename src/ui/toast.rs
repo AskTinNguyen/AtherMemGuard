@@ -818,6 +818,62 @@ pub mod catalog {
         keyed(toast(ToastKind::Error, "Couldn't save that setting".into(), message.to_string()), "save")
     }
 
+    /// "Steam, Spotify and Blender"
+    fn and_list(names: &[String]) -> String {
+        match names {
+            [] => String::new(),
+            [one] => one.clone(),
+            [rest @ .., last] => format!("{} and {}", rest.join(", "), last),
+        }
+    }
+
+    /// Unreal work started and the checkup found at least `nudge_above_gb` to free
+    /// (docs/UI.md section 6); `top` are the biggest apps, at most three are named.
+    pub fn checkup_nudge(gb_free: f64, top: &[String]) -> Toast {
+        let names: Vec<String> = top.iter().take(3).cloned().collect();
+        let body = if names.is_empty() { String::new() } else { format!("{}.", and_list(&names)) };
+        keyed(
+            with(toast(ToastKind::Info, format!("{} GB is in use by apps Unreal doesn't need", gb(gb_free)), body), "Review", Command::OpenDoctor),
+            "checkup",
+        )
+    }
+
+    /// A cleanup from the checkup window finished.
+    pub fn checkup_done(freed_gb: f64, startup_off: usize) -> Toast {
+        let mut parts = Vec::new();
+        if freed_gb >= 0.05 {
+            parts.push(format!("Freed about {} GB.", gb(freed_gb)));
+        }
+        match startup_off {
+            0 => {}
+            1 => parts.push("1 app won't start with Windows any more.".to_string()),
+            n => parts.push(format!("{} apps won't start with Windows any more.", n)),
+        }
+        keyed(with(toast(ToastKind::Info, "Checkup done".into(), parts.join(" ")), "Undo", Command::UndoDoctor), "checkup")
+    }
+
+    /// The guard asked a `close_while_unreal` app to close.
+    pub fn guard_closed(app: &str) -> Toast {
+        keyed(
+            with(
+                toast(ToastKind::Info, format!("Closed {}", app), "It's on your list to stay closed while Unreal is running.".into()),
+                "Allow this time",
+                Command::AllowGuarded,
+            ),
+            "guard",
+        )
+    }
+
+    /// "Undo" on "Checkup done" finished. Not in the catalogue table: the undo needs an answer.
+    /// `problems` are the reasons parts couldn't be undone (empty when everything was).
+    pub fn checkup_undone(problems: &[String]) -> Toast {
+        if problems.is_empty() {
+            keyed(toast(ToastKind::Info, "Undid the last cleanup".into(), "Everything it changed is back as it was.".into()), "checkup")
+        } else {
+            keyed(toast(ToastKind::Warning, "Couldn't undo all of it".into(), problems.join(" ")), "checkup")
+        }
+    }
+
     /// One sample of every toast with the mockup's numbers: (snapshot name, toast).
     pub fn samples() -> Vec<(&'static str, Toast)> {
         vec![
@@ -842,6 +898,10 @@ pub mod catalog {
             ("setup-copied", setup_copied()),
             ("hotkey-taken", hotkey_taken("Ctrl+Alt+M")),
             ("save-failed", save_failed("settings.toml is read-only.")),
+            ("checkup-nudge", checkup_nudge(6.3, &["Steam".into(), "Blender".into(), "Spotify".into(), "iCUE".into()])),
+            ("checkup-done", checkup_done(3.2, 2)),
+            ("guard-closed", guard_closed("Steam")),
+            ("checkup-undone", checkup_undone(&[])),
         ]
     }
 }
@@ -949,6 +1009,21 @@ mod tests {
         assert_eq!(catalog::first_run("Ctrl+Alt+M").body, "It keeps memory free for Unreal. Ctrl+Alt+M frees memory now.");
         assert_eq!(catalog::settings_problem("Bad value").body, "Bad value. The last good settings are still in use.");
         assert!(catalog::samples().len() >= 19);
+
+        // docs/UI.md section 6.
+        let n = catalog::checkup_nudge(6.34, &["Steam".into(), "Blender".into(), "Spotify".into(), "iCUE".into()]);
+        assert_eq!(n.title, "6.3 GB is in use by apps Unreal doesn't need");
+        assert_eq!(n.body, "Steam, Blender and Spotify.");
+        assert_eq!(n.actions, vec![("Review".to_string(), Command::OpenDoctor)]);
+        assert_eq!(catalog::checkup_nudge(4.0, &["Steam".into()]).body, "Steam.");
+        let d = catalog::checkup_done(3.2, 2);
+        assert_eq!((d.title.as_str(), d.body.as_str()), ("Checkup done", "Freed about 3.2 GB. 2 apps won't start with Windows any more."));
+        assert_eq!(d.actions, vec![("Undo".to_string(), Command::UndoDoctor)]);
+        assert_eq!(catalog::checkup_done(1.0, 0).body, "Freed about 1.0 GB.");
+        assert_eq!(catalog::checkup_done(0.0, 1).body, "1 app won't start with Windows any more.");
+        let g = catalog::guard_closed("Steam");
+        assert_eq!((g.title.as_str(), g.body.as_str()), ("Closed Steam", "It's on your list to stay closed while Unreal is running."));
+        assert_eq!(g.actions, vec![("Allow this time".to_string(), Command::AllowGuarded)]);
     }
 
     #[test]
