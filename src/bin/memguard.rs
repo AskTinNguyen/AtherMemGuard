@@ -431,8 +431,8 @@ fn main() -> ExitCode {
 
         Cmd::Wait { workload, ram_gb, commit_gb, timeout, prime, json } => {
             let cfg = load_config();
-            let base = workload.and_then(|w| cfg.prime.target(w.name())).unwrap_or(Target { ram_gb: 0.0, commit_gb: 0.0 });
-            let need = Target { ram_gb: ram_gb.unwrap_or(base.ram_gb), commit_gb: commit_gb.unwrap_or(base.commit_gb) };
+            let base = workload.and_then(|w| cfg.prime.target(w.name())).unwrap_or(Target { ram_gb: 0.0, commit_gb: 0.0, disk_gb: None });
+            let need = Target { ram_gb: ram_gb.unwrap_or(base.ram_gb), commit_gb: commit_gb.unwrap_or(base.commit_gb), disk_gb: None };
             if need.ram_gb <= 0.0 && need.commit_gb <= 0.0 {
                 eprintln!("Say what to wait for: --for editor|build|cook, or --ram-gb / --commit-gb.");
                 return ExitCode::from(1);

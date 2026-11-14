@@ -378,6 +378,10 @@ fn default_growth_alert() -> f64 {
 pub struct Target {
     pub ram_gb: f64,
     pub commit_gb: f64,
+    /// Reserved for the disk gate in a later version: accepted so a newer settings or team
+    /// file still loads here, and ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_gb: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -469,6 +473,10 @@ pub struct Config {
     /// validates them itself; the table is carried here so the file still loads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doctor: Option<toml::Table>,
+    /// Reserved for disk and Dev Drive settings in a later version: accepted so a newer
+    /// settings or team file still loads here, and ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk: Option<toml::Table>,
     /// Every group, including disabled ones (`enabled = false`); the engine skips those.
     #[serde(default, rename = "group")]
     pub groups: Vec<Group>,
@@ -1344,6 +1352,17 @@ mod tests {
         assert!(Config::parse("intervalsec = 5").is_err());
         assert!(config_from_layers(None, "intervalsec = 5").is_err());
         assert!(config_from_layers(None, "[general]\npresett = \"gentle\"").is_err());
+    }
+
+    #[test]
+    fn disk_keys_from_a_newer_version_still_load() {
+        let text = "[prime]\ncook = { ram_gb = 32, commit_gb = 48, disk_gb = 100 }\n\n[disk]\nenabled = true\ncritical_free_gb = 50\nwatch = [\"auto\"]\n";
+        let (cfg, _) = config_from_layers(None, text).expect("a [disk] table and disk_gb must load");
+        assert_eq!(cfg.prime.cook.ram_gb, 32.0);
+        assert_eq!(cfg.prime.cook.disk_gb, Some(100.0));
+        assert!(cfg.disk.is_some());
+        // Typos elsewhere are still caught.
+        assert!(config_from_layers(None, "[prime]\ncook = { ram_gb = 32, commit_gb = 48, dsk_gb = 100 }").is_err());
     }
 
     #[test]

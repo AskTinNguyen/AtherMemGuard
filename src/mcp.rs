@@ -195,8 +195,8 @@ impl Server {
                     ));
                 }
                 let cfg = (self.load_config)();
-                let base = workload.and_then(|w| cfg.prime.target(w)).unwrap_or(Target { ram_gb: 0.0, commit_gb: 0.0 });
-                let need = Target { ram_gb: ram_gb.unwrap_or(base.ram_gb), commit_gb: commit_gb.unwrap_or(base.commit_gb) };
+                let base = workload.and_then(|w| cfg.prime.target(w)).unwrap_or(Target { ram_gb: 0.0, commit_gb: 0.0, disk_gb: None });
+                let need = Target { ram_gb: ram_gb.unwrap_or(base.ram_gb), commit_gb: commit_gb.unwrap_or(base.commit_gb), disk_gb: None };
                 if need.ram_gb <= 0.0 && need.commit_gb <= 0.0 {
                     return Err(ToolError("Nothing to wait for: the RAM and commit needed are both 0.".into()));
                 }
