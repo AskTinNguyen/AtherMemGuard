@@ -1,0 +1,6 @@
+//! Custom-drawn UI: theme, canvas, widget kit, window layer, toasts and the settings window.
+//! See docs/UI.md. All Win32 drawing lives here.
+
+pub mod canvas;
+pub mod geom;
+pub mod theme;

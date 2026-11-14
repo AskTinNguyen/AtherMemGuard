@@ -14,6 +14,7 @@ pub mod logo;
 pub mod ops;
 pub mod paths;
 pub mod tray;
+pub mod ui;
 pub mod win;
 
 pub mod log {
