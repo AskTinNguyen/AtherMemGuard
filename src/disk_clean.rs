@@ -806,7 +806,22 @@ pub fn thousands(n: u64) -> String {
 /// symbolic link inside is removed as a link and its target is left alone. Read-only files
 /// are made writable first. Reports exactly what was removed and what remains.
 pub fn delete_tree(root: &Path) -> DeleteReport {
+    use std::os::windows::fs::MetadataExt;
     let mut r = DeleteReport::default();
+    // The callers' checks refuse a root that is a link, but the root can change between that
+    // check and now (and the bin's expiry has no such check): never walk into a link's target.
+    if let Ok(m) = std::fs::symlink_metadata(root) {
+        let a = m.file_attributes();
+        if a & disk_win::A_REPARSE != 0 {
+            let res = if a & disk_win::A_DIR != 0 { std::fs::remove_dir(root) } else { std::fs::remove_file(root) };
+            match res {
+                Ok(()) => r.links += 1,
+                Err(err) => r.fail(root, &err),
+            }
+            r.remains = std::fs::symlink_metadata(root).is_ok();
+            return r;
+        }
+    }
     delete_dir(root, &mut r);
     r.remains = std::fs::symlink_metadata(root).is_ok();
     r
@@ -2377,6 +2392,25 @@ mod tests {
         assert_eq!(rep.failed_count, 1);
         assert!(rep.words().starts_with("Removed 1 file (less than 1 MB)") && rep.words().contains("1 could not be removed"), "{}", rep.words());
         drop(held);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_of_a_root_that_is_a_link_removes_only_the_link() {
+        let root = std::env::temp_dir().join(format!("amg-clean-rootlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let target = root.join("Content");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("keep.uasset"), b"precious").unwrap();
+        let link = root.join("Intermediate");
+        let ok = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&link).arg(&target).output().map(|o| o.status.success()).unwrap_or(false);
+        if ok {
+            let rep = delete_tree(&link);
+            assert_eq!((rep.links, rep.files, rep.dirs), (1, 0, 0), "{:?}", rep);
+            assert!(!rep.remains);
+            assert!(!link.exists());
+            assert_eq!(std::fs::read(target.join("keep.uasset")).unwrap(), b"precious", "the link's target is untouched");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

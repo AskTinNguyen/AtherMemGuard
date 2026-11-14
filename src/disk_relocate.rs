@@ -205,6 +205,8 @@ pub struct VarState {
     pub exists: bool,
     pub volume: Option<String>,
     pub size: Option<u64>,
+    /// The count stopped before the whole folder was read: `size` is a lower bound.
+    pub size_partial: bool,
 }
 
 /// A drive the caches could go to.
@@ -226,6 +228,9 @@ pub struct PlanEntry {
     pub old_location: String,
     pub new_location: Option<String>,
     pub size: Option<u64>,
+    /// `size` is a lower bound: the count stopped before the whole folder was read.
+    #[serde(default)]
+    pub size_partial: bool,
     /// "set" or "skip".
     pub action: String,
     pub reason: Option<String>,
@@ -237,6 +242,9 @@ pub struct RelocatePlan {
     pub entries: Vec<PlanEntry>,
     /// Bytes the moved caches hold now: what the destination should have room for.
     pub need: u64,
+    /// `need` is a lower bound: at least one cache was too big to count in time.
+    #[serde(default)]
+    pub need_partial: bool,
     pub dest_free_now: Option<u64>,
     pub dest_free_after: Option<u64>,
     /// Why nothing will be set.
@@ -249,6 +257,7 @@ pub struct RelocatePlan {
 pub fn plan(vars: &[VarState], system: Option<&str>, vols: &[DestVolume], to: Option<(&str, &str)>, s: &DiskSettings) -> RelocatePlan {
     let mut entries = Vec::new();
     let mut need = 0u64;
+    let mut need_partial = false;
     for v in vars {
         let on_system = v.volume.as_deref().zip(system).is_some_and(|(a, b)| a.eq_ignore_ascii_case(b));
         let (action, reason) = if !v.exists {
@@ -257,14 +266,15 @@ pub fn plan(vars: &[VarState], system: Option<&str>, vols: &[DestVolume], to: Op
             ("skip", Some("already off the system drive".to_string()))
         } else {
             need += v.size.unwrap_or(0);
+            need_partial |= v.size_partial || v.size.is_none();
             ("set", None)
         };
-        entries.push(PlanEntry { name: v.name.clone(), what: v.what.clone(), old_location: v.location.clone(), new_location: None, size: v.size, action: action.into(), reason });
+        entries.push(PlanEntry { name: v.name.clone(), what: v.what.clone(), old_location: v.location.clone(), new_location: None, size: v.size, size_partial: v.size_partial, action: action.into(), reason });
     }
     let mut notes: Vec<String> = NEVER.iter().map(|(n, why)| format!("{} is never moved: {}.", n, why)).collect();
     notes.push("Zen's cache isn't moved: its data path setting isn't confirmed yet.".into());
     notes.push("Nothing is copied or deleted. The old caches stay where they are until you remove them, so total use goes up at first.".into());
-    let mut p = RelocatePlan { destination: None, entries, need, dest_free_now: None, dest_free_after: None, refused: None, notes };
+    let mut p = RelocatePlan { destination: None, entries, need, need_partial, dest_free_now: None, dest_free_after: None, refused: None, notes };
     if !p.entries.iter().any(|e| e.action == "set") {
         p.refused = Some("Nothing to move: no cache this covers is on the system drive.".into());
         return p;
@@ -310,7 +320,7 @@ pub fn plan(vars: &[VarState], system: Option<&str>, vols: &[DestVolume], to: Op
 }
 
 /// Read this PC: every variable's current value (from `store`), where its cache is, how big.
-pub fn read_vars(store: &dyn EnvStore, sizer: &dyn Fn(&str) -> Option<u64>) -> Vec<VarState> {
+pub fn read_vars(store: &dyn EnvStore, sizer: &dyn Fn(&str) -> Option<(u64, bool)>) -> Vec<VarState> {
     cache_vars()
         .into_iter()
         .map(|cv| {
@@ -323,8 +333,12 @@ pub fn read_vars(store: &dyn EnvStore, sizer: &dyn Fn(&str) -> Option<u64>) -> V
                 .unwrap_or_default();
             let exists = !location.is_empty() && Path::new(&location).is_dir();
             let volume = if location.is_empty() { None } else { existing_volume(&location) };
-            let size = if exists { sizer(&location) } else { None };
-            VarState { name: cv.name.into(), what: cv.what.into(), sub: cv.sub.into(), current, location, exists, volume, size }
+            let counted = if exists { sizer(&location) } else { None };
+            let (size, size_partial) = match counted {
+                Some((bytes, complete)) => (Some(bytes), !complete),
+                None => (None, false),
+            };
+            VarState { name: cv.name.into(), what: cv.what.into(), sub: cv.sub.into(), current, location, exists, volume, size, size_partial }
         })
         .collect()
 }
@@ -353,23 +367,25 @@ pub fn dest_volumes() -> Vec<DestVolume> {
         .collect()
 }
 
-/// Size a folder fast (enumeration only, no file opened): allocated bytes.
-pub fn quick_size(path: &str) -> Option<u64> {
+/// Size a folder (enumeration only, no file opened): allocated bytes, and whether every folder
+/// was read. A cache can hold hundreds of thousands of files (a DDC here: 693,000), so the count
+/// gets 3 minutes; when it stops early the bytes are a lower bound and say so.
+pub fn quick_size(path: &str) -> Option<(u64, bool)> {
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::{Arc, Mutex};
     let vs = crate::disk_win::VolumeScan {
         cluster: 4096,
         block_cloning: false,
         level2: false,
-        threads: 4,
-        deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+        threads: 8,
+        deadline: std::time::Instant::now() + std::time::Duration::from_secs(180),
         stop: Arc::new(AtomicBool::new(false)),
         started_ft: u64::MAX,
         multi: Mutex::new(std::collections::HashMap::new()),
         progress_files: Arc::new(AtomicU64::new(0)),
     };
     let (st, _) = crate::disk_win::walk_item(&vs, 0, &[path.to_string()], &[]);
-    Some(st.allocated)
+    Some((st.allocated, !st.cut_short && st.dir_failures == 0))
 }
 
 // ---------------------------------------------------------------- apply and undo
@@ -469,11 +485,12 @@ pub fn plan_json(p: &RelocatePlan, store: &str) -> Value {
         "store": store,
         "destination": p.destination,
         "need_gb": gb2(p.need),
+        "need_is_lower_bound": p.need_partial,
         "dest_free_now_gb": p.dest_free_now.map(gb2),
         "dest_free_after_gb": p.dest_free_after.map(gb2),
         "refused": p.refused,
         "entries": p.entries.iter().map(|e| json!({ "variable": e.name, "what": e.what, "now": e.old_location, "new": e.new_location,
-            "size_gb": e.size.map(gb2), "action": e.action, "reason": e.reason })).collect::<Vec<_>>(),
+            "size_gb": e.size.map(gb2), "size_is_lower_bound": e.size_partial, "action": e.action, "reason": e.reason })).collect::<Vec<_>>(),
         "notes": p.notes,
     })
 }
@@ -486,7 +503,11 @@ pub fn render_plan(p: &RelocatePlan) -> String {
         None => s.push_str("Caches that could move off the system drive:\n"),
     }
     for e in &p.entries {
-        let size = e.size.map(|b| format!("{:.1} GB", gb2(b))).unwrap_or_else(|| "-".into());
+        let size = match e.size {
+            Some(b) if e.size_partial => format!("{:.1}+ GB", gb2(b)),
+            Some(b) => format!("{:.1} GB", gb2(b)),
+            None => "-".into(),
+        };
         match (&e.action[..], &e.new_location) {
             ("set", Some(n)) => s.push_str(&format!("  {:<28} {:>9}  {}\n  {:<28} {:>9}  -> {}\n", e.name, size, e.old_location, "", "", n)),
             ("set", None) => s.push_str(&format!("  {:<28} {:>9}  {}\n", e.name, size, e.old_location)),
@@ -494,7 +515,12 @@ pub fn render_plan(p: &RelocatePlan) -> String {
         }
     }
     if let (Some(now), Some(after)) = (p.dest_free_now, p.dest_free_after) {
-        s.push_str(&format!("The caches hold {:.1} GB now. {} has {:.0} GB free; about {:.0} GB if they grow back to that size there.\n", gb2(p.need), p.destination.as_deref().unwrap_or(""), gb2(now), gb2(after)));
+        let held = if p.need_partial { format!("at least {:.1} GB", gb2(p.need)) } else { format!("{:.1} GB", gb2(p.need)) };
+        let left = if p.need_partial { format!("less than {:.0} GB", gb2(after)) } else { format!("about {:.0} GB", gb2(after)) };
+        s.push_str(&format!("The caches hold {} now. {} has {:.0} GB free; {} if they grow back to that size there.\n", held, p.destination.as_deref().unwrap_or(""), gb2(now), left));
+        if p.need_partial {
+            s.push_str("A size ending in + is where counting stopped before the whole folder was read: the cache holds at least that much.\n");
+        }
     }
     if let Some(r) = &p.refused {
         s.push_str(&format!("Not offered: {}\n", r));
@@ -544,11 +570,37 @@ mod tests {
     }
 
     fn var(name: &str, loc: &str, vol: &str, size_gb: u64, exists: bool) -> VarState {
-        VarState { name: name.into(), what: name.into(), sub: name.into(), current: None, location: loc.into(), exists, volume: Some(vol.into()), size: Some(size_gb * G) }
+        VarState { name: name.into(), what: name.into(), sub: name.into(), current: None, location: loc.into(), exists, volume: Some(vol.into()), size: Some(size_gb * G), size_partial: false }
     }
 
     fn vol(guid: &str, avail_gb: u64, total_gb: u64, suitable: bool) -> DestVolume {
         DestVolume { guid: guid.into(), name: format!("{}:", guid), root: format!("{}:\\", guid), avail: avail_gb * G, total: total_gb * G, suitable }
+    }
+
+    #[test]
+    fn a_count_that_stopped_early_is_shown_as_a_lower_bound() {
+        // Found live: a 112.8 GB DDC (693,000 files) hit the count's deadline and printed as
+        // "1.4 GB", as if that were all of it.
+        let s = DiskSettings::default();
+        let mut ddc = var("UE-LocalDataCachePath", r"C:\u\ddc", "C", 1, true);
+        ddc.size_partial = true;
+        let vars = vec![ddc, var("npm_config_cache", r"C:\u\npm", "C", 3, true)];
+        let vols = vec![vol("C", 298, 1903, true), vol("E", 1739, 1863, true)];
+        let p = plan(&vars, Some("C"), &vols, None, &s);
+        assert!(p.need_partial);
+        assert!(p.entries[0].size_partial && !p.entries[1].size_partial);
+        let text = render_plan(&p);
+        assert!(text.contains("1.0+ GB"), "{}", text);
+        assert!(text.contains("The caches hold at least 4.0 GB now"), "{}", text);
+        assert!(text.contains("less than"), "{}", text);
+        let j = plan_json(&p, "memory");
+        assert_eq!(j["need_is_lower_bound"], true);
+        assert_eq!(j["entries"][0]["size_is_lower_bound"], true);
+        assert_eq!(j["entries"][1]["size_is_lower_bound"], false);
+        // A complete count reads as before.
+        let p = plan(&[var("npm_config_cache", r"C:\u\npm", "C", 3, true)], Some("C"), &vols, None, &s);
+        assert!(!p.need_partial);
+        assert!(render_plan(&p).contains("The caches hold 3.0 GB now"));
     }
 
     #[test]
