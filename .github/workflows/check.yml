@@ -18,6 +18,8 @@ jobs:
       CARGO_TERM_COLOR: always
       # Anything that reads settings or writes a log uses this folder, never the runner's profile.
       ATHER_MEMGUARD_DIR: ${{ github.workspace }}\target\test-home
+      # The runner is throwaway, so the doctor test that writes a test value to HKCU runs here.
+      MEMGUARD_TEST_HKCU: "1"
     steps:
       - uses: actions/checkout@v4
       - name: Rust toolchain

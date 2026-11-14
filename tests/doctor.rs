@@ -1,7 +1,8 @@
 //! Doctor actions against things these tests create themselves, and nothing else:
 //! a copy of powershell.exe showing a window ("DoctorTestWindow"), a copy of ping.exe
 //! ("DoctorTestPing"), and a throwaway HKCU Run value named `AtherMemGuardDoctorTest`
-//! (plus its StartupApproved twin), removed afterwards. Every report here is built by hand
+//! (plus its StartupApproved twin), removed afterwards; that one only with
+//! `MEMGUARD_TEST_HKCU=1`. Every report here is built by hand
 //! with the test's own PIDs, so nothing depends on the live process list.
 //!
 //! `ATHER_MEMGUARD_DIR` points at a temp folder, so the undo log, settings and log never
@@ -75,6 +76,7 @@ fn app_finding(id: &str, name: &str, pids: Vec<u32>, actions: &[ActionKind]) -> 
         has_window: false,
         group: None,
         startup: None,
+        company: String::new(),
     }
 }
 
@@ -253,8 +255,14 @@ impl Drop for RunValue {
     }
 }
 
+/// Writes a throwaway value to HKCU's Run key, so it only runs where that is wanted (CI sets
+/// `MEMGUARD_TEST_HKCU=1`); on a teammate's PC `cargo test` leaves the registry alone.
 #[test]
 fn switches_the_throwaway_startup_value_off_and_undoes_it() {
+    if std::env::var("MEMGUARD_TEST_HKCU").as_deref() != Ok("1") {
+        eprintln!("skipped: set MEMGUARD_TEST_HKCU=1 to let this test write HKCU");
+        return;
+    }
     let (_g, dir) = setup();
     let target = dir.join("DoctorTestStartup.exe");
     let _value = RunValue::create(&format!("\"{}\" --background", target.display()));

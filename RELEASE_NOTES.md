@@ -9,11 +9,38 @@
 ## What's new
 
 ### One file to install, and updates in the app
-- **One setup exe:** `AtherMemGuard-Setup-<version>.exe` is the app itself. Run it and it installs both programs, adds a **Start menu** shortcut and an entry in **Settings › Apps**, and starts.
-- **Updates itself:** the app checks GitHub for a newer version, downloads it next to itself, checks its size and SHA-256, swaps it in and restarts. Nothing is installed if the download doesn't match.
+- **One setup exe:** `AtherMemGuard-Setup-<version>.exe` is the app itself. It opens a small setup window with two switches, **Start with Windows** and **Add the memguard command**, installs both programs, adds a **Start menu** shortcut and an entry in **Settings › Apps**, and starts. **Run without installing** runs it from where it is.
+- **Updates itself:** the app checks GitHub once a day for a newer version, downloads it next to itself, checks its size and SHA-256, swaps it in and restarts. Nothing is installed if the download doesn't match. The release files have to be reachable from your PC: while the repository is private, only teammates with access get automatic updates.
 - **Your own update server:** `[updates] manifest_url` in the settings points the app at another `latest.json`, for teams that host their own builds.
-- **Uninstall the usual way:** Settings › Apps › Ather MemGuard › Uninstall. Settings and the log are kept.
-- **Silent install for scripts:** `AtherMemGuard-Setup-<version>.exe --install [--no-path] [--no-start]`.
+- **Uninstall the usual way:** Settings › Apps › Ather MemGuard › Uninstall asks first, then puts every app back to normal. Settings, history and the log are kept.
+- **Silent install for scripts:** `AtherMemGuard-Setup-<version>.exe --install [--no-path] [--no-startup] [--no-start]`, or `memguard install --no-startup`.
+
+### A tray app you can read at a glance
+- **Flyout:** click the tray icon to see whether memory is fine, tight or critical, RAM and commit free, what Unreal is doing and how each app group sits against its cap, with **Free memory**, **Pause 30 min** and **Settings**.
+- **Toasts** in Ather style, only when something changed: memory critical and fine again, memory freed for a build or cook, the editor is big or growing fast, an update is ready.
+- **Free memory shortcut:** **Ctrl+Alt+M** from anywhere (change it in Settings).
+- **Pause** for 30 minutes or until you resume; every app goes back to normal meanwhile.
+
+### Settings people can use
+- **Settings window:** every setting with a plain description, search, changes saved as you make them, right-click to reset. Risky options (freeze, hard cap) are red and off by default.
+- **Presets:** Gentle, Balanced or Aggressive scales every limit at once.
+- **Limits that scale with RAM:** soft caps are a share of your RAM, so one settings file suits a 32 GB and a 128 GB PC.
+- **Team defaults:** load a team file and it sits under your own settings; what you changed still wins. **Export** and **Import** your settings.
+- **0.1 settings:** an untouched 0.1 file is replaced by the new template (kept as `.bak`); one you edited keeps working.
+
+### Checkup
+- **Run a checkup** from the tray: what is using memory that Unreal doesn't need (launchers, music, overlays, apps that start with Windows, big tools you might not be using, unknown apps, Unreal leftovers), how much could be freed, and one click to clean up what you tick. Apps are asked to close, never forced; anything unsaved stays. **Undo last cleanup** reverses it.
+- **A nudge when Unreal starts:** if 4 GB or more could be freed, a toast says so, at most once a day.
+- **Keep apps closed while Unreal runs:** apps on that list are asked to close when they start during Unreal work, with **Allow this time** on the toast.
+- `memguard doctor` is the same checkup for the command line and agents.
+
+### Memory history and smarter freeing
+- **Memory history** window: Unreal's memory, RAM free and commit free over 1 hour to 7 days, with tight and critical spells, memory freed and editor starts marked. Recorded to a CSV file per day.
+- **Free memory when a build or cook starts**, automatically.
+- **Editor alerts:** a toast when the editor passes its restart hint or keeps growing fast, with how long until memory runs out.
+
+### For agents
+- **MCP server:** `memguard mcp` gives Claude Code, Codex and other agents MemGuard as tools (status, prime, wait, advise, history and a read-only checkup). **Copy setup** in Settings, or `memguard agent-setup`, gives the text to paste. See `docs/AI-AGENTS.md`.
 
 ## Checksums
 

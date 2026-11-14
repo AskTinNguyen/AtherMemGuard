@@ -35,6 +35,16 @@ pub fn exit_event() -> &'static str {
     }
 }
 
+/// Signalled by `AtherMemGuard.exe --settings` to ask the running tray to open its settings
+/// window (the tray polls it every second, like the exit event).
+pub fn settings_event() -> &'static str {
+    if test_home().is_some() {
+        "Local\\AtherMemGuard.OpenSettings.Test"
+    } else {
+        "Local\\AtherMemGuard.OpenSettings"
+    }
+}
+
 fn env_dir(name: &str) -> PathBuf {
     std::env::var_os(name).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
 }

@@ -280,6 +280,24 @@ pub mod model {
         }
     }
 
+    /// May the checkup nudge run now? Never with notifications off, once at a time, at most
+    /// once per calendar day.
+    pub fn should_nudge(notifications: bool, running: bool, last_day: Option<&str>, today: &str) -> bool {
+        notifications && !running && last_day != Some(today)
+    }
+
+    /// The nudge for a checkup report: (GB that could be freed, the biggest apps Unreal
+    /// doesn't need, largest first), or `None` below `threshold_gb`.
+    pub fn nudge_for(r: &crate::doctor::Report, threshold_gb: f64) -> Option<(f64, Vec<String>)> {
+        use crate::doctor::{FindingKind, Verdict};
+        if r.reclaimable_ram_gb < threshold_gb || r.reclaimable_ram_gb <= 0.0 {
+            return None;
+        }
+        let mut apps: Vec<&crate::doctor::Finding> = r.findings.iter().filter(|f| f.kind == FindingKind::App && f.verdict == Verdict::Close).collect();
+        apps.sort_by(|a, b| b.ram_mb.cmp(&a.ram_mb));
+        Some((r.reclaimable_ram_gb, apps.iter().take(3).map(|f| f.title.clone()).collect()))
+    }
+
     /// A value from the `[tray]` table of ui-state.toml.
     pub fn tray_value(text: &str, key: &str) -> Option<toml::Value> {
         text.parse::<toml::Table>().ok()?.get("tray")?.as_table()?.get(key).cloned()
@@ -366,6 +384,16 @@ fn clock_after(d: Duration) -> String {
     clock_plus(h, m, d.as_secs().div_ceil(60))
 }
 
+/// Today's local date, "2026-11-14".
+fn today() -> String {
+    win::local_time_string().chars().take(10).collect()
+}
+
+/// The day the checkup nudge last showed (ui-state.toml `[tray] last_nudge_day`).
+fn last_nudge_day() -> Option<String> {
+    tray_state("last_nudge_day").and_then(|v| v.as_str().map(str::to_string))
+}
+
 /// ui-state.toml `[tray]` values (first run, last announced update).
 fn tray_state(key: &str) -> Option<toml::Value> {
     tray_value(&std::fs::read_to_string(crate::ui::ui_state::file()).unwrap_or_default(), key)
@@ -389,21 +417,272 @@ pub fn post_command(cmd: Command) {
     }
 }
 
-// ---------------------------------------------------------------- windows built by Part E2
+// ---------------------------------------------------------------- memory history and checkup windows
 
-// INTEGRATION: open E2's memory history window (src/ui/history.rs) here.
+/// Memory history for the window. Ranges up to 24 hours come from the engine's in-memory
+/// history (filled from disk at start), longer ones from the daily CSV files. Called on the
+/// tray thread.
+struct TrayHistory;
+
+impl crate::ui::history::HistorySource for TrayHistory {
+    fn samples(&self, since: Duration) -> Vec<crate::history::Sample> {
+        if since <= Duration::from_secs(24 * 3600) {
+            if let Some(s) = with_app(|a| a.engine.history().series(since)) {
+                return s;
+            }
+        }
+        crate::history::load_since(since)
+    }
+    fn interval_sec(&self) -> u64 {
+        with_app(|a| a.engine.cfg.interval_sec).unwrap_or(10)
+    }
+    fn keep_days(&self) -> u32 {
+        with_app(|a| a.engine.cfg.history.keep_days).unwrap_or(7)
+    }
+    fn ram_total_gb(&self) -> f64 {
+        win::sys_info().ram_total as f64 / (1024.0 * 1024.0 * 1024.0)
+    }
+    fn folder(&self) -> PathBuf {
+        crate::history::history_dir()
+    }
+}
+
 pub fn open_history_window() {
-    crate::log::write("memory history window: not wired yet");
+    flyout::close();
+    crate::ui::history::open_history(Box::new(TrayHistory));
 }
 
-// INTEGRATION: open E2's checkup window (src/ui/doctor.rs) here.
 pub fn open_doctor_window() {
-    crate::log::write("checkup window: not wired yet");
+    flyout::close();
+    let tray = TRAY_HWND.load(Ordering::SeqCst);
+    crate::ui::doctor::open_doctor(Box::new(RealDoctor::new(tray)));
 }
 
-// INTEGRATION: call doctor::undo (Part F) here and show its toast.
+/// "Undo" on the "Checkup done" toast: reverse the last cleanup on a worker thread.
 pub fn undo_doctor() {
-    crate::log::write("undo checkup: not wired yet");
+    let h = TRAY_HWND.load(Ordering::SeqCst);
+    if h != 0 {
+        spawn_work(h as HWND, || Work::Undone(crate::doctor::undo(true, None)));
+    }
+}
+
+/// The checkup window's data and actions over the real doctor (docs/DESIGN.md Part F). Runs
+/// on the window's worker thread: it touches no UI state, and tells the tray about a finished
+/// cleanup by posting it a message.
+pub struct RealDoctor {
+    /// The last real report, which `apply` acts on.
+    last: std::sync::Mutex<Option<crate::doctor::Report>>,
+    /// What a fresh scan after the last `apply` says could still be freed.
+    after_apply: std::sync::Mutex<Option<f64>>,
+    /// The tray window, for the "Checkup done" toast. 0 = no toast, no rescan (tests).
+    tray: isize,
+}
+
+impl RealDoctor {
+    pub fn new(tray: isize) -> RealDoctor {
+        RealDoctor { last: std::sync::Mutex::new(None), after_apply: std::sync::Mutex::new(None), tray }
+    }
+
+    /// Start from a report built elsewhere (tests).
+    pub fn with_report(report: crate::doctor::Report) -> RealDoctor {
+        let d = RealDoctor::new(0);
+        *d.last.lock().unwrap() = Some(report);
+        d
+    }
+
+    fn fresh_scan() -> crate::doctor::Report {
+        crate::doctor::scan(&crate::doctor::load_config_readonly())
+    }
+
+    /// `doctor::apply` on the last report, mapped both ways. No rescan, no toast.
+    pub fn apply_mapped(
+        &self,
+        picks: &[(String, crate::ui::doctor::ActionKind)],
+        force: bool,
+    ) -> (Vec<crate::ui::doctor::Outcome>, Option<CleanupSummary>) {
+        use crate::ui::doctor as vm;
+        let report = self.last.lock().unwrap().clone();
+        let Some(report) = report else {
+            let outs = picks
+                .iter()
+                .map(|(id, k)| vm::Outcome { finding_id: id.clone(), action: *k, status: vm::OutcomeStatus::Skipped, message: "Check again first".into() })
+                .collect();
+            return (outs, None);
+        };
+        let real: Vec<(String, crate::doctor::ActionKind)> = picks.iter().map(|(id, k)| (id.clone(), doctor_map::action_to_real(*k))).collect();
+        let outs = crate::doctor::apply(&report, &real, force);
+        let summary = doctor_map::cleanup_summary(&report, &outs);
+        (outs.iter().map(doctor_map::outcome_view).collect(), summary)
+    }
+}
+
+impl crate::ui::doctor::DoctorSource for RealDoctor {
+    fn scan(&self) -> crate::ui::doctor::Report {
+        let r = Self::fresh_scan();
+        let view = doctor_map::report_view(&r);
+        *self.last.lock().unwrap() = Some(r);
+        view
+    }
+
+    fn apply(&self, picks: &[(String, crate::ui::doctor::ActionKind)], force: bool) -> Vec<crate::ui::doctor::Outcome> {
+        let (outs, summary) = self.apply_mapped(picks, force);
+        if self.tray != 0 {
+            // Scan again so the window's hero number goes down; later picks act on this one.
+            let fresh = Self::fresh_scan();
+            *self.after_apply.lock().unwrap() = Some(fresh.reclaimable_ram_gb);
+            *self.last.lock().unwrap() = Some(fresh);
+            if let Some(s) = summary {
+                post_work(self.tray, Work::CheckupDone(s));
+            }
+        }
+        outs
+    }
+
+    fn undo_last(&self) -> Vec<crate::ui::doctor::Outcome> {
+        crate::doctor::undo(true, None).iter().filter(|o| !o.finding_id.is_empty()).map(doctor_map::outcome_view).collect()
+    }
+
+    fn can_undo(&self) -> bool {
+        crate::doctor::UndoLog::load().can_undo()
+    }
+
+    fn reclaimable_after_apply(&self) -> Option<f64> {
+        self.after_apply.lock().unwrap().take()
+    }
+}
+
+/// What a cleanup did, for the "Checkup done" toast.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CleanupSummary {
+    /// RAM of the apps that were closed or ended, GB.
+    pub freed_gb: f64,
+    /// Startup entries switched off.
+    pub startup_off: usize,
+}
+
+/// Mapping between the real doctor's report and the checkup window's view model. Pure.
+pub mod doctor_map {
+    use super::CleanupSummary;
+    use crate::doctor as real;
+    use crate::ui::doctor as vm;
+
+    /// Where "How to fix" goes for a THIS PC finding.
+    pub fn help_url(id: &str) -> Option<String> {
+        match id {
+            "sys:pagefile" | "sys:commit" => Some(
+                "https://learn.microsoft.com/en-us/troubleshoot/windows-client/performance/how-to-determine-the-appropriate-page-file-size-for-64-bit-versions-of-windows"
+                    .into(),
+            ),
+            _ => None,
+        }
+    }
+
+    pub fn action_view(k: real::ActionKind) -> vm::ActionKind {
+        match k {
+            real::ActionKind::Close => vm::ActionKind::Close,
+            real::ActionKind::End => vm::ActionKind::End,
+            real::ActionKind::DisableStartup => vm::ActionKind::DisableStartup,
+            real::ActionKind::HoldBack => vm::ActionKind::HoldBack,
+            real::ActionKind::BlockWhileUnreal => vm::ActionKind::BlockWhileUnreal,
+            real::ActionKind::LeaveIt => vm::ActionKind::Keep,
+        }
+    }
+
+    pub fn action_to_real(k: vm::ActionKind) -> real::ActionKind {
+        match k {
+            vm::ActionKind::Close => real::ActionKind::Close,
+            vm::ActionKind::End => real::ActionKind::End,
+            vm::ActionKind::DisableStartup => real::ActionKind::DisableStartup,
+            vm::ActionKind::HoldBack => real::ActionKind::HoldBack,
+            vm::ActionKind::BlockWhileUnreal => real::ActionKind::BlockWhileUnreal,
+            vm::ActionKind::Keep => real::ActionKind::LeaveIt,
+        }
+    }
+
+    fn kind_view(k: real::FindingKind) -> vm::FindingKind {
+        match k {
+            real::FindingKind::App => vm::FindingKind::App,
+            real::FindingKind::Startup => vm::FindingKind::Startup,
+            real::FindingKind::Unreal => vm::FindingKind::Unreal,
+            real::FindingKind::System => vm::FindingKind::System,
+        }
+    }
+
+    fn verdict_view(v: real::Verdict) -> vm::Verdict {
+        match v {
+            real::Verdict::Close => vm::Verdict::Close,
+            real::Verdict::HoldBack => vm::Verdict::HoldBack,
+            real::Verdict::Keep => vm::Verdict::Keep,
+            real::Verdict::Review => vm::Verdict::Review,
+            real::Verdict::HeavyTool => vm::Verdict::HeavyTool,
+        }
+    }
+
+    pub fn finding_view(f: &real::Finding) -> vm::Finding {
+        // Machine-wide startup entries (HKLM, the shared Startup folder) need an administrator.
+        let needs_admin = f.kind == real::FindingKind::Startup && f.startup.as_ref().is_some_and(|e| !e.location.switchable());
+        vm::Finding {
+            id: f.id.clone(),
+            kind: kind_view(f.kind),
+            verdict: verdict_view(f.verdict),
+            title: f.title.clone(),
+            detail: f.detail.clone(),
+            processes: f.processes,
+            ram_mb: f.ram_mb,
+            committed_mb: f.committed_mb,
+            actions: f.actions.iter().map(|a| vm::Action { kind: action_view(a.kind), detail: a.label.clone() }).collect(),
+            recommended: f.recommended,
+            needs_admin,
+            company: f.company.clone(),
+            help_url: if f.kind == real::FindingKind::System { help_url(&f.id) } else { None },
+        }
+    }
+
+    pub fn report_view(r: &real::Report) -> vm::Report {
+        let memguard = r.findings.iter().find(|f| f.id == "sys:memguard");
+        vm::Report {
+            time: r.time.clone(),
+            system: vm::SystemStatus {
+                ram_total_gb: r.system.ram_total_gb,
+                ram_free_gb: r.system.ram_free_gb,
+                commit_limit_gb: r.system.commit_limit_gb,
+                commit_free_gb: r.system.commit_free_gb,
+                memguard_running: memguard.map_or(true, |f| !f.title.contains("isn't running")),
+                memguard_paused: memguard.is_some_and(|f| f.title.contains("paused")),
+            },
+            findings: r.findings.iter().map(finding_view).collect(),
+            reclaimable_ram_gb: r.reclaimable_ram_gb,
+            reclaimable_commit_gb: r.reclaimable_commit_gb,
+        }
+    }
+
+    pub fn outcome_view(o: &real::Outcome) -> vm::Outcome {
+        let status = match o.result {
+            real::OutcomeKind::Done | real::OutcomeKind::Undone => vm::OutcomeStatus::Done,
+            real::OutcomeKind::StillOpen => vm::OutcomeStatus::StillOpen,
+            real::OutcomeKind::Failed => vm::OutcomeStatus::Failed,
+            real::OutcomeKind::Refused | real::OutcomeKind::WouldDo => vm::OutcomeStatus::Skipped,
+        };
+        vm::Outcome { finding_id: o.finding_id.clone(), action: action_view(o.action), status, message: o.message.clone() }
+    }
+
+    /// What the "Checkup done" toast says; `None` when nothing was done.
+    pub fn cleanup_summary(report: &real::Report, outs: &[real::Outcome]) -> Option<CleanupSummary> {
+        let done: Vec<&real::Outcome> = outs.iter().filter(|o| o.result == real::OutcomeKind::Done).collect();
+        if done.is_empty() {
+            return None;
+        }
+        let mut freed_ids: Vec<&str> = done
+            .iter()
+            .filter(|o| matches!(o.action, real::ActionKind::Close | real::ActionKind::End))
+            .map(|o| o.finding_id.as_str())
+            .collect();
+        freed_ids.sort_unstable();
+        freed_ids.dedup();
+        let freed_mb: u64 = freed_ids.iter().filter_map(|id| report.finding(id)).map(|f| f.ram_mb).sum();
+        let startup_off = done.iter().filter(|o| o.action == real::ActionKind::DisableStartup).count();
+        Some(CleanupSummary { freed_gb: freed_mb as f64 / 1024.0, startup_off })
+    }
 }
 
 // ---------------------------------------------------------------- worker results
@@ -414,6 +693,15 @@ enum Work {
     Checked { manual: bool, result: CheckResult },
     Progress(u32),
     Downloaded(Result<PathBuf, String>),
+    /// The checkup window finished a cleanup.
+    CheckupDone(CleanupSummary),
+    /// "Undo" on the "Checkup done" toast finished.
+    Undone(Vec<crate::doctor::Outcome>),
+    /// The guard asked a `close_while_unreal` app to close.
+    GuardClosed { app: String, outcome: crate::doctor::Outcome },
+    /// The checkup that runs when Unreal work starts: (GB to free, top app names) when it is
+    /// worth a nudge.
+    Nudge(Option<(f64, Vec<String>)>),
 }
 
 fn post_work(hwnd: isize, w: Work) {
@@ -449,6 +737,8 @@ struct App {
     /// The latest status, shared with the settings window.
     status: Rc<RefCell<Option<Status>>>,
     exit_event: Option<Handle>,
+    /// `AtherMemGuard.exe --settings` signals this to open the settings window.
+    settings_event: Option<Handle>,
     taskbar_created: u32,
     brain: ToastBrain,
     /// The hotkey text last tried, and whether it is registered.
@@ -458,6 +748,13 @@ struct App {
     updates: Updates,
     priming: bool,
     dblclick_at: Option<Instant>,
+    /// Closes `[doctor] close_while_unreal` apps while Unreal works.
+    guard: crate::doctor::Guard,
+    /// The app the "Closed {app}" toast is about ("Allow this time").
+    guard_pending: Option<String>,
+    /// Unreal work (editor, build or cook) on the last tick.
+    was_active: bool,
+    nudge_running: bool,
 }
 
 thread_local! {
@@ -623,6 +920,7 @@ impl App {
             log_event(ev, &st);
             if matches!(ev, Event::SettingsReloaded) {
                 self.apply_settings();
+                self.guard.set_patterns(crate::doctor::DoctorSettings::load().close_while_unreal);
             }
             if let Some(t) = self.brain.toast_for(ev, &st) {
                 toast::show(t);
@@ -633,12 +931,36 @@ impl App {
                 flyout::update(d);
             }
         }
+        self.watch_unreal(&st);
         let now = Instant::now();
         if self.engine.cfg.updates.check_automatically && now >= self.updates.next_auto && !self.updates.checking && !self.updates.downloading {
             self.updates.next_auto = now + UPDATE_EVERY;
             self.start_check(false);
         }
         self.last_tick = Some(now);
+    }
+
+    /// The doctor's guard and the checkup nudge, both driven by Unreal work starting.
+    fn watch_unreal(&mut self, st: &Status) {
+        let active = st.activities.any();
+        let started = active && !self.was_active;
+        self.was_active = active;
+        if !self.engine.paused {
+            for ev in self.guard.on_tick(self.engine.last_procs(), active) {
+                let crate::doctor::GuardEvent::Close { app, .. } = &ev;
+                let app = app.clone();
+                spawn_work(self.hwnd, move || Work::GuardClosed { outcome: crate::doctor::guard_close(&ev), app });
+            }
+        }
+        let today = today();
+        if started && should_nudge(self.engine.cfg.general.notifications, self.nudge_running, last_nudge_day().as_deref(), &today) {
+            self.nudge_running = true;
+            spawn_work(self.hwnd, || {
+                let threshold = crate::doctor::DoctorSettings::load().nudge_above_gb;
+                let r = crate::doctor::scan(&crate::doctor::load_config_readonly());
+                Work::Nudge(nudge_for(&r, threshold))
+            });
+        }
     }
 
     fn start_check(&mut self, manual: bool) {
@@ -718,6 +1040,46 @@ impl App {
             Work::Progress(pct) => {
                 *self.updates.state.borrow_mut() = UpdateState::Downloading { pct };
                 toast::update_body(self.updates.toast, &catalog::downloading_body(pct));
+            }
+            Work::CheckupDone(s) => {
+                crate::log::write(&format!("checkup: freed about {:.1} GB, {} startup entries off", s.freed_gb, s.startup_off));
+                toast::show(catalog::checkup_done(s.freed_gb, s.startup_off));
+            }
+            Work::Undone(outs) => {
+                let problems: Vec<String> = outs
+                    .iter()
+                    .filter(|o| !matches!(o.result, crate::doctor::OutcomeKind::Undone))
+                    .map(|o| o.message.clone())
+                    .fold(Vec::new(), |mut v, m| {
+                        if !v.contains(&m) {
+                            v.push(m);
+                        }
+                        v
+                    });
+                // The person just clicked Undo: say how it went even with notifications off.
+                toast::show_always(catalog::checkup_undone(&problems));
+            }
+            Work::GuardClosed { app, outcome } => {
+                use crate::doctor::OutcomeKind;
+                match outcome.result {
+                    OutcomeKind::Done if outcome.message != "Already closed" => {
+                        self.guard_pending = Some(app.clone());
+                        toast::show(catalog::guard_closed(&app));
+                    }
+                    OutcomeKind::Done => {}
+                    _ => crate::log::write(&format!("doctor guard: {} not closed: {}", app, outcome.message)),
+                }
+            }
+            Work::Nudge(found) => {
+                self.nudge_running = false;
+                let today = today();
+                if let Some((gb, names)) = found {
+                    if should_nudge(self.engine.cfg.general.notifications, false, last_nudge_day().as_deref(), &today) {
+                        set_tray_state("last_nudge_day", toml::Value::String(today));
+                        crate::log::write(&format!("checkup nudge: {:.1} GB could be freed", gb));
+                        toast::show(catalog::checkup_nudge(gb, &names));
+                    }
+                }
             }
             Work::Downloaded(r) => {
                 let installed = r.and_then(|path| updater::install_staged(&path));
@@ -813,6 +1175,14 @@ fn dispatch(hwnd: HWND, cmd: Command) {
         Command::OpenHistory => open_history_window(),
         Command::OpenDoctor => open_doctor_window(),
         Command::UndoDoctor => undo_doctor(),
+        Command::AllowGuarded => {
+            with_app(|a| {
+                if let Some(app) = a.guard_pending.take() {
+                    crate::log::write(&format!("doctor guard: {} allowed until Unreal stops", app));
+                    a.guard.allow(&app);
+                }
+            });
+        }
         Command::CheckUpdates => {
             with_app(|a| a.start_check(true));
         }
@@ -918,10 +1288,12 @@ fn on_select(hwnd: HWND, keyboard: bool) {
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_TIMER => {
+            let mut open_settings = false;
             let quit = with_app(|a| {
                 if a.exit_event.as_ref().is_some_and(win::event_is_set) {
                     return true;
                 }
+                open_settings = a.settings_event.as_ref().is_some_and(win::event_is_set);
                 let due = a.last_tick.map_or(true, |t| t.elapsed().as_secs() >= a.engine.cfg.interval_sec);
                 if due {
                     a.tick();
@@ -934,6 +1306,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             if quit == Some(true) {
                 crate::log::write("asked to stop");
                 PostQuitMessage(0);
+            } else if open_settings {
+                // Outside the app borrow: opening a window runs its own messages.
+                dispatch(hwnd, Command::OpenSettings);
             }
             0
         }
@@ -989,17 +1364,40 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
 
 /// Run the tray app until Quit or `memguard stop`. Returns at once if a copy is already running.
 pub fn run() {
-    run_with(false);
+    run_with(false, false);
 }
 
 /// Like `run`, started by the updater: says "Updated to Ather MemGuard {v}" once it is up.
 pub fn run_after_update() {
-    run_with(true);
+    run_with(true, false);
 }
 
-fn run_with(after_update: bool) {
+/// Like `run`, and open the settings window once the tray is up (`AtherMemGuard.exe --settings`
+/// when no copy was running).
+pub fn run_and_open_settings() {
+    run_with(false, true);
+}
+
+/// Ask the running tray to open its settings window. Waits up to `wait` for a copy that is
+/// still starting to begin listening. False when no copy answered.
+pub fn ask_running_to_open_settings(wait: Duration) -> bool {
+    win::allow_any_foreground();
+    let until = Instant::now() + wait;
+    loop {
+        if win::signal_event(paths::settings_event()) {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn run_with(after_update: bool, open_settings: bool) {
     let Some(_instance) = win::acquire_instance(paths::mutex(), 8000) else { return };
     let exit_event = win::create_event(paths::exit_event());
+    let settings_event = win::create_event(paths::settings_event());
 
     unsafe {
         let class = wide("AtherMemGuardTrayWindow");
@@ -1027,6 +1425,7 @@ fn run_with(after_update: bool) {
             last_tick: None,
             status: Rc::new(RefCell::new(None)),
             exit_event,
+            settings_event,
             taskbar_created: RegisterWindowMessageW(created.as_ptr()),
             brain: ToastBrain::default(),
             hotkey_keys: None,
@@ -1042,6 +1441,10 @@ fn run_with(after_update: bool) {
             },
             priming: false,
             dblclick_at: None,
+            guard: crate::doctor::Guard::from_settings(),
+            guard_pending: None,
+            was_active: false,
+            nudge_running: false,
         };
         app.add_icon();
         crate::log::write(&format!("Ather MemGuard {} started", env!("CARGO_PKG_VERSION")));
@@ -1062,6 +1465,9 @@ fn run_with(after_update: bool) {
             }
         });
         SetTimer(hwnd, TIMER_ID, 1000, None);
+        if open_settings {
+            post_command(Command::OpenSettings);
+        }
 
         let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
@@ -1352,6 +1758,177 @@ mod tests {
         let t = b.toast_for(&Event::SettingsError("settings.toml: bad key".into()), &st).unwrap();
         assert_eq!((t.kind, t.actions[0].1), (ToastKind::Error, Command::OpenSettingsFile));
         assert_eq!(b.toast_for(&Event::SettingsReloaded, &st), None);
+    }
+
+    fn real_finding(id: &str, kind: crate::doctor::FindingKind, verdict: crate::doctor::Verdict, title: &str, ram_mb: u64, actions: &[crate::doctor::ActionKind]) -> crate::doctor::Finding {
+        crate::doctor::Finding {
+            id: id.into(),
+            kind,
+            verdict,
+            title: title.into(),
+            detail: "Detail.".into(),
+            processes: 2,
+            ram_mb,
+            committed_mb: ram_mb * 2,
+            actions: actions.iter().map(|&a| crate::doctor::Action::new(a, Some("Background"))).collect(),
+            recommended: false,
+            category: String::new(),
+            names: vec![title.into()],
+            pids: vec![],
+            has_window: false,
+            group: None,
+            startup: None,
+            company: String::new(),
+        }
+    }
+
+    /// A hand-built report covering every section of the checkup window.
+    fn real_report() -> crate::doctor::Report {
+        use crate::doctor::{ActionKind as A, FindingKind as K, Verdict as V};
+        use crate::startup::{Entry, Location};
+        let entry = |location, name: &str| Entry { location, name: name.into(), command: String::new(), exe: name.into(), enabled: true };
+        let mut steam = real_finding("app:steam", K::App, V::Close, "Steam", 1270, &[A::Close, A::BlockWhileUnreal]);
+        steam.recommended = true;
+        let mut mystery = real_finding("app:mystery", K::App, V::Review, "Mystery", 2150, &[A::Close, A::HoldBack, A::LeaveIt]);
+        mystery.company = "Contoso".into();
+        let mut user_startup = real_finding("startup:hkcu:Steam", K::Startup, V::Close, "Steam", 1270, &[A::DisableStartup]);
+        user_startup.startup = Some(entry(Location::HkcuRun, "Steam"));
+        user_startup.recommended = true;
+        let mut machine_startup = real_finding("startup:hklm:iCUE", K::Startup, V::Close, "iCUE", 560, &[]);
+        machine_startup.startup = Some(entry(Location::HklmRun, "iCUE"));
+        let mut shared_folder = real_finding("startup:commonfolder:Tool.lnk", K::Startup, V::Close, "Tool", 0, &[]);
+        shared_folder.startup = Some(entry(Location::CommonFolder, "Tool.lnk"));
+        crate::doctor::Report {
+            time: "2026-11-14 14:02:11".into(),
+            system: crate::engine::SystemStatus::from(&crate::win::SysInfo::default()),
+            unreal_active: true,
+            findings: vec![
+                steam,
+                real_finding("app:spotify", K::App, V::Close, "Spotify", 640, &[A::Close]),
+                real_finding("app:widgets", K::App, V::Close, "Widgets", 410, &[A::Close]),
+                real_finding("app:icue", K::App, V::Close, "iCUE", 2000, &[A::Close]),
+                user_startup,
+                machine_startup,
+                shared_folder,
+                real_finding("app:blender", K::App, V::HeavyTool, "Blender", 2350, &[A::Close]),
+                mystery,
+                real_finding("app:discord", K::App, V::HoldBack, "Discord", 890, &[A::HoldBack]),
+                real_finding("ue:orphans", K::Unreal, V::Close, "3 leftover Unreal helpers", 1230, &[A::End]),
+                real_finding("sys:pagefile", K::System, V::Review, "The page file is small for this much RAM", 0, &[]),
+                real_finding("sys:git", K::System, V::Review, "25 git processes are running", 0, &[]),
+            ],
+            reclaimable_ram_gb: 5.5,
+            reclaimable_commit_gb: 11.0,
+        }
+    }
+
+    #[test]
+    fn real_report_maps_onto_the_checkup_window() {
+        use crate::ui::doctor::{self as vm, ActionKind as VA, SectionKind};
+        let r = real_report();
+        let v = doctor_map::report_view(&r);
+        assert_eq!(v.findings.len(), r.findings.len());
+        assert_eq!((v.reclaimable_ram_gb, v.reclaimable_commit_gb), (5.5, 11.0));
+        assert!(v.system.memguard_running && !v.system.memguard_paused);
+        let f = |id: &str| v.findings.iter().find(|f| f.id == id).unwrap();
+
+        // "Leave it" is the window's Keep, both ways.
+        let mystery = f("app:mystery");
+        assert_eq!(mystery.actions.iter().map(|a| a.kind).collect::<Vec<_>>(), [VA::Close, VA::HoldBack, VA::Keep]);
+        assert_eq!(mystery.company, "Contoso");
+        assert_eq!(vm::choices(mystery).iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), ["Close", "Hold back", "Leave it"]);
+        for k in [VA::Close, VA::End, VA::DisableStartup, VA::HoldBack, VA::BlockWhileUnreal, VA::Keep] {
+            assert_eq!(doctor_map::action_view(doctor_map::action_to_real(k)), k);
+        }
+        assert_eq!(doctor_map::action_to_real(VA::Keep), crate::doctor::ActionKind::LeaveIt);
+
+        // Machine-wide startup entries need an administrator; the user's own don't.
+        assert!(!f("startup:hkcu:Steam").needs_admin);
+        assert!(f("startup:hklm:iCUE").needs_admin);
+        assert!(f("startup:commonfolder:Tool.lnk").needs_admin);
+        assert!(!f("app:steam").needs_admin);
+
+        // THIS PC rows link to help where there is some.
+        assert!(f("sys:pagefile").help_url.as_deref().is_some_and(|u| u.starts_with("https://learn.microsoft.com/")));
+        assert_eq!(f("sys:git").help_url, None);
+        assert_eq!(f("app:steam").help_url, None);
+
+        // Every section shows, in order, and the window's pre-checks follow `recommended`.
+        let m = vm::DoctorModel::new(v.clone());
+        let kinds: Vec<SectionKind> = m.sections().iter().map(|s| s.kind).collect();
+        assert_eq!(kinds, SectionKind::ORDER.to_vec());
+        let picks = m.picks();
+        assert!(picks.contains(&("app:steam".to_string(), VA::Close)));
+        assert!(picks.contains(&("startup:hkcu:Steam".to_string(), VA::DisableStartup)));
+        assert!(picks.contains(&("app:discord".to_string(), VA::HoldBack)), "held-back rows start checked");
+        assert!(!picks.iter().any(|(id, _)| id == "app:spotify" || id == "app:mystery" || id == "app:blender" || id.starts_with("startup:hklm")));
+        assert!(!m.all_clear());
+
+        // A paused copy is reported as such.
+        let mut paused = r.clone();
+        paused.findings.push(real_finding("sys:memguard", crate::doctor::FindingKind::System, crate::doctor::Verdict::Review, "Ather MemGuard is paused", 0, &[]));
+        assert!(doctor_map::report_view(&paused).system.memguard_paused);
+    }
+
+    #[test]
+    fn outcomes_and_cleanup_summary() {
+        use crate::doctor::{ActionKind as A, Outcome, OutcomeKind as O};
+        use crate::ui::doctor::{ActionKind as VA, OutcomeStatus as S};
+        let o = |id: &str, action, result, message: &str| Outcome { finding_id: id.into(), action, result, message: message.into(), undo_id: None };
+        let outs = vec![
+            o("app:steam", A::Close, O::Done, "Closed"),
+            o("app:steam", A::BlockWhileUnreal, O::Done, "Stays closed while Unreal is running"),
+            o("app:spotify", A::Close, O::StillOpen, "Still open — it may be asking you to save"),
+            o("startup:hkcu:Steam", A::DisableStartup, O::Done, "Switched off"),
+            o("app:mystery", A::LeaveIt, O::Done, "Added to the keep list"),
+            o("ue:orphans", A::End, O::Refused, "Ending needs --force"),
+            o("app:icue", A::Close, O::Failed, "Access denied"),
+        ];
+        let v: Vec<_> = outs.iter().map(doctor_map::outcome_view).collect();
+        assert_eq!(v.iter().map(|o| o.status).collect::<Vec<_>>(), [S::Done, S::Done, S::StillOpen, S::Done, S::Done, S::Skipped, S::Failed]);
+        assert_eq!(v[4].action, VA::Keep);
+        assert_eq!(v[2].message, "Still open — it may be asking you to save");
+
+        let s = doctor_map::cleanup_summary(&real_report(), &outs).unwrap();
+        // Steam (1270 MB) closed; Spotify stayed open, iCUE failed: only Steam counts, once.
+        assert!((s.freed_gb - 1270.0 / 1024.0).abs() < 1e-9);
+        assert_eq!(s.startup_off, 1);
+        assert_eq!(doctor_map::cleanup_summary(&real_report(), &outs[2..3]), None, "nothing done, no toast");
+        let t = catalog::checkup_done(s.freed_gb, s.startup_off);
+        assert_eq!(t.body, "Freed about 1.2 GB. 1 app won't start with Windows any more.");
+    }
+
+    #[test]
+    fn real_doctor_without_a_scan_skips_everything() {
+        use crate::ui::doctor::{ActionKind as VA, OutcomeStatus};
+        let d = RealDoctor::new(0);
+        let (outs, summary) = d.apply_mapped(&[("app:steam".into(), VA::Close)], false);
+        assert_eq!(outs.len(), 1);
+        assert_eq!(outs[0].status, OutcomeStatus::Skipped);
+        assert_eq!(summary, None);
+    }
+
+    #[test]
+    fn nudge_rules() {
+        let r = real_report();
+        // 5.5 GB to free, threshold 4: the three biggest "not needed" apps, largest first.
+        assert_eq!(nudge_for(&r, 4.0), Some((5.5, vec!["iCUE".to_string(), "Steam".to_string(), "Spotify".to_string()])));
+        assert_eq!(nudge_for(&r, 6.0), None);
+        let mut empty = r.clone();
+        empty.reclaimable_ram_gb = 0.0;
+        assert_eq!(nudge_for(&empty, 0.0), None, "nothing to free is never a nudge");
+        let t = catalog::checkup_nudge(5.5, &nudge_for(&r, 4.0).unwrap().1);
+        assert_eq!((t.title.as_str(), t.body.as_str()), ("5.5 GB is in use by apps Unreal doesn't need", "iCUE, Steam and Spotify."));
+
+        assert!(should_nudge(true, false, None, "2026-11-14"));
+        assert!(should_nudge(true, false, Some("2026-11-13"), "2026-11-14"));
+        assert!(!should_nudge(true, false, Some("2026-11-14"), "2026-11-14"), "once per calendar day");
+        assert!(!should_nudge(false, false, None, "2026-11-14"), "never with notifications off");
+        assert!(!should_nudge(true, true, None, "2026-11-14"), "one scan at a time");
+
+        // The day lives in ui-state.toml's [tray] table.
+        let text = with_tray_value("", "last_nudge_day", toml::Value::String("2026-11-14".into()));
+        assert_eq!(tray_value(&text, "last_nudge_day").unwrap().as_str(), Some("2026-11-14"));
     }
 
     #[test]

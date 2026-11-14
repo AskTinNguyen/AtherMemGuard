@@ -239,6 +239,9 @@ enum Cmd {
         /// Don't start the tray app after installing
         #[arg(long)]
         no_start: bool,
+        /// Don't start Ather MemGuard when you sign in to Windows
+        #[arg(long)]
+        no_startup: bool,
     },
     /// Stop Ather MemGuard, remove it from sign-in and delete the program (settings are kept)
     Uninstall,
@@ -515,7 +518,11 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
 
-        Cmd::Install { add_to_path, no_start } => match install::install(add_to_path, !no_start) {
+        Cmd::Install { add_to_path, no_start, no_startup } => match install::install(install::InstallOptions {
+            add_to_path,
+            start_with_windows: !no_startup,
+            start: !no_start,
+        }) {
             Ok(r) => {
                 println!("Installed to {}", r.dir.display());
                 if r.migrated_from_memcap {
@@ -524,7 +531,7 @@ fn main() -> ExitCode {
                 if r.stopped_previous {
                     println!("Stopped the copy that was running.");
                 }
-                println!("Starts at sign-in: yes");
+                println!("Starts at sign-in: {}", if no_startup { "no" } else { "yes" });
                 if add_to_path {
                     println!(
                         "PATH: {}",
@@ -832,5 +839,21 @@ fn print_doctor_report(r: &athermemguard::doctor::Report) {
             f.id
         ),
         _ => println!("Nothing to do."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_flags() {
+        let flags = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Cmd::Install { add_to_path, no_start, no_startup } => (add_to_path, no_start, no_startup),
+            _ => panic!("not install"),
+        };
+        assert_eq!(flags(&["memguard", "install"]), (false, false, false));
+        assert_eq!(flags(&["memguard", "install", "--no-startup"]), (false, false, true));
+        assert_eq!(flags(&["memguard", "install", "--add-to-path", "--no-start", "--no-startup"]), (true, true, true));
     }
 }

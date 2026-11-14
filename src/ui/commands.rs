@@ -23,11 +23,14 @@ pub enum Command {
     OpenDoctor,
     /// docs/UI.md section 6: undo the last cleanup.
     UndoDoctor,
+    /// docs/UI.md section 6: "Allow this time" on the "Closed {app}" toast. Commands carry no
+    /// data, so the tray remembers which app the (single, keyed) toast is about.
+    AllowGuarded,
 }
 
 impl Command {
     /// Every command, in a fixed order (their ids).
-    pub const ALL: [Command; 15] = [
+    pub const ALL: [Command; 16] = [
         Command::FreeMemory,
         Command::Pause30,
         Command::PauseUntilResumed,
@@ -43,6 +46,7 @@ impl Command {
         Command::OpenSettingsFile,
         Command::OpenDoctor,
         Command::UndoDoctor,
+        Command::AllowGuarded,
     ];
 
     /// A small non-zero number for menu item ids and window messages.
@@ -63,6 +67,7 @@ impl Command {
             Command::OpenSettingsFile => 13,
             Command::OpenDoctor => 14,
             Command::UndoDoctor => 15,
+            Command::AllowGuarded => 16,
         }
     }
 
@@ -83,7 +88,7 @@ mod tests {
             assert_eq!(Command::from_id(c.id()), Some(c));
             seen.insert(c.id());
         }
-        assert_eq!(seen.len(), 15, "every variant has its own id");
+        assert_eq!(seen.len(), 16, "every variant has its own id");
         assert_eq!(Command::from_id(0), None);
         assert_eq!(Command::from_id(99), None);
     }

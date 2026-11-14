@@ -103,13 +103,7 @@ impl SetupBackend for RealBackend {
     }
 
     fn install(&self, start_with_windows: bool, add_to_path: bool) -> Result<(), String> {
-        // install::install always turns "run at startup" on; switch it off afterwards when the
-        // person said so (see the integration notes: install() should take this as a parameter).
-        crate::install::install(add_to_path, true)?;
-        if !start_with_windows {
-            crate::install::set_run_at_startup(false)?;
-        }
-        Ok(())
+        crate::install::install(crate::install::InstallOptions { add_to_path, start_with_windows, start: true }).map(|_| ())
     }
 
     fn uninstall(&self) -> Result<(), String> {
@@ -125,7 +119,8 @@ impl SetupBackend for RealBackend {
     }
 
     fn open_settings(&self) {
-        // Needs `--settings` in bin/tray.rs (forwarded to the running tray); see the notes.
+        // `--settings` asks the running tray (just started by install) to open its settings
+        // window, or starts the tray with it open.
         let _ = Self::launch(&Self::installed_exe(), "--settings");
     }
 

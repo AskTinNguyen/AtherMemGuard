@@ -3,22 +3,121 @@
 Keeps a Windows PC primed for agentic Unreal Engine work: the editor, local builds and cooks get
 memory first, and everything else (browsers, chat apps, agent apps, launchers) gives it up.
 
-Two small executables, no admin rights, no runtime to install:
+Two small programs, no admin rights, no runtime to install:
 
 - `AtherMemGuard.exe`: the background app. Sits in the tray, checks every 10 seconds, enforces the rules.
-- `memguard.exe`: the command line for you, your scripts and your agents.
+  The same file is the setup program.
+- `memguard.exe`: the command line for you, your scripts and your agents (and their MCP server).
 
 ## Install
 
-Copy both files to the PC and run:
+Download **`AtherMemGuard-Setup-<version>.exe`** and run it. The setup window offers two switches, both on:
+**Start with Windows** and **Add the memguard command**. Click **INSTALL**. It installs just for your Windows
+account, with no admin rights:
 
-```
-memguard install --add-to-path
-```
+- both programs go to `%LOCALAPPDATA%\Programs\AtherMemGuard`
+- the tray app starts now (and at sign-in, if you left that on)
+- a Start menu shortcut and an entry in Settings › Apps
+- `memguard` on your user PATH (new terminals find it)
 
-This copies them to `%LOCALAPPDATA%\Programs\AtherMemGuard`, starts the tray app at sign-in, starts it now,
-adds an entry under Settings > Apps, and (with `--add-to-path`) puts `memguard` on your user PATH. `memguard uninstall` reverses all of it;
-settings and the log are kept. The files are unsigned, so SmartScreen may ask once (More info → Run anyway).
+**Run without installing** on the same window writes an `AtherMemGuard.portable` file next to the exe and
+runs it from there. Running a newer setup exe updates an installed copy; running the same version again
+repairs it. Your settings are kept either way. A copy of 0.1 or MemCap is stopped and replaced, and its
+settings carry over.
+
+The exe isn't code-signed yet, so SmartScreen asks once: **More info › Run anyway**.
+
+For scripts, `AtherMemGuard-Setup-<version>.exe --install` installs without a window; add `--no-path`,
+`--no-startup` (don't start at sign-in) or `--no-start` (don't start it now). `memguard install
+[--add-to-path] [--no-startup] [--no-start]` does the same from the command line.
+
+**Uninstall** from Settings › Apps › Ather MemGuard › Uninstall (or `memguard uninstall`). Every app goes back
+to normal. Settings, history and the log stay in `%APPDATA%\AtherMemGuard` in case you come back.
+
+[INSTALL.md](INSTALL.md) is the short version for teammates.
+
+## The tray
+
+The tray icon is the Ather mark: an amber dot when memory is tight, red when it's critical, faded while
+paused. Its tooltip says the Unreal mode, the pressure and RAM / commit free.
+
+- **Left-click** opens the flyout: memory is fine / tight / critical, RAM free and commit free, what Unreal is
+  doing ("UnrealEditor · 43.8 GB · growing 2.1 GB an hour"), each app group against its cap, and the buttons
+  **Free memory**, **Pause 30 min** (or **Resume**) and **Settings**. "Run a checkup" opens the checkup.
+- **Right-click** opens the menu: Free memory now, Pause for 30 minutes, Pause until I resume, Settings,
+  Memory history, Run a checkup, Check for updates, Run at Windows startup, Quit.
+- **Double-click** opens Settings.
+- **Ctrl+Alt+M** (change it in Settings) frees memory from anywhere.
+
+Toasts appear bottom right, only when something changed that you'd want to know: memory became critical (and
+fine again), memory was freed for a build or cook, the editor is big or growing fast, an update is ready, a
+checkup found a lot to free. Turn them off with **Notifications** in Settings.
+
+Pausing puts every app back to normal until you resume (or for 30 minutes). Quit and `memguard stop` do the
+same and stop the app.
+
+## The settings window
+
+Settings (tray menu, flyout, or `AtherMemGuard.exe --settings`) shows every setting with a plain description.
+Changes apply as you make them; there is no Save button. A lime dot marks what you changed, a TEAM tag what
+comes from your team's file, and right-click resets a setting. Type anywhere to search.
+
+- **General**: how hard to push other apps (Gentle / Balanced / Aggressive), free memory when a build or cook
+  starts, run at Windows startup, notifications, the Free memory shortcut.
+- **App groups**: one card per group (Browsers, Chat, Agents, Background, and your own) with its apps, a soft cap
+  and speed for each situation (always, Unreal running, memory tight, memory critical), and the risky
+  options, freeze and hard cap, labelled in red and off by default.
+- **Unreal**, **Memory pressure**, **Headroom**, **History**, **Updates**.
+- **AI agents**: **Copy setup** puts ready-to-paste agent setup on the clipboard.
+- **Team and backup**: **Load team file…**, **Export…** / **Import…** your settings, **Open file**,
+  **Reset all settings**.
+
+## Presets and team defaults
+
+**Presets** set how hard MemGuard pushes: Balanced is the default; Gentle doubles every soft cap; Aggressive
+halves them and slows other apps while Unreal runs. Soft caps are a share of your RAM, so the same settings
+suit a 32 GB and a 128 GB PC.
+
+**Team defaults**: one person tunes the settings, exports them (or writes a `team.toml`), and everyone else
+loads that file with **Load team file…** (or `memguard config team team.toml`). It sits under each person's own
+settings: what you changed yourself still wins, everything else follows the team. Details under
+[Settings](#settings).
+
+## Checkup
+
+**Run a checkup** (tray menu or flyout) opens a window that answers: what is using memory on this PC that
+Unreal work doesn't need? It shows the total that could be freed, then sections: apps not needed for Unreal,
+apps that start with Windows, big tools you might not be using, unknown apps worth a look, apps that should be
+held back, Unreal leftovers, and notes about this PC. Tick what you want, pick what happens to each (close,
+don't start with Windows, close whenever Unreal is running, hold back, leave it) and click **CLEAN UP**.
+Nothing changes without a tick and that click. Apps that ask to save stay open and offer **End it anyway**,
+which asks first. **Undo last cleanup** reverses it.
+
+When Unreal work starts and a checkup finds at least 4 GB to free, a toast says so (at most once a day), with a
+**Review** button. Apps you put on the "close whenever Unreal is running" list are asked to close when they
+start during Unreal work; the toast has **Allow this time**.
+
+The same checkup is on the command line as `memguard doctor`; see [Checkup (doctor)](#checkup-doctor).
+
+## Memory history
+
+**Memory history** (tray menu) charts the last 1 hour, 6 hours, 24 hours or 7 days: Unreal's committed
+memory, RAM free and commit free, with tight and critical spells shaded, dots where memory was freed and a line
+where an editor started. Cards under it show the editor and each group, now and at its peak. The data is a CSV
+file per day in `%APPDATA%\AtherMemGuard\history`, kept 7 days by default.
+
+## Updates
+
+The app checks for a new version a minute after it starts and then once a day (Settings › Updates; **Check
+now** checks at once). When there is one, a toast offers it; clicking it downloads the new version, checks its
+size and SHA-256, swaps it in and restarts. Your settings stay. Nothing is installed if the download doesn't
+match.
+
+Updates download from this repository's GitHub releases (the manifest is
+`releases/latest/download/latest.json`). **The repository is private, so automatic updates only work for
+teammates who can reach its releases**; for everyone else the check fails quietly and the app keeps running
+the version it has. Teams can host the files elsewhere and point `[updates] manifest_url` at their own
+`latest.json`.
 
 ## How it decides
 
@@ -67,6 +166,8 @@ memguard run --cap-gb 48 [--per-process-cap-gb N] [--priority low] [--cpu below]
                                   the command's exit code is passed through
 memguard advise [--json]            suggested -MaxParallelActions for the memory available now
 memguard history [--hours 1] [--json]    memory history the background app recorded
+memguard doctor [--json] [--fix ...] [--undo]   the checkup; see Checkup (doctor)
+memguard mcp | agent-setup          MCP server for agents, and setup text to paste; see AI agents
 memguard config show | set | reset | export | import | team    see Settings
 memguard stop | daemon | config [--check | --reset] | install | uninstall
 ```
@@ -83,7 +184,8 @@ The tray app also writes `%APPDATA%\AtherMemGuard\status.json` every interval, w
 ## AI agents (MCP)
 
 `memguard mcp` is an MCP server over stdio, so Claude Code, Codex and other coding agents can call
-MemGuard as tools: `memguard_status`, `memguard_prime`, `memguard_wait` and `memguard_advise`. The agent
+MemGuard as tools: `memguard_status`, `memguard_prime`, `memguard_wait`, `memguard_advise`,
+`memguard_history` and `memguard_doctor` (read-only). The agent
 starts it by itself; there is no port and nothing to enable. Run `memguard agent-setup` for ready-to-paste
 setup, or add it to Claude Code with:
 
@@ -155,8 +257,9 @@ you before anything is fixed.
 
 ## Settings
 
-Your settings are in `%APPDATA%\AtherMemGuard\settings.toml` (tray menu → Settings). Saved changes apply
-within one interval. If a change has a mistake, MemGuard keeps the previous settings and reports it in the log.
+The settings window writes `%APPDATA%\AtherMemGuard\settings.toml` (Settings › Team and backup › Open file).
+You can also edit it by hand; saved changes apply within one interval. If a change has a mistake, MemGuard keeps
+the previous settings and says so in a toast and in the log.
 
 **Layers.** The settings in effect are the built-in defaults, then `team.toml` in the same folder if your
 team gave you one, then your `settings.toml`. Each layer only changes the keys it sets. Tables merge key by
@@ -233,13 +336,44 @@ points, not measurements of your project. Tune them.
 
 ## Build from source
 
+Rust stable with the MSVC toolchain.
+
 ```
 cargo build --release
 cargo test
 ```
 
-Setting `ATHER_MEMGUARD_DIR` to a folder makes MemGuard use it for settings, log and status, with its own
-instance name, so a test copy can run beside the installed one.
+The build writes an `AtherMemGuard.portable` marker into `target\<profile>`, so `target\release\AtherMemGuard.exe`
+runs as the tray app from there instead of offering to install. A copy of the exe anywhere else opens the setup
+window.
+
+Setting `ATHER_MEMGUARD_DIR` to a folder makes MemGuard use it for settings, log, status and history, with its
+own instance name, so a test copy can run beside the installed one. `ATHER_MEMGUARD_UPDATE_URL` points the update
+check somewhere else (tests).
+
+One doctor test writes a throwaway value to your HKCU Run key and removes it again; it only runs with
+`MEMGUARD_TEST_HKCU=1` (CI sets it).
+
+**UI snapshots.** `cargo run --example ui_snapshots -- docs/design/snapshots` (or `AtherMemGuard.exe
+--ui-snapshots <dir>`) paints every window, the flyout and every toast with fixed sample data into PNG files, at
+100% and 150%. Look at them after changing any UI. `cargo run --example ui_demo` opens the settings window and
+some toasts on fake data.
+
+## Package a release
+
+```
+.\package.ps1
+```
+
+builds the CLI, then `AtherMemGuard.exe` with the CLI embedded (feature `embed-cli`), and writes `dist\`:
+
+- `AtherMemGuard-Setup-<version>.exe`: the one file teammates download
+- `AtherMemGuard-<version>-portable.zip`: both programs, the portable marker, README and INSTALL
+- `SHA256SUMS.txt` and `latest.json` (the update manifest: version, URL, SHA-256, size, `UPDATE_NOTES`)
+
+The version comes from `Cargo.toml`. `.\package.ps1 -Publish` also creates or updates the GitHub release
+`v<version>` with `RELEASE_NOTES.md` as its text and copies `latest.json` to `downloads\latest.json`; running
+copies find the update on their next check. Set `SIGN_PFX` and `SIGN_PASSWORD` to code-sign both programs.
 
 The exe icon is the Ather mark, drawn in code (`src/logo.rs`). To regenerate `res/app.ico` after changing it:
 
