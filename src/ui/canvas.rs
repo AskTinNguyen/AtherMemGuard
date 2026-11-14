@@ -609,6 +609,11 @@ impl Canvas {
         }
     }
 
+    /// The memory DC (window captures).
+    pub(crate) fn dc(&self) -> HDC {
+        self.dc
+    }
+
     /// The pixel at (x, y) as RGB (tests).
     pub fn pixel(&self, x: i32, y: i32) -> Rgb {
         unsafe { GdiFlush() };

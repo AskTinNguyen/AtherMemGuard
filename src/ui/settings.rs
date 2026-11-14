@@ -1878,3 +1878,100 @@ mod tests {
         assert_eq!(HotkeyField::display("Ctrl+Alt+M"), "Ctrl + Alt + M");
     }
 }
+
+#[cfg(test)]
+mod interaction_tests {
+    use super::*;
+    use crate::ui::snapshots::sample_settings;
+
+    fn painted(w: &mut SettingsWindow) -> Canvas {
+        let mut c = Canvas::new(900, 2400, Scale(1.0));
+        w.paint(&mut c);
+        c
+    }
+
+    fn click(w: &mut SettingsWindow, p: Pt) {
+        let mut host = Host::detached((900, 2400), Scale(1.0));
+        w.event(Event::MouseDown(p, MouseButton::Left), &mut host);
+        w.event(Event::MouseUp(p, MouseButton::Left), &mut host);
+    }
+
+    fn value(w: &SettingsWindow, path: &str) -> Option<Value> {
+        w.host.store.get(path).map(|s| s.value)
+    }
+
+    #[test]
+    fn clicks_write_through_the_store() {
+        let mut w = sample_settings();
+        painted(&mut w);
+        let toggle = w.item_with(&Act::Toggle("general.notifications".into())).unwrap().rect;
+        click(&mut w, Pt::new(toggle.cx(), toggle.cy()));
+        assert_eq!(value(&w, "general.notifications"), Some(Value::Bool(false)));
+        painted(&mut w);
+        let seg = w.item_with(&Act::Seg("general.preset".into())).unwrap().rect;
+        click(&mut w, Pt::new(seg.right() - 10, seg.cy()));
+        assert_eq!(value(&w, "general.preset"), Some(Value::Text("aggressive".into())));
+
+        // Open Browsers, drag its "Unreal is running" slider to the far right.
+        painted(&mut w);
+        let head = w.items().iter().find(|i| i.act == Some(Act::GroupHeader("Browsers".into()))).unwrap().rect;
+        click(&mut w, Pt::new(head.x + 30, head.cy()));
+        painted(&mut w);
+        let act = Act::Slider("Browsers".into(), Tier::Unreal);
+        let s = w.item_with(&act).unwrap().rect;
+        let mut host = Host::detached((900, 2400), Scale(1.0));
+        w.event(Event::MouseDown(Pt::new(s.x + 20, s.cy()), MouseButton::Left), &mut host);
+        w.event(Event::MouseMove(Pt::new(s.right() + 50, s.cy())), &mut host);
+        w.event(Event::MouseUp(Pt::new(s.right() + 50, s.cy()), MouseButton::Left), &mut host);
+        assert_eq!(value(&w, "group.Browsers.ue.trim_above_pct"), Some(Value::Float(25.0)));
+        // Arrow keys step 0.1 %, PgDn 1 %.
+        painted(&mut w);
+        w.event(Event::Key(VK_LEFT, Mods::default()), &mut host);
+        w.event(Event::Key(VK_NEXT, Mods::default()), &mut host);
+        assert_eq!(value(&w, "group.Browsers.ue.trim_above_pct"), Some(Value::Float(23.9)));
+    }
+
+    #[test]
+    fn typing_searches_and_escape_clears() {
+        let mut w = sample_settings();
+        painted(&mut w);
+        let mut host = Host::detached((900, 760), Scale(1.0));
+        for ch in "notif".chars() {
+            w.event(Event::Char(ch), &mut host);
+        }
+        assert_eq!(w.query, "notif");
+        w.event(Event::Key(VK_BACK, Mods::default()), &mut host);
+        assert_eq!(w.query, "noti");
+        w.event(Event::Key(VK_ESCAPE, Mods::default()), &mut host);
+        assert_eq!(w.query, "");
+        // Tab walks the controls in order.
+        painted(&mut w);
+        w.event(Event::Key(VK_TAB, Mods::default()), &mut host);
+        assert_eq!(w.focus, Some(Act::Seg("general.preset".into())));
+        w.event(Event::Key(VK_TAB, Mods::default()), &mut host);
+        assert_eq!(w.focus, Some(Act::Toggle("general.auto_prime".into())));
+        w.event(Event::Key(VK_SPACE, Mods::default()), &mut host);
+        assert_eq!(value(&w, "general.auto_prime"), Some(Value::Bool(false)));
+        w.event(Event::Key(VK_TAB, Mods { shift: true, ..Mods::default() }), &mut host);
+        assert_eq!(w.focus, Some(Act::Seg("general.preset".into())));
+    }
+
+    #[test]
+    fn hard_cap_asks_first() {
+        let mut w = sample_settings();
+        w.set_open_group(Some("Browsers"));
+        painted(&mut w);
+        let mut host = Host::detached((900, 2400), Scale(1.0));
+        w.editing = Some(EditTarget::Number("group.Browsers.hard_cap_mb".into()));
+        w.event(Event::EditDone { tag: 0, commit: true, text: "4096".into() }, &mut host);
+        assert!(w.confirm.is_some());
+        assert_eq!(value(&w, "group.Browsers.hard_cap_mb"), None, "nothing written before the answer");
+        w.event(Event::Key(VK_RETURN, Mods::default()), &mut host);
+        assert!(w.confirm.is_none());
+        assert_eq!(value(&w, "group.Browsers.hard_cap_mb"), None, "Enter is the safe choice");
+        w.editing = Some(EditTarget::Number("group.Browsers.hard_cap_mb".into()));
+        w.event(Event::EditDone { tag: 0, commit: true, text: "4096".into() }, &mut host);
+        w.confirm_ok();
+        assert_eq!(value(&w, "group.Browsers.hard_cap_mb"), Some(Value::Int(4096)));
+    }
+}

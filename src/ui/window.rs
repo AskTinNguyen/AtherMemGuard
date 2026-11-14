@@ -855,3 +855,15 @@ pub fn screen_to_client(hwnd: HWND, p: Pt) -> Pt {
     unsafe { ScreenToClient(hwnd, &mut pt) };
     Pt::new(pt.x, pt.y)
 }
+
+/// Save what a window shows (title bar included) as PNG, for manual checks.
+pub fn capture_png(hwnd: HWND, path: &std::path::Path) -> Result<(), String> {
+    let mut r: RECT = unsafe { zeroed() };
+    unsafe { GetWindowRect(hwnd, &mut r) };
+    let c = Canvas::new(r.right - r.left, r.bottom - r.top, Scale(1.0));
+    let ok = unsafe { windows_sys::Win32::Storage::Xps::PrintWindow(hwnd, c.dc(), 2 /* PW_RENDERFULLCONTENT */) };
+    if ok == 0 {
+        return Err("PrintWindow failed".into());
+    }
+    c.save_png(path)
+}
