@@ -77,13 +77,15 @@ Teammates download one file, `AtherMemGuard-Setup-<ver>.exe`, which **is** the a
 - `src/bin/tray.rs` becomes the entry point for every GUI-exe mode. Parse `std::env::args`:
   - no args, running from the install folder or a folder containing a file named
     `AtherMemGuard.portable`: run the tray (`tray::run()`).
-  - no args, running from anywhere else: first-run setup. Part E builds the branded window;
-    until then call `install::install(true, true)` directly and exit. Expose the decision as
-    `pub fn install::launch_mode() -> LaunchMode { Tray, Setup }` so Part E can plug in.
+  - no args, running from anywhere else: first-run setup, the branded setup window
+    (`ui::setup::run_setup`). The decision is `install::launch_mode() -> LaunchMode { Tray, Setup }`.
   - `--after-update <pid>`: finish an update (below), then run the tray.
-  - `--uninstall`: same as `memguard uninstall` (Settings > Apps will call this; change
-    `UninstallString` to `"<AtherMemGuard.exe>" --uninstall`).
-  - `--install [--no-path] [--no-start]`: silent install, for scripts.
+  - `--uninstall`: the setup window's "Uninstall?" screen (Settings > Apps calls this;
+    `UninstallString` is `"<AtherMemGuard.exe>" --uninstall`).
+  - `--install [--no-path] [--no-startup] [--no-start]`: silent install, for scripts
+    (`install::install(InstallOptions { add_to_path, start_with_windows, start })`).
+  - `--settings`: open the settings window in the running tray (a named event it polls), or
+    start the tray with it open.
 - Add a Start menu shortcut `Ather MemGuard.lnk` on install (IShellLink through `windows-sys`
   COM, or a small PowerShell-free implementation) and remove it on uninstall.
 
