@@ -147,8 +147,9 @@ pub struct GroupStatus {
     pub hard_cap_mb: u64,
     pub hard_cap_per_process_mb: u64,
     pub suspended: bool,
+    /// Members as (pid, creation time).
     #[serde(skip)]
-    pub pids: Vec<u32>,
+    pub pids: Vec<(u32, u64)>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -326,7 +327,7 @@ pub fn analyze(cfg: &Config, snap: &Snapshot) -> Status {
                 hard_cap_mb: g.hard_cap_mb,
                 hard_cap_per_process_mb: g.hard_cap_per_process_mb,
                 suspended: false,
-                pids: members.iter().map(|p| p.pid).collect(),
+                pids: members.iter().map(|p| (p.pid, p.created)).collect(),
             }
         })
         .collect();
@@ -454,6 +455,63 @@ impl Hints {
 
 // ---------------------------------------------------------------- enforcement
 
+/// A process as (pid, creation time): a recycled pid is a different key.
+type ProcKey = (u32, u64);
+
+/// How long a memory priority and CPU setting the engine made is trusted before it is set
+/// again. Browsers reset their own priorities, and prime (here, in the tray's worker or in
+/// another process) changes them behind the engine's back.
+const REAPPLY_AFTER: Duration = Duration::from_secs(60);
+
+/// What the engine last set on a process.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Applied {
+    priority: u32,
+    cpu: Cpu,
+    at: Instant,
+}
+
+/// Set memory priority and CPU policy on a process now? Yes the first time, when the
+/// policy changed, and again once `REAPPLY_AFTER` has passed.
+fn should_apply(last: Option<&Applied>, priority: u32, cpu: Cpu, now: Instant) -> bool {
+    match last {
+        None => true,
+        Some(a) => a.priority != priority || a.cpu != cpu || now.saturating_duration_since(a.at) >= REAPPLY_AFTER,
+    }
+}
+
+/// The CPU calls that bring a process to `want`, given whether we changed its priority
+/// class (`class_touched`) and turned on efficiency mode (`eco_on`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct CpuPlan {
+    /// Read and remember the class before changing it.
+    remember_class: bool,
+    set_class: Option<win::CpuClass>,
+    /// Put back the class we remembered.
+    restore_class: bool,
+    eco: Option<bool>,
+}
+
+fn cpu_plan(want: Cpu, class_touched: bool, eco_on: bool) -> CpuPlan {
+    match want {
+        Cpu::Normal => CpuPlan { restore_class: class_touched, eco: eco_on.then_some(false), ..Default::default() },
+        Cpu::Below | Cpu::Idle => CpuPlan {
+            remember_class: !class_touched,
+            set_class: Some(if want == Cpu::Idle { win::CpuClass::Idle } else { win::CpuClass::BelowNormal }),
+            eco: eco_on.then_some(false),
+            ..Default::default()
+        },
+        // Efficiency mode replaces a lowered class: put the class back first.
+        Cpu::Eco => CpuPlan { restore_class: class_touched, eco: Some(true), ..Default::default() },
+    }
+}
+
+/// The members of one group the engine acts on: a process in two groups gets the policy of
+/// the first, instead of flip-flopping between both every tick.
+fn claim(claimed: &mut HashSet<u32>, members: &[ProcKey]) -> Vec<ProcKey> {
+    members.iter().copied().filter(|k| claimed.insert(k.0)).collect()
+}
+
 /// Modification times of settings.toml and team.toml, to notice edits.
 type Stamp = (Option<SystemTime>, Option<SystemTime>);
 
@@ -469,9 +527,12 @@ pub struct Engine {
     last_trim: HashMap<String, Instant>,
     /// Cooldown multiplier per group, doubled each time a trim doesn't stick.
     trim_backoff: HashMap<String, u64>,
-    /// pid -> CPU priority class it had before we changed it.
-    cpu_touched: HashMap<u32, u32>,
-    eco_touched: HashSet<u32>,
+    /// Process -> CPU priority class it had before we changed it.
+    cpu_touched: HashMap<ProcKey, u32>,
+    eco_touched: HashSet<ProcKey>,
+    /// Memory priority and CPU policy last set per process, so unchanged ones aren't set
+    /// again every tick.
+    applied: HashMap<ProcKey, Applied>,
     suspended: HashSet<u32>,
     workers_paused: HashSet<u32>,
     cap_misses: HashMap<String, usize>,
@@ -508,6 +569,7 @@ impl Engine {
             trim_backoff: HashMap::new(),
             cpu_touched: HashMap::new(),
             eco_touched: HashSet::new(),
+            applied: HashMap::new(),
             suspended: HashSet::new(),
             workers_paused: HashSet::new(),
             cap_misses: HashMap::new(),
@@ -609,7 +671,7 @@ impl Engine {
         }
         let prime_reason = self.observe(&st);
         if !self.paused {
-            self.apply(&snap, &mut st);
+            self.apply(&snap, &mut st, Instant::now());
             if let Some(reason) = prime_reason {
                 self.auto_prime(reason, &snap, &st);
             }
@@ -642,6 +704,7 @@ impl Engine {
     fn auto_prime(&mut self, reason: &'static str, snap: &Snapshot, st: &Status) {
         let groups_ram_before_gb = (st.groups.iter().map(|g| g.ram_mb).sum::<u64>() as f64 / 102.4).round() / 10.0;
         let trimmed = crate::ops::trim_groups(&self.cfg, &snap.procs);
+        self.forget_applied(); // trim_groups lowered memory priorities
         crate::log::write(&format!(
             "auto-prime: {} started, trimmed {} processes (app groups held {:.1} GB)",
             reason, trimmed, groups_ram_before_gb
@@ -649,40 +712,38 @@ impl Engine {
         self.push_event(Event::AutoPrimed { reason, trimmed, groups_ram_before_gb });
     }
 
-    fn apply(&mut self, snap: &Snapshot, st: &mut Status) {
-        let alive: HashSet<u32> = snap.procs.iter().map(|p| p.pid).collect();
-        self.cpu_touched.retain(|pid, _| alive.contains(pid));
-        self.eco_touched.retain(|pid| alive.contains(pid));
-        self.suspended.retain(|pid| alive.contains(pid));
-        self.workers_paused.retain(|pid| alive.contains(pid));
+    /// Forget which priorities the engine set, so the next tick sets them all again. Call it
+    /// after something else changed them (a prime).
+    pub fn forget_applied(&mut self) {
+        self.applied.clear();
+    }
+
+    fn apply(&mut self, snap: &Snapshot, st: &mut Status, now: Instant) {
+        let alive: HashSet<ProcKey> = snap.procs.iter().map(|p| (p.pid, p.created)).collect();
+        let alive_pids: HashSet<u32> = alive.iter().map(|k| k.0).collect();
+        self.cpu_touched.retain(|k, _| alive.contains(k));
+        self.eco_touched.retain(|k| alive.contains(k));
+        self.applied.retain(|k, _| alive.contains(k));
+        self.suspended.retain(|pid| alive_pids.contains(pid));
+        self.workers_paused.retain(|pid| alive_pids.contains(pid));
 
         let critical = st.pressure == Level::Critical;
         let cooldown = if critical { 15 } else { self.cfg.trim_cooldown_sec };
+        let mut claimed = HashSet::new();
 
         for gs in st.groups.iter_mut() {
             let eff = gs.policy;
+            let mine = claim(&mut claimed, &gs.pids);
             let mut uncapped = 0usize;
-            for &pid in &gs.pids {
-                win::set_memory_priority(pid, eff.priority.value());
-
-                match eff.cpu {
-                    Cpu::Normal => self.restore_cpu(pid),
-                    Cpu::Below | Cpu::Idle => {
-                        self.cpu_touched.entry(pid).or_insert_with(|| win::cpu_class_raw(pid));
-                        win::set_cpu_class(pid, if eff.cpu == Cpu::Idle { win::CpuClass::Idle } else { win::CpuClass::BelowNormal });
-                        if self.eco_touched.remove(&pid) {
-                            win::set_eco_mode(pid, false);
-                        }
-                    }
-                    Cpu::Eco => {
-                        if self.eco_touched.insert(pid) {
-                            win::set_eco_mode(pid, true);
-                        }
-                    }
+            for &key in &mine {
+                let priority = eff.priority.value();
+                if should_apply(self.applied.get(&key), priority, eff.cpu, now) {
+                    self.set_policy(key, priority, eff.cpu);
+                    self.applied.insert(key, Applied { priority, cpu: eff.cpu, at: now });
                 }
 
                 if let Some(job) = self.jobs.get(&gs.name) {
-                    if !job.assign(pid) {
+                    if !job.assign(key.0) {
                         uncapped += 1;
                     }
                 }
@@ -692,8 +753,8 @@ impl Engine {
                 crate::log::write(&format!(
                     "[{}] hard cap covers {} of {} processes{}",
                     gs.name,
-                    gs.pids.len() - uncapped,
-                    gs.pids.len(),
+                    mine.len() - uncapped,
+                    mine.len(),
                     if uncapped > 0 { " (the rest refused to join the job; sandboxed helpers do that)" } else { "" }
                 ));
             }
@@ -705,7 +766,7 @@ impl Engine {
                 let since = self.last_trim.get(&gs.name).map(|t| t.elapsed().as_secs());
                 let due = since.map_or(true, |s| s >= cooldown * backoff);
                 if due {
-                    let trimmed = count_ok(&gs.pids, win::trim);
+                    let trimmed = count_ok(gs.pids.iter().map(|k| k.0), win::trim);
                     let next = match since {
                         Some(s) if !critical && s < cooldown * backoff * 3 => (backoff * 2).min(16),
                         _ => 1,
@@ -726,14 +787,14 @@ impl Engine {
             }
 
             if eff.suspend {
-                for &pid in &gs.pids {
+                for &(pid, _) in &mine {
                     if !self.suspended.contains(&pid) && win::suspend(pid) {
                         self.suspended.insert(pid);
                     }
                 }
                 gs.suspended = true;
             } else {
-                for &pid in &gs.pids {
+                for &(pid, _) in &mine {
                     if self.suspended.remove(&pid) {
                         win::resume(pid);
                     }
@@ -778,17 +839,51 @@ impl Engine {
         }
     }
 
-    fn restore_cpu(&mut self, pid: u32) {
-        if let Some(orig) = self.cpu_touched.remove(&pid) {
+    /// Set memory priority and CPU policy on one process.
+    fn set_policy(&mut self, key: ProcKey, priority: u32, cpu: Cpu) {
+        let pid = key.0;
+        win::set_memory_priority(pid, priority);
+        let plan = cpu_plan(cpu, self.cpu_touched.contains_key(&key), self.eco_touched.contains(&key));
+        if plan.restore_class {
+            self.restore_class(key);
+        }
+        if plan.remember_class {
+            self.cpu_touched.insert(key, win::cpu_class_raw(pid));
+        }
+        if let Some(class) = plan.set_class {
+            win::set_cpu_class(pid, class);
+        }
+        match plan.eco {
+            Some(true) => {
+                self.eco_touched.insert(key);
+                win::set_eco_mode(pid, true);
+            }
+            Some(false) => {
+                self.eco_touched.remove(&key);
+                win::set_eco_mode(pid, false);
+            }
+            None => {}
+        }
+    }
+
+    /// Put back the CPU priority class a process had before we lowered it.
+    fn restore_class(&mut self, key: ProcKey) {
+        if let Some(orig) = self.cpu_touched.remove(&key) {
             if orig != 0 {
-                win::set_cpu_class_raw(pid, orig);
+                win::set_cpu_class_raw(key.0, orig);
             } else {
-                win::set_cpu_class(pid, win::CpuClass::Normal);
+                win::set_cpu_class(key.0, win::CpuClass::Normal);
             }
         }
-        if self.eco_touched.remove(&pid) {
-            win::set_eco_mode(pid, false);
+    }
+
+    /// Undo our CPU changes to one process and forget what we set on it.
+    fn restore_cpu(&mut self, key: ProcKey) {
+        self.restore_class(key);
+        if self.eco_touched.remove(&key) {
+            win::set_eco_mode(key.0, false);
         }
+        self.applied.remove(&key);
     }
 
     /// Put every app back the way we found it: normal memory priority, original CPU
@@ -797,10 +892,11 @@ impl Engine {
         for pid in self.suspended.drain().chain(self.workers_paused.drain()) {
             win::resume(pid);
         }
-        let pids: Vec<u32> = self.cpu_touched.keys().copied().chain(self.eco_touched.iter().copied()).collect();
-        for pid in pids {
-            self.restore_cpu(pid);
+        let keys: Vec<ProcKey> = self.cpu_touched.keys().copied().chain(self.eco_touched.iter().copied()).collect();
+        for key in keys {
+            self.restore_cpu(key);
         }
+        self.applied.clear();
         let procs = win::list_processes();
         for g in self.cfg.active_groups() {
             for p in procs.iter().filter(|p| p.queryable && any_matches(&g.processes, &p.name) && !is_protected(&self.cfg, p)) {
@@ -848,8 +944,8 @@ impl Default for Engine {
 }
 
 /// Run `f` on every pid; how many succeeded.
-fn count_ok(pids: &[u32], mut f: impl FnMut(u32) -> bool) -> usize {
-    pids.iter().filter(|&&pid| f(pid)).count()
+fn count_ok(pids: impl IntoIterator<Item = u32>, mut f: impl FnMut(u32) -> bool) -> usize {
+    pids.into_iter().filter(|&pid| f(pid)).count()
 }
 
 /// Publish the latest status for agents and `memguard status`. Written atomically.
@@ -1102,9 +1198,135 @@ mod tests {
     }
 
     #[test]
+    fn apply_skips_unchanged_and_reapplies_after_a_minute() {
+        let t0 = Instant::now();
+        let low = MemPriority::Low.value();
+        let a = Applied { priority: low, cpu: Cpu::Below, at: t0 };
+        assert!(should_apply(None, low, Cpu::Below, t0));
+        assert!(!should_apply(Some(&a), low, Cpu::Below, t0 + Duration::from_secs(1)));
+        assert!(!should_apply(Some(&a), low, Cpu::Below, t0 + Duration::from_secs(59)));
+        assert!(should_apply(Some(&a), low, Cpu::Below, t0 + REAPPLY_AFTER));
+        assert!(should_apply(Some(&a), MemPriority::Normal.value(), Cpu::Below, t0 + Duration::from_secs(1)));
+        assert!(should_apply(Some(&a), low, Cpu::Eco, t0 + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn cpu_plan_restores_the_class_for_eco() {
+        // Below/Idle -> Eco used to leave the lowered class in place.
+        let p = cpu_plan(Cpu::Eco, true, false);
+        assert_eq!(p, CpuPlan { restore_class: true, eco: Some(true), ..Default::default() });
+        // Eco -> Below turns efficiency mode off and remembers the class once.
+        let p = cpu_plan(Cpu::Below, false, true);
+        assert_eq!(p, CpuPlan { remember_class: true, set_class: Some(win::CpuClass::BelowNormal), eco: Some(false), ..Default::default() });
+        assert!(!cpu_plan(Cpu::Idle, true, false).remember_class);
+        assert_eq!(cpu_plan(Cpu::Idle, true, false).set_class, Some(win::CpuClass::Idle));
+        // Normal undoes whatever we did, and nothing if we did nothing.
+        assert_eq!(cpu_plan(Cpu::Normal, true, true), CpuPlan { restore_class: true, eco: Some(false), ..Default::default() });
+        assert_eq!(cpu_plan(Cpu::Normal, false, false), CpuPlan::default());
+    }
+
+    #[test]
+    fn first_group_wins() {
+        let mut claimed = HashSet::new();
+        assert_eq!(claim(&mut claimed, &[(4, 1), (8, 1)]), [(4, 1), (8, 1)]);
+        assert_eq!(claim(&mut claimed, &[(8, 1), (12, 1)]), [(12, 1)]);
+    }
+
+    #[test]
+    fn applied_cache_is_cleared_by_restore_all_and_auto_prime() {
+        let mut e = test_engine();
+        let mark = |e: &mut Engine| {
+            e.applied.insert((4, 1), Applied { priority: 1, cpu: Cpu::Below, at: Instant::now() });
+        };
+        mark(&mut e);
+        e.restore_all();
+        assert!(e.applied.is_empty());
+        mark(&mut e);
+        let snap = Snapshot { sys: sys(32, 20, 48, 10), procs: Vec::new(), now: 0 };
+        let st = analyze(&e.cfg, &snap);
+        e.auto_prime("build", &snap, &st);
+        assert!(e.applied.is_empty());
+        mark(&mut e);
+        e.forget_applied();
+        assert!(e.applied.is_empty());
+    }
+
+    /// The whole loop on a process this test starts: set once, skipped while unchanged,
+    /// set again after the TTL, Below -> Eco puts the class back, a recycled pid starts
+    /// over, restore_all undoes it.
+    #[test]
+    fn apply_on_our_own_ping() {
+        const NORMAL: u32 = 0x20;
+        const BELOW: u32 = 0x4000;
+        let mut child = std::process::Command::new("ping")
+            .args(["-t", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("start ping");
+        let pid = child.id();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut cfg = Config::builtin();
+            let mut g = cfg.groups[0].clone();
+            g.name = "PingTest".into();
+            g.processes = vec!["PING".into()];
+            g.priority = Some(MemPriority::Low);
+            g.cpu = Some(Cpu::Below);
+            g.trim_above_mb = None;
+            g.trim_above_pct = None;
+            g.suspend = None;
+            g.hard_cap_mb = 0;
+            g.hard_cap_per_process_mb = 0;
+            g.ue = None;
+            g.elevated = None;
+            g.critical = None;
+            cfg.groups = vec![g.clone(), g.clone()]; // the same process in two groups
+            cfg.groups[1].name = "PingTest2".into();
+            cfg.groups[1].cpu = Some(Cpu::Idle);
+            let procs: Vec<Proc> = win::list_processes().into_iter().filter(|p| p.pid == pid).collect();
+            assert_eq!(procs.len(), 1);
+            let key = (pid, procs[0].created);
+            let snap = Snapshot { sys: sys(32, 20, 48, 10), procs, now: 0 };
+            let mut e = Engine::with_config(cfg);
+            let t0 = Instant::now();
+            let mut st = analyze(&e.cfg, &snap);
+            e.apply(&snap, &mut st, t0);
+            assert_eq!(win::cpu_class_raw(pid), BELOW, "first group wins over Idle");
+            assert_eq!(e.applied[&key].at, t0);
+            // Something resets the class behind our back: not noticed within the TTL...
+            win::set_cpu_class_raw(pid, NORMAL);
+            e.apply(&snap, &mut st, t0 + Duration::from_secs(10));
+            assert_eq!(win::cpu_class_raw(pid), NORMAL);
+            // ...set again after it.
+            e.apply(&snap, &mut st, t0 + REAPPLY_AFTER);
+            assert_eq!(win::cpu_class_raw(pid), BELOW);
+            // Below -> Eco: the class goes back to normal.
+            e.cfg.groups[0].cpu = Some(Cpu::Eco);
+            let mut st = analyze(&e.cfg, &snap);
+            e.apply(&snap, &mut st, t0 + REAPPLY_AFTER + Duration::from_secs(1));
+            assert_eq!(win::cpu_class_raw(pid), NORMAL);
+            assert!(e.eco_touched.contains(&key) && !e.cpu_touched.contains_key(&key));
+            // A recycled pid is another process: nothing carries over.
+            let recycled = Snapshot { sys: snap.sys, procs: vec![Proc { created: key.1 + 1, ..snap.procs[0].clone() }], now: 0 };
+            e.cfg.groups[0].cpu = Some(Cpu::Below);
+            let mut st = analyze(&e.cfg, &recycled);
+            e.apply(&recycled, &mut st, t0 + REAPPLY_AFTER + Duration::from_secs(2));
+            assert!(!e.applied.contains_key(&key) && !e.eco_touched.contains(&key));
+            assert!(e.applied.contains_key(&(pid, key.1 + 1)));
+            e.restore_all();
+            assert!(e.applied.is_empty() && e.cpu_touched.is_empty() && e.eco_touched.is_empty());
+            assert_eq!(win::cpu_class_raw(pid), NORMAL);
+        }));
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[test]
     fn trim_log_counts_successes() {
-        assert_eq!(count_ok(&[4, 8, 12, 16], |pid| pid != 8), 3);
-        assert_eq!(count_ok(&[], |_| true), 0);
+        assert_eq!(count_ok([4, 8, 12, 16], |pid| pid != 8), 3);
+        assert_eq!(count_ok([], |_| true), 0);
     }
 
     #[test]

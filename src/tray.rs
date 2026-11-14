@@ -1071,6 +1071,7 @@ impl App {
         match w {
             Work::Primed(r) => {
                 self.priming = false;
+                self.engine.forget_applied(); // prime set memory priorities of its own
                 toast::show(catalog::freed_manual(r.trimmed_processes, r.before.ram_free_gb, r.after.ram_free_gb));
             }
             Work::Checked { manual, result } => {
