@@ -1,21 +1,21 @@
 [package]
-name = "memcap"
-version = "2.0.0"
+name = "athermemguard"
+version = "0.1.0"
 edition = "2021"
 description = "Memory manager that keeps a Windows PC primed for agentic Unreal Engine work"
-license = "MIT"
+build = "build.rs"
 
 [lib]
-name = "memcap"
+name = "athermemguard"
 path = "src/lib.rs"
 
 [[bin]]
-name = "memcap"
-path = "src/bin/memcap.rs"
+name = "memguard"
+path = "src/bin/memguard.rs"
 
 [[bin]]
-name = "memcap-tray"
-path = "src/bin/memcap-tray.rs"
+name = "AtherMemGuard"
+path = "src/bin/tray.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -23,6 +23,9 @@ serde_json = "1"
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 winreg = "0.52"
+
+[build-dependencies]
+winresource = "0.1"
 
 [dependencies.windows-sys]
 version = "0.59"

@@ -2,5 +2,5 @@
 #![windows_subsystem = "windows"]
 
 fn main() {
-    memcap::tray::run();
+    athermemguard::tray::run();
 }

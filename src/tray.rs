@@ -12,10 +12,10 @@ use windows_sys::Win32::UI::Shell::{
     NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
-    DispatchMessageW, GetCursorPos, GetMessageW, KillTimer, MessageBoxW, PostQuitMessage, RegisterClassW,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
+    DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, KillTimer, MessageBoxW, PostQuitMessage, RegisterClassW,
     RegisterWindowMessageW, SendMessageTimeoutW, SetForegroundWindow, SetTimer, TrackPopupMenu, TranslateMessage,
-    HICON, HWND_BROADCAST, MB_ICONINFORMATION, MB_OK, MF_SEPARATOR, MF_STRING, MSG, SMTO_ABORTIFHUNG,
+    HICON, HWND_BROADCAST, MB_ICONINFORMATION, MB_OK, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, SMTO_ABORTIFHUNG, SM_CXSMICON,
     SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_LBUTTONDBLCLK,
     WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW,
 };
@@ -33,6 +33,7 @@ const CMD_PAUSE: usize = 3;
 const CMD_SETTINGS: usize = 4;
 const CMD_LOG: usize = 5;
 const CMD_FOLDER: usize = 6;
+const CMD_STARTUP: usize = 7;
 const CMD_EXIT: usize = 9;
 
 struct App {
@@ -60,41 +61,10 @@ pub fn broadcast_environment_change() {
     }
 }
 
-/// 32x32 icon: a memory chip whose colour shows the pressure level.
+/// The Ather mark at the tray's icon size, with a status dot for the pressure level.
 fn make_icon(level: Level) -> HICON {
-    let (r, g, b) = match level {
-        Level::Normal => (46u8, 160u8, 90u8),
-        Level::Elevated => (230, 160, 30),
-        Level::Critical => (215, 55, 55),
-    };
-    let mut px = vec![0u8; 32 * 32 * 4];
-    let mut put = |x: usize, y: usize, c: (u8, u8, u8)| {
-        let i = (y * 32 + x) * 4;
-        px[i] = c.2;
-        px[i + 1] = c.1;
-        px[i + 2] = c.0;
-        px[i + 3] = 255;
-    };
-    for y in 6..26 {
-        for x in 4..28 {
-            put(x, y, (r, g, b));
-        }
-    }
-    for x in [7usize, 13, 19, 25] {
-        for y in (2..6).chain(26..30) {
-            put(x, y, (r, g, b));
-            put(x - 1, y, (r, g, b));
-        }
-    }
-    for (x0, top) in [(8usize, 10usize), (14, 14), (20, 18)] {
-        for y in top..22 {
-            for x in x0..x0 + 4 {
-                put(x, y, (255, 255, 255));
-            }
-        }
-    }
-    let and_mask = vec![0u8; 32 * 32 / 8];
-    unsafe { CreateIcon(GetModuleHandleW(null()), 32, 32, 1, 32, and_mask.as_ptr(), px.as_ptr()) }
+    let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16) as usize;
+    crate::logo::create_icon(size, level)
 }
 
 fn copy_to(dst: &mut [u16], text: &str) {
@@ -114,7 +84,7 @@ fn notify_data(hwnd: HWND) -> NOTIFYICONDATAW {
 
 fn tooltip(st: &Status) -> String {
     format!(
-        "MemCap{}: {}, pressure {}\nRAM free {:.1} GB, commit free {:.1} GB",
+        "Ather MemGuard{}: {}, pressure {}\nRAM free {:.1} GB, commit free {:.1} GB",
         if st.paused { " (paused)" } else { "" },
         st.mode,
         st.pressure.label(),
@@ -129,7 +99,7 @@ impl App {
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         nid.uCallbackMessage = WM_TRAY;
         nid.hIcon = self.icon;
-        copy_to(&mut nid.szTip, "MemCap");
+        copy_to(&mut nid.szTip, "Ather MemGuard");
         unsafe { Shell_NotifyIconW(NIM_ADD, &nid) };
     }
 
@@ -202,7 +172,7 @@ impl App {
             Shell_NotifyIconW(NIM_DELETE, &nid);
             DestroyIcon(self.icon);
         }
-        crate::log::write("MemCap stopped, apps restored to normal");
+        crate::log::write("Ather MemGuard stopped, apps restored to normal");
     }
 }
 
@@ -261,7 +231,7 @@ pub fn status_text(st: &Status) -> String {
 }
 
 fn message_box(hwnd: HWND, text: &str) {
-    let (t, c) = (wide(text), wide("MemCap"));
+    let (t, c) = (wide(text), wide("Ather MemGuard"));
     unsafe { MessageBoxW(hwnd, t.as_ptr(), c.as_ptr(), MB_OK | MB_ICONINFORMATION) };
 }
 
@@ -304,11 +274,13 @@ fn show_menu(hwnd: HWND) {
         add(CMD_PRIME, "Prime now (free RAM for Unreal)");
         add(CMD_PAUSE, if paused { "Resume" } else { "Pause" });
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
-        add(CMD_SETTINGS, "Edit settings");
+        add(CMD_SETTINGS, "Settings");
         add(CMD_LOG, "Open log");
         add(CMD_FOLDER, "Open data folder");
+        let startup = wide("Run at Windows startup");
+        AppendMenuW(menu, MF_STRING | if crate::install::is_run_at_startup() { MF_CHECKED } else { 0 }, CMD_STARTUP, startup.as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
-        add(CMD_EXIT, "Exit");
+        add(CMD_EXIT, "Quit Ather MemGuard");
         let mut pt: POINT = zeroed();
         GetCursorPos(&mut pt);
         SetForegroundWindow(hwnd);
@@ -359,6 +331,17 @@ fn run_command(hwnd: HWND, cmd: usize) {
         CMD_SETTINGS => open_in_notepad(&paths::config_file()),
         CMD_LOG => open_in_notepad(&paths::log_file()),
         CMD_FOLDER => open_folder(&paths::data_dir()),
+        CMD_STARTUP => {
+            let on = !crate::install::is_run_at_startup();
+            let ok = crate::install::set_run_at_startup(on).is_ok();
+            with_app(|a| {
+                if ok {
+                    a.balloon(if on { "Run at startup: On" } else { "Run at startup: Off" }, "Ather MemGuard", false);
+                } else {
+                    a.balloon("Couldn't change run at startup", "Ather MemGuard", true);
+                }
+            });
+        }
         CMD_EXIT => unsafe { PostQuitMessage(0) },
         _ => {}
     }
@@ -404,20 +387,20 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
     }
 }
 
-/// Run the tray app until Exit or `memcap stop`. Returns at once if a copy is already running.
+/// Run the tray app until Exit or `memguard stop`. Returns at once if a copy is already running.
 pub fn run() {
     let Some(_instance) = win::acquire_instance(paths::mutex(), 8000) else { return };
     let exit_event = win::create_event(paths::exit_event());
 
     unsafe {
-        let class = wide("MemCapTrayWindow");
+        let class = wide("AtherMemGuardTrayWindow");
         let hinstance = GetModuleHandleW(null());
         let mut wc: WNDCLASSW = zeroed();
         wc.lpfnWndProc = Some(wnd_proc);
         wc.hInstance = hinstance;
         wc.lpszClassName = class.as_ptr();
         RegisterClassW(&wc);
-        let title = wide("MemCap");
+        let title = wide("Ather MemGuard");
         let hwnd = CreateWindowExW(0, class.as_ptr(), title.as_ptr(), 0, 0, 0, 0, 0, null_mut(), null_mut(), hinstance, null());
         if hwnd.is_null() {
             crate::log::write("could not create the tray window");
@@ -437,7 +420,7 @@ pub fn run() {
             hinted_restart: false,
         };
         app.add_icon();
-        crate::log::write(&format!("MemCap {} started", env!("CARGO_PKG_VERSION")));
+        crate::log::write(&format!("Ather MemGuard {} started", env!("CARGO_PKG_VERSION")));
         APP.with(|cell| *cell.borrow_mut() = Some(app));
         with_app(|a| a.tick());
         SetTimer(hwnd, TIMER_ID, 1000, None);
@@ -452,15 +435,15 @@ pub fn run() {
     }
 }
 
-/// Headless loop for `memcap daemon`: same engine, no tray icon, logs to the console.
+/// Headless loop for `memguard daemon`: same engine, no tray icon, logs to the console.
 pub fn run_headless() {
     let Some(_instance) = win::acquire_instance(paths::mutex(), 8000) else {
-        eprintln!("MemCap is already running.");
+        eprintln!("Ather MemGuard is already running.");
         return;
     };
     let exit_event = win::create_event(paths::exit_event());
     let mut engine = Engine::new();
-    crate::log::write(&format!("MemCap {} started (headless)", env!("CARGO_PKG_VERSION")));
+    crate::log::write(&format!("Ather MemGuard {} started (headless)", env!("CARGO_PKG_VERSION")));
     loop {
         let st = engine.tick();
         println!(
@@ -474,7 +457,7 @@ pub fn run_headless() {
         for _ in 0..engine.cfg.interval_sec {
             if exit_event.as_ref().is_some_and(win::event_is_set) {
                 engine.restore_all();
-                crate::log::write("MemCap stopped, apps restored to normal");
+                crate::log::write("Ather MemGuard stopped, apps restored to normal");
                 return;
             }
             std::thread::sleep(std::time::Duration::from_secs(1));

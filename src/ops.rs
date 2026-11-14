@@ -121,7 +121,7 @@ pub fn prime(cfg: &Config, target: Option<&str>, kill_orphans: bool) -> PrimeRep
     let mut advice = st.advice;
     if !orphans.is_empty() && !kill_orphans {
         advice.push(format!(
-            "{} leftover Unreal helper processes have no parent. Run `memcap prime --kill-orphans` to end them.",
+            "{} leftover Unreal helper processes have no parent. Run `memguard prime --kill-orphans` to end them.",
             orphans.len()
         ));
     }
@@ -188,7 +188,7 @@ pub struct RunOptions {
 }
 
 /// Run a command inside a Job Object, wait for it and return its exit code.
-/// Children are in the job too, and all of them end if memcap itself is killed.
+/// Children are in the job too, and all of them end if memguard itself is killed.
 pub fn run(opts: &RunOptions, command: &[String]) -> Result<i32, String> {
     let job = win::Job::create(None, (opts.per_process_cap_gb * GB) as u64, (opts.hard_cap_gb * GB) as u64, true)?;
     let mut child = Command::new(&command[0])

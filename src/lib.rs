@@ -1,4 +1,4 @@
-//! MemCap: keeps a Windows PC primed for agentic Unreal Engine work.
+//! AtherMemGuard: keeps a Windows PC primed for agentic Unreal Engine work.
 //!
 //! - `win`     thin safe wrappers over the Win32 / NT calls we need
 //! - `config`  TOML settings (groups, pressure thresholds, UE process names)
@@ -10,6 +10,7 @@
 pub mod config;
 pub mod engine;
 pub mod install;
+pub mod logo;
 pub mod ops;
 pub mod paths;
 pub mod tray;

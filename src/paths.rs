@@ -1,44 +1,63 @@
-﻿use std::path::PathBuf;
+use std::path::PathBuf;
 
-/// Setting MEMCAP_HOME points MemCap at another data folder and gives it its own
+/// Internal name: folders, registry values, executables.
+pub const APP_NAME: &str = "AtherMemGuard";
+/// The name people see.
+pub const PRODUCT_NAME: &str = "Ather MemGuard";
+pub const PUBLISHER: &str = "Ather";
+
+pub const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+pub const RUN_VALUE: &str = "AtherMemGuard";
+pub const UNINSTALL_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\AtherMemGuard";
+
+pub const TRAY_EXE: &str = "AtherMemGuard.exe";
+pub const CLI_EXE: &str = "memguard.exe";
+
+/// Setting ATHER_MEMGUARD_DIR points the app at another data folder and gives it its own
 /// instance names, so a test copy can run beside the installed one.
 fn test_home() -> Option<PathBuf> {
-    std::env::var_os("MEMCAP_HOME").filter(|v| !v.is_empty()).map(PathBuf::from)
+    std::env::var_os("ATHER_MEMGUARD_DIR").filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
 pub fn mutex() -> &'static str {
-    if test_home().is_some() { "Local\\MemCap-Running-Test" } else { "Local\\MemCap-Running" }
+    if test_home().is_some() {
+        "Local\\AtherMemGuard.Instance.Test"
+    } else {
+        "Local\\AtherMemGuard.Instance"
+    }
 }
 
 pub fn exit_event() -> &'static str {
-    if test_home().is_some() { "Local\\MemCap-Exit-Test" } else { "Local\\MemCap-Exit" }
-}
-pub const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-pub const RUN_VALUE: &str = "MemCap";
-
-fn local_app_data() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+    if test_home().is_some() {
+        "Local\\AtherMemGuard.Exit.Test"
+    } else {
+        "Local\\AtherMemGuard.Exit"
+    }
 }
 
-/// Settings, log and status live here.
+fn env_dir(name: &str) -> PathBuf {
+    std::env::var_os(name).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Settings, log and status live here: %APPDATA%\AtherMemGuard, like other Ather apps.
 pub fn data_dir() -> PathBuf {
     if let Some(home) = test_home() {
         return home;
     }
-    local_app_data().join("MemCap")
+    env_dir("APPDATA").join(APP_NAME)
 }
 
-/// Where `memcap install` puts the executables.
+/// Where `memguard install` puts the executables.
 pub fn install_dir() -> PathBuf {
-    local_app_data().join("Programs").join("MemCap")
+    env_dir("LOCALAPPDATA").join("Programs").join(APP_NAME)
 }
 
 pub fn config_file() -> PathBuf {
-    data_dir().join("memcap.toml")
+    data_dir().join("settings.toml")
 }
 
 pub fn log_file() -> PathBuf {
-    data_dir().join("memcap.log")
+    data_dir().join("memguard.log")
 }
 
 pub fn status_file() -> PathBuf {

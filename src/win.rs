@@ -1,4 +1,4 @@
-//! Safe wrappers over the Win32 / NT calls MemCap uses. All `unsafe` lives here and in `tray`.
+//! Safe wrappers over the Win32 / NT calls AtherMemGuard uses. All `unsafe` lives here and in `tray`.
 
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
@@ -370,7 +370,7 @@ impl Job {
 
 // ---------------------------------------------------------------- single instance + stop signal
 
-/// Take the "MemCap is running" mutex. Waits up to `wait_ms` for a previous copy to finish.
+/// Take the "AtherMemGuard is running" mutex. Waits up to `wait_ms` for a previous copy to finish.
 pub fn acquire_instance(name: &str, wait_ms: u32) -> Option<Handle> {
     let w = wide(name);
     let h = unsafe { CreateMutexW(null(), 0, w.as_ptr()) };

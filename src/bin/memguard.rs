@@ -1,16 +1,16 @@
-//! `memcap`: the command line for people, scripts and agents.
+//! `memguard`: the command line for people, scripts and agents.
 
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use memcap::config::{Config, Cpu, MemPriority, Target};
-use memcap::engine::{analyze, snapshot, Status};
-use memcap::{install, ops, paths, tray, win};
+use athermemguard::config::{Config, Cpu, MemPriority, Target};
+use athermemguard::engine::{analyze, snapshot, Status};
+use athermemguard::{install, ops, paths, tray, win};
 
 #[derive(Parser)]
-#[command(name = "memcap", version, about = "Keeps this PC primed for agentic Unreal Engine work")]
+#[command(name = "memguard", version, about = "Keeps this PC primed for agentic Unreal Engine work")]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -114,23 +114,26 @@ enum Cmd {
     Daemon,
     /// Install for this user, start at sign-in and start now
     Install {
-        /// Also put `memcap` on your PATH so agents and scripts can call it
+        /// Also put `memguard` on your PATH so agents and scripts can call it
         #[arg(long)]
         add_to_path: bool,
         /// Don't start the tray app after installing
         #[arg(long)]
         no_start: bool,
     },
-    /// Stop MemCap, remove it from sign-in and delete the program (settings are kept)
+    /// Stop Ather MemGuard, remove it from sign-in and delete the program (settings are kept)
     Uninstall,
     /// Stop the running background app; apps go back to normal
     Stop,
+    /// Write the app icon to a file (used by the build)
+    #[command(hide = true)]
+    WriteIcon { path: std::path::PathBuf },
     /// Show where the settings file is, or check it for mistakes
     Config {
-        /// Validate memcap.toml and report the first problem
+        /// Validate settings.toml and report the first problem
         #[arg(long)]
         check: bool,
-        /// Replace memcap.toml with the built-in defaults (the old file is kept as .bak)
+        /// Replace settings.toml with the built-in defaults (the old file is kept as .bak)
         #[arg(long)]
         reset: bool,
     },
@@ -165,7 +168,7 @@ fn current_status(cfg: &Config) -> Status {
 
 fn print_status(st: &Status) {
     println!(
-        "MemCap {}   background app: {}",
+        "Ather MemGuard {}   background app: {}",
         env!("CARGO_PKG_VERSION"),
         if !st.daemon {
             "NOT RUNNING (nothing is being enforced)"
@@ -315,7 +318,7 @@ fn main() -> ExitCode {
             match ops::run(&opts, &command) {
                 Ok(code) => ExitCode::from((code & 0xff) as u8),
                 Err(e) => {
-                    eprintln!("memcap run: {}", e);
+                    eprintln!("memguard run: {}", e);
                     ExitCode::from(125)
                 }
             }
@@ -342,6 +345,14 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
 
+        Cmd::WriteIcon { path } => match athermemguard::logo::write_ico(&path) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{}: {}", path.display(), e);
+                ExitCode::from(1)
+            }
+        },
+
         Cmd::Daemon => {
             tray::run_headless();
             ExitCode::SUCCESS
@@ -350,6 +361,9 @@ fn main() -> ExitCode {
         Cmd::Install { add_to_path, no_start } => match install::install(add_to_path, !no_start) {
             Ok(r) => {
                 println!("Installed to {}", r.dir.display());
+                if r.migrated_from_memcap {
+                    println!("Replaced MemCap, the earlier name of this app. Its settings were carried over.");
+                }
                 if r.stopped_previous {
                     println!("Stopped the copy that was running.");
                 }
@@ -357,10 +371,10 @@ fn main() -> ExitCode {
                 if add_to_path {
                     println!(
                         "PATH: {}",
-                        if r.path_changed { "added (new terminals will find `memcap`)" } else { "already there" }
+                        if r.path_changed { "added (new terminals will find `memguard`)" } else { "already there" }
                     );
                 }
-                println!("Running now: {}", if r.started { "yes, look for the chip icon in the tray" } else { "no" });
+                println!("Running now: {}", if r.started { "yes, look for the Ather icon in the tray" } else { "no" });
                 println!("Settings: {}", paths::config_file().display());
                 ExitCode::SUCCESS
             }
@@ -372,7 +386,7 @@ fn main() -> ExitCode {
 
         Cmd::Uninstall => match install::uninstall() {
             Ok(()) => {
-                println!("MemCap is removed. Settings and log are kept in {}", paths::data_dir().display());
+                println!("Ather MemGuard is removed. Settings and log are kept in {}", paths::data_dir().display());
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -383,12 +397,12 @@ fn main() -> ExitCode {
 
         Cmd::Stop => {
             if install::stop_running() {
-                println!("MemCap stopped. Apps are back to normal.");
+                println!("Ather MemGuard stopped. Apps are back to normal.");
             } else if win::instance_running(paths::mutex()) {
-                eprintln!("MemCap did not stop within 8 seconds.");
+                eprintln!("Ather MemGuard did not stop within 8 seconds.");
                 return ExitCode::from(1);
             } else {
-                println!("MemCap was not running.");
+                println!("Ather MemGuard was not running.");
             }
             ExitCode::SUCCESS
         }
@@ -400,7 +414,7 @@ fn main() -> ExitCode {
                     let _ = std::fs::copy(&path, path.with_extension("toml.bak"));
                 }
                 if let Err(e) = std::fs::create_dir_all(paths::data_dir())
-                    .and_then(|_| std::fs::write(&path, memcap::config::DEFAULT_TOML))
+                    .and_then(|_| std::fs::write(&path, athermemguard::config::DEFAULT_TOML))
                 {
                     eprintln!("Could not write {}: {}", path.display(), e);
                     return ExitCode::from(1);

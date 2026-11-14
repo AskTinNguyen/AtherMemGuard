@@ -2,7 +2,7 @@
 //!
 //! `analyze` turns a process snapshot into a `Status`: what Unreal is doing, how much
 //! pressure memory is under, and which policy each group should get. `Engine::apply`
-//! then enforces that policy. The CLI uses `analyze` alone, so `memcap status` works
+//! then enforces that policy. The CLI uses `analyze` alone, so `memguard status` works
 //! with or without the background app running.
 
 use std::collections::{HashMap, HashSet};
@@ -228,9 +228,9 @@ pub fn pressure_level(cfg: &Config, sys: &SysInfo) -> Level {
     }
 }
 
-/// Is this process one MemCap must never touch?
+/// Is this process one AtherMemGuard must never touch?
 pub fn is_protected(cfg: &Config, p: &Proc) -> bool {
-    p.pid == win::current_pid() || p.name.to_ascii_lowercase().starts_with("memcap") || any_matches(&cfg.ue.protect, &p.name)
+    p.pid == win::current_pid() || p.name.to_ascii_lowercase().contains("memguard") || any_matches(&cfg.ue.protect, &p.name)
 }
 
 pub fn analyze(cfg: &Config, snap: &Snapshot) -> Status {
@@ -396,7 +396,7 @@ impl Engine {
         e
     }
 
-    /// Re-read memcap.toml if it changed on disk.
+    /// Re-read settings.toml if it changed on disk.
     pub fn reload(&mut self, force: bool) {
         let path = crate::paths::config_file();
         let stamp = fs::metadata(&path).and_then(|m| m.modified()).ok();
@@ -411,7 +411,7 @@ impl Engine {
                 self.jobs.clear();
                 for g in &cfg.groups {
                     if g.hard_cap_mb > 0 || g.hard_cap_per_process_mb > 0 {
-                        let name = format!("Local\\MemCap-{}", g.name);
+                        let name = format!("Local\\AtherMemGuard-{}", g.name);
                         match win::Job::create(Some(&name), g.hard_cap_per_process_mb * MB, g.hard_cap_mb * MB, false) {
                             Ok(job) => {
                                 self.jobs.insert(g.name.clone(), job);
@@ -618,7 +618,7 @@ impl Default for Engine {
     }
 }
 
-/// Publish the latest status for agents and `memcap status`. Written atomically.
+/// Publish the latest status for agents and `memguard status`. Written atomically.
 pub fn write_status(st: &Status) {
     let path = crate::paths::status_file();
     let tmp = path.with_extension("json.tmp");

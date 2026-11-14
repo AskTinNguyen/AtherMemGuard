@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 
-/// Written to memcap.toml on first run. Also the source of the built-in defaults.
-pub const DEFAULT_TOML: &str = r#"# MemCap settings. Saved changes are picked up within one interval.
+/// Written to settings.toml on first run. Also the source of the built-in defaults.
+pub const DEFAULT_TOML: &str = r#"# AtherMemGuard settings. Saved changes are picked up within one interval.
 #
 # How it decides what to do
 #   mode      what Unreal is doing: idle, editor, build, cook (several can be true at once)
@@ -53,7 +53,7 @@ worker_throttle = false
 min_workers = 4
 
 [prime]
-# Headroom `memcap prime --for X` and `memcap wait --for X` aim for. Starting points:
+# Headroom `memguard prime --for X` and `memguard wait --for X` aim for. Starting points:
 # tune them to your project.
 editor = { ram_gb = 16, commit_gb = 24 }
 build = { ram_gb = 24, commit_gb = 40 }
@@ -279,7 +279,7 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Load memcap.toml, writing the default file first if there is none.
+    /// Load settings.toml, writing the default file first if there is none.
     pub fn load() -> Result<Config, String> {
         let path = crate::paths::config_file();
         if !path.exists() {
