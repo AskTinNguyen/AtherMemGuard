@@ -294,6 +294,17 @@ enum Cmd {
         #[arg(long, num_args = 0..=1, value_name = "UNDO_ID")]
         undo: Option<Option<String>>,
     },
+
+    // ---- Part G: RAM and BIOS check
+    /// Check whether your RAM runs at its rated speed and how to fix it in the BIOS (changes nothing)
+    Ram {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+        /// Also write the report as a page you can open in a browser
+        #[arg(long, value_name = "FILE")]
+        html: Option<std::path::PathBuf>,
+    },
 }
 
 fn load_config() -> Config {
@@ -618,6 +629,9 @@ fn main() -> ExitCode {
 
         // ---- Part F: doctor
         Cmd::Doctor { json, fix, force, dry_run, undo } => run_doctor(json, fix, force, dry_run, undo),
+
+        // ---- Part G: RAM and BIOS check
+        Cmd::Ram { json, html } => run_ram(json, html),
     }
 }
 
@@ -833,4 +847,26 @@ fn print_doctor_report(r: &athermemguard::doctor::Report) {
         ),
         _ => println!("Nothing to do."),
     }
+}
+
+// ---- Part G: RAM and BIOS check
+
+/// `memguard ram`: a report, not a test, so it always exits 0. A page that can't be
+/// written is said on stderr.
+fn run_ram(json: bool, html: Option<std::path::PathBuf>) -> ExitCode {
+    use athermemguard::ramcheck;
+    let report = ramcheck::check();
+    if json {
+        print_json(&report);
+    } else {
+        print!("{}", ramcheck::render_text(&report));
+    }
+    if let Some(path) = html {
+        match std::fs::write(&path, ramcheck::render_html(&report)) {
+            Ok(()) if !json => println!("\nReport page written to {}", path.display()),
+            Ok(()) => {}
+            Err(e) => eprintln!("Couldn't write {}: {}", path.display(), e),
+        }
+    }
+    ExitCode::SUCCESS
 }

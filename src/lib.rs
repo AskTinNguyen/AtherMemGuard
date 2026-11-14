@@ -12,6 +12,8 @@
 //! - `tray`    tray icon + background loop
 //! - `net`     HTTP(S) GET through WinHTTP
 //! - `updater` check, download, verify and swap in a new version
+//! - `ramcheck` RAM and BIOS check: memory below its rated speed, slots, BIOS age (Part G)
+//! - `smbios`  reading and parsing the firmware SMBIOS tables (Part G)
 
 pub mod config;
 pub mod doctor;
@@ -24,6 +26,8 @@ pub mod mcp;
 pub mod net;
 pub mod ops;
 pub mod paths;
+pub mod ramcheck; // Part G: RAM and BIOS check
+pub mod smbios; // Part G: firmware tables for the RAM check
 pub mod startup;
 pub mod tray;
 pub mod ui;

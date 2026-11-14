@@ -1,0 +1,427 @@
+# Ather MemGuard: data for the RAM and BIOS check (src/ramcheck.rs). Embedded at build time.
+#
+# Everything here is read-only knowledge. Add a rule when you are sure of what it decodes to;
+# a part number no rule matches is reported as "couldn't identify", which is always better
+# than a wrong guess.
+#
+# ---------------------------------------------------------------- part-number patterns
+#
+# A pattern is matched against the whole part number, upper-cased and trimmed. Syntax:
+#   letters, digits, - / .     must appear as written
+#   *                          any run of characters (also none)
+#   {name:d} {name:d4} {name:d1-3}   digits: one or more, exactly 4, 1 to 3
+#   {name:a...}                letters, same counts (a0-4 allows none)
+#   {name:w...}                letters or digits, same counts
+#   {name:[XD]}                one character from the set (ranges like [A-Z] work)
+#   {:...}                     the same without keeping the value
+# Names the engine understands:
+#   gen    4 or 5 (DDR generation)          speed  rated speed, see speed_scale / speed_map
+#   cl     first timing (CAS latency)       t2     second timing (tRCD; tRP is the same)
+#   size   GB per stick                     total  GB for the whole kit
+#   count  sticks in the kit                code   looked up in `codes` (speed, CL; 0 = unknown)
+# Rule fields:
+#   vendor, patterns (first match wins), gen (when the pattern has none),
+#   speed_scale (multiply the captured speed; default 1), speed_map (raw text -> MT/s, wins),
+#   codes, timings (template with {cl} and {t2}),
+#   profile: "xmp"   = a kit with a fast profile,
+#            "jedec" = standard speed only (OEM and value modules: no fast profile),
+#            "auto"  = standard ("jedec") when speed and CL are within the JEDEC tables below,
+#                      otherwise a fast-profile kit.
+# A decode is only used when its speed is in range for its generation and its generation
+# matches what the firmware reports.
+
+[[part]]
+vendor = "G.Skill"
+# DDR5 kit: F5-6000J3038F16GX2-TZ5N = DDR5-6000, CL30-38-38, 2 x 16 GB.
+# The sticks themselves report the kit number without the X2 suffix (F5-6000J3038F16G).
+patterns = [
+  "F5-{speed:d4}{:a1}{cl:d2}{t2:d2}{:a1}{size:d1-3}G{:[XD]}{count:d1}*",
+  "F5-{speed:d4}{:a1}{cl:d2}{t2:d2}{:a1}{size:d1-3}G*",
+]
+gen = 5
+timings = "{cl}-{t2}-{t2}"
+profile = "auto"
+
+[[part]]
+vendor = "G.Skill"
+# DDR4 kit: F4-3600C16D-32GTZN = DDR4-3600 CL16, 32 GB kit of 2 (D = dual, Q = quad).
+# The sticks report F4-3600C16-16GTZN (no D, size per stick).
+patterns = [
+  "F4-{speed:d4}C{cl:d2}{count:[DQ]}-{total:d1-3}G*",
+  "F4-{speed:d4}C{cl:d2}-{size:d1-3}G*",
+]
+gen = 4
+profile = "auto"
+
+[[part]]
+vendor = "Corsair"
+# CMK32GX5M2B5600C36 = Vengeance, 32 GB, DDR5, kit of 2, DDR5-5600 CL36.
+patterns = ["CM{:a1-3}{total:d1-3}GX{gen:[45]}M{count:d1}{:a1}{speed:d4}C{cl:d2}*"]
+profile = "auto"
+
+[[part]]
+vendor = "Kingston"
+# Fury Beast / Renegade / Impact: KF560C36BBEK2-32 = DDR5-6000 CL36, kit of 2, 32 GB;
+# KF432C16BB/16 = DDR4-3200 CL16, 16 GB; KF432S20IB/16 = DDR4-3200 CL20 SO-DIMM.
+patterns = [
+  "KF{gen:[45]}{speed:d2}{:[CS]}{cl:d2}{:w0-4}K{count:d1}{:[-/]}{total:d1-3}*",
+  "KF{gen:[45]}{speed:d2}{:[CS]}{cl:d2}{:w0-4}{:[-/]}{size:d1-3}*",
+]
+speed_scale = 100
+speed_map = { "26" = 2666, "29" = 2933, "21" = 2133 }
+profile = "auto"
+
+[[part]]
+vendor = "Kingston"
+# What Fury Beast DDR4 and HyperX DDR4 sticks report: KF3200C16D4/8GX, KHX3200C16D4/8GX.
+patterns = ["K{:[F]}{speed:d4}C{cl:d2}D4/{size:d1-3}G*", "KHX{speed:d4}C{cl:d2}D4/{size:d1-3}G*"]
+gen = 4
+profile = "auto"
+
+[[part]]
+vendor = "Kingston"
+# HyperX Fury / Predator DDR4 kits: HX432C16FB3K2/16 = DDR4-3200 CL16, kit of 2, 16 GB.
+patterns = [
+  "HX4{speed:d2}C{cl:d2}{:w0-5}K{count:d1}/{total:d1-3}*",
+  "HX4{speed:d2}C{cl:d2}{:w0-5}/{size:d1-3}*",
+]
+gen = 4
+speed_scale = 100
+speed_map = { "26" = 2666, "29" = 2933, "21" = 2133, "33" = 3333 }
+profile = "auto"
+
+[[part]]
+vendor = "Kingston"
+# ValueRAM (standard speed): KVR32N22S8/8 = DDR4-3200 CL22, 8 GB; KVR48U40BS8-16 = DDR5-4800 CL40.
+patterns = ["KVR{speed:d2}{:[NSUE]}{cl:d2}*"]
+speed_scale = 100
+speed_map = { "26" = 2666, "29" = 2933, "21" = 2133 }
+gen_from_speed = true
+profile = "jedec"
+
+[[part]]
+vendor = "Crucial"
+# Ballistix: BL16G36C16U4B = 16 GB DDR4-3600 CL16 (U4 desktop, S4 laptop); BLM = Ballistix MAX;
+# BL2K8G32C16U4B = kit of 2.
+patterns = [
+  "BL{:[M]}{count:d1}K{size:d1-3}G{speed:d2}C{cl:d2}{:[US]}4*",
+  "BL{:[M]}{size:d1-3}G{speed:d2}C{cl:d2}{:[US]}4*",
+  "BL{count:d1}K{size:d1-3}G{speed:d2}C{cl:d2}{:[US]}4*",
+  "BL{size:d1-3}G{speed:d2}C{cl:d2}{:[US]}4*",
+]
+gen = 4
+speed_scale = 100
+speed_map = { "26" = 2666, "29" = 2933 }
+profile = "xmp"
+
+[[part]]
+vendor = "Crucial"
+# DDR5 (standard speed): CT16G48C40U5 = 16 GB DDR5-4800 CL40 (U5 desktop, S5 laptop).
+patterns = [
+  "CT{count:d1}K{size:d1-3}G{speed:d2}C{cl:d2}{:[US]}5*",
+  "CT{size:d1-3}G{speed:d2}C{cl:d2}{:[US]}5*",
+]
+gen = 5
+speed_scale = 100
+profile = "jedec"
+
+[[part]]
+vendor = "Crucial"
+# Crucial Pro DDR5: CP2K16G60C36U5B = kit of 2 x 16 GB DDR5-6000 CL36 (a fast-profile kit);
+# CP16G56C46U5 = DDR5-5600 CL46 (standard speed).
+patterns = [
+  "CP{count:d1}K{size:d1-3}G{speed:d2}C{cl:d2}{:[US]}5*",
+  "CP{size:d1-3}G{speed:d2}C{cl:d2}{:[US]}5*",
+]
+gen = 5
+speed_scale = 100
+profile = "auto"
+
+[[part]]
+vendor = "Crucial"
+# DDR4 (standard speed): CT16G4DFRA32A = 16 GB DDR4-3200; CT8G4DFS8266 = 8 GB DDR4-2666.
+patterns = [
+  "C{:[TP]}{count:d1}K{size:d1-3}G4{:a2}{:w2}{speed:d2-3}*",
+  "C{:[TP]}{size:d1-3}G4{:a2}{:w2}{speed:d2-3}*",
+]
+gen = 4
+speed_scale = 100
+speed_map = { "21" = 2133, "24" = 2400, "26" = 2666, "29" = 2933, "32" = 3200, "213" = 2133, "240" = 2400, "266" = 2666, "293" = 2933 }
+profile = "jedec"
+
+[[part]]
+vendor = "TeamGroup"
+# T-Force / Vulcan kits: FF3D516G6000HC38ADC01 = DDR5-6000 CL38; TLZGD416G3200HC16CDC01 = DDR4-3200 CL16.
+# The size in these numbers can be per stick or per kit, so it isn't used.
+patterns = ["*D{gen:[45]}{:d1-3}G{speed:d4}HC{cl:d2}*"]
+profile = "auto"
+
+[[part]]
+vendor = "TeamGroup"
+# What many TeamGroup sticks report instead: TEAMGROUP-UD4-3200, UD5-6000 (speed only).
+patterns = ["*UD{gen:[45]}-{speed:d4}*"]
+profile = "auto"
+
+[[part]]
+vendor = "ADATA"
+# XPG DDR5: AX5U6000C3016G-DCLARBK = DDR5-6000 CL30, 16 GB.
+patterns = ["AX5U{speed:d4}C{cl:d2}{size:d1-3}G*"]
+gen = 5
+profile = "auto"
+
+[[part]]
+vendor = "ADATA"
+# XPG DDR4: AX4U320016G16A-DT60 = DDR4-3200, 16 GB, CL16.
+patterns = ["AX4U{speed:d4}{size:d1-2}G{cl:d2}*"]
+gen = 4
+profile = "auto"
+
+[[part]]
+vendor = "Patriot"
+# Viper DDR5: PVV532G600C36K = DDR5-6000 CL36, 32 GB kit (K). Speed is written / 10.
+patterns = [
+  "PV{:a1-2}5{total:d2-3}G{speed:d3}C{cl:d2}K*",
+  "PV{:a1-2}5{size:d2-3}G{speed:d3}C{cl:d2}*",
+]
+gen = 5
+speed_scale = 10
+profile = "auto"
+
+[[part]]
+vendor = "Patriot"
+# Signature Line (standard speed): PSD516G480081 = DDR5-4800 16 GB; PSD48G266681 = DDR4-2666 8 GB.
+patterns = ["PSD{gen:[45]}{size:d1-2}G{speed:d4}*"]
+profile = "jedec"
+
+[[part]]
+vendor = "Samsung"
+# OEM DDR4 (standard speed): M378A1K43EB2-CWE = 8 GB DDR4-3200 desktop, M471... = laptop.
+patterns = ["M{:d3}A{:w4-12}-C{code:a2}*"]
+gen = 4
+codes = { PB = [2133, 0], RC = [2400, 0], TD = [2666, 0], VF = [2933, 0], WE = [3200, 0] }
+profile = "jedec"
+
+[[part]]
+vendor = "Samsung"
+# OEM DDR5 (standard speed): M323R2GA3BB0-CQK = 16 GB DDR5-4800 CL40; -CWM = DDR5-5600 CL46.
+patterns = ["M{:d3}R{:w4-12}-C{code:a2}*"]
+gen = 5
+codes = { QK = [4800, 40], WM = [5600, 46] }
+profile = "jedec"
+
+[[part]]
+vendor = "SK hynix"
+# OEM DDR4 (standard speed): HMA81GU6CJR8N-VK = 8 GB DDR4-2666; HMA82GS6CJR8N-XN = 16 GB DDR4-3200.
+patterns = ["HMA{:w6-12}-{code:a2}*"]
+gen = 4
+codes = { TF = [2133, 0], UH = [2400, 0], VK = [2666, 0], WM = [2933, 0], XN = [3200, 0] }
+profile = "jedec"
+
+[[part]]
+vendor = "Micron"
+# OEM DDR4 (standard speed): MTA8ATF1G64AZ-2G6E1 = 8 GB DDR4-2666; MTA16ATF2G64HZ-3G2J1 = 16 GB DDR4-3200.
+patterns = ["MTA{:w6-14}-{code:w3}*"]
+gen = 4
+codes = { "2G1" = [2133, 0], "2G3" = [2400, 0], "2G6" = [2666, 0], "2G9" = [2933, 0], "3G2" = [3200, 0] }
+profile = "jedec"
+
+[[part]]
+vendor = "Micron"
+# OEM DDR5 (standard speed): MTC8C1084S1UC48BA1 = 16 GB DDR5-4800; ...SC56... = DDR5-5600 laptop.
+patterns = ["MTC{:d1-2}C{:d4}S1{:a2}{speed:d2}*"]
+gen = 5
+speed_scale = 100
+profile = "jedec"
+
+# ---------------------------------------------------------------- JEDEC standard speeds
+# For profile = "auto": at or under `max_speed`, with a CL at or above the standard CL for that
+# speed (or no CL known), a kit is treated as standard speed. Standard voltages are the JEDEC
+# ones (a specification, not a typical value).
+
+[jedec.ddr4]
+max_speed = 3200
+volts = 1.2
+cl = { "2133" = 15, "2400" = 17, "2666" = 19, "2933" = 21, "3200" = 22 }
+range = [1600, 5600]
+# Speeds for "one step down", lowest first.
+ladder = [2133, 2400, 2666, 2933, 3200, 3600, 4000, 4400, 4800, 5333]
+
+[jedec.ddr5]
+max_speed = 5600
+volts = 1.1
+cl = { "4800" = 40, "5200" = 42, "5600" = 46 }
+range = [3200, 12000]
+ladder = [4800, 5200, 5600, 6000, 6400, 6800, 7200, 7600, 8000, 8400, 8800]
+
+# ---------------------------------------------------------------- typical profile voltages
+# Typical voltages of fast-profile kits by generation and speed. Always shown as "typical":
+# the kit's profile sets its own value.
+
+[[voltage]]
+gen = 4
+up_to = 3600
+volts = 1.35
+
+[[voltage]]
+gen = 4
+up_to = 99999
+volts = 1.4
+
+[[voltage]]
+gen = 5
+up_to = 5600
+volts = 1.25
+
+[[voltage]]
+gen = 5
+up_to = 6400
+volts = 1.35
+
+[[voltage]]
+gen = 5
+up_to = 99999
+volts = 1.4
+
+# ---------------------------------------------------------------- memory makers
+# JEDEC manufacturer IDs some firmware reports instead of a name.
+
+[jedec_ids]
+"80CE" = "Samsung"
+"CE00" = "Samsung"
+"80AD" = "SK hynix"
+"AD00" = "SK hynix"
+"802C" = "Micron"
+"2C00" = "Micron"
+"859B" = "Crucial"
+"9B85" = "Crucial"
+"0198" = "Kingston"
+"9801" = "Kingston"
+"029E" = "Corsair"
+"9E02" = "Corsair"
+"04CD" = "G.Skill"
+"CD04" = "G.Skill"
+"04CB" = "ADATA"
+"CB04" = "ADATA"
+
+# ---------------------------------------------------------------- board makers
+# `match`: any of these in the baseboard manufacturer (upper-cased). `profile_*`: the name of
+# the setting on Intel, on AMD with DDR5 and on AMD with DDR4. `model_paths`: a different path
+# when the board model contains the text. `support`: support page template ({model},
+# {model_slug}, {cpu_vendor}); without one, a web search for "{maker} {board} BIOS" is used.
+
+[[board]]
+id = "asus"
+name = "ASUS"
+match = ["ASUSTEK", "ASUS"]
+enter = "Del or F2"
+path = "Press F7 for Advanced Mode, then Ai Tweaker → Ai Overclock Tuner"
+model_paths = [{ contains = "ROG", path = "Press F7 for Advanced Mode, then Extreme Tweaker → Ai Overclock Tuner" }]
+profile_intel = "XMP I"
+profile_amd_ddr5 = "EXPO I (DOCP I if EXPO isn't listed)"
+profile_amd_ddr4 = "D.O.C.P."
+support = "https://www.asus.com/supportonly/{model}/helpdesk_bios/"
+
+[[board]]
+id = "msi"
+name = "MSI"
+match = ["MICRO-STAR", "MSI"]
+enter = "Del"
+path = "Press F7 for Advanced mode, then OC → Extreme Memory Profile (or use the XMP / EXPO button on the EZ Mode screen)"
+profile_intel = "XMP"
+profile_amd_ddr5 = "EXPO (A-XMP if EXPO isn't listed)"
+profile_amd_ddr4 = "A-XMP"
+support = "https://www.msi.com/Motherboard/{model_slug}/support"
+
+[[board]]
+id = "gigabyte"
+name = "Gigabyte"
+match = ["GIGABYTE", "AORUS"]
+enter = "Del"
+path = "Press F2 for Advanced Mode if you see Easy Mode, then Tweaker → Extreme Memory Profile (X.M.P.)"
+profile_intel = "XMP"
+profile_amd_ddr5 = "EXPO (XMP if EXPO isn't listed)"
+profile_amd_ddr4 = "XMP"
+
+[[board]]
+id = "asrock"
+name = "ASRock"
+match = ["ASROCK"]
+enter = "Del or F2"
+path = "Press F6 for Advanced Mode if you see Easy Mode, then OC Tweaker → DRAM Profile Configuration → Load {profile} Setting"
+profile_intel = "XMP"
+profile_amd_ddr5 = "EXPO"
+profile_amd_ddr4 = "XMP"
+support = "https://www.asrock.com/mb/{cpu_vendor}/{model}/index.asp#BIOS"
+
+# ---------------------------------------------------------------- CPU cautions
+# `pattern` is matched against the processor name, upper-cased, with (R), (TM), "CPU", "PRO"
+# and runs of spaces removed, and one space added at the end. `model` must fall in one of
+# `models` and `suffix` must be one of `suffixes`. `findings` are added in order; a finding
+# with `microcode_below` is only added when the CPU's microcode is known and lower, and one
+# with `microcode_unknown` only when it isn't known.
+
+[[cpu]]
+id = "intel_raptor"
+pattern = "*I{:[579]}-{model:d5}{suffix:a0-2} *"
+models = [[13400, 13999], [14400, 14999]]
+suffixes = ["", "K", "KF", "KS", "F"]
+platform = "Intel Core 13th / 14th gen"
+
+  [[cpu.findings]]
+  id = "ram:microcode"
+  severity = "problem"
+  microcode_below = 0x12B
+  title = "Update the BIOS before changing memory settings"
+  detail = "This CPU runs microcode {microcode}. Versions before 0x12B can slowly damage 13th and 14th gen Core CPUs. Install the newest BIOS from the board maker first; it carries the fix."
+
+  [[cpu.findings]]
+  id = "ram:microcode"
+  severity = "caution"
+  microcode_unknown = true
+  title = "Check the BIOS has the 13th / 14th gen fix"
+  detail = "Couldn't read this CPU's microcode version. Versions before 0x12B can slowly damage 13th and 14th gen Core CPUs, so make sure the BIOS is from late 2024 or newer before changing memory settings."
+
+  [[cpu.findings]]
+  id = "ram:cpu"
+  severity = "caution"
+  title = "Keep System Agent voltage at or under about 1.25 V"
+  detail = "On 13th and 14th gen Core CPUs, a memory profile can raise System Agent (SA) voltage on some boards. If you set it by hand, stay at or under about 1.25 V."
+
+[[cpu]]
+id = "intel_arrow"
+pattern = "*ULTRA {:[579]} {model:d3}{suffix:a0-2} *"
+models = [[200, 299]]
+suffixes = ["", "K", "KF", "F", "T"]
+platform = "Intel Core Ultra 200"
+
+  [[cpu.findings]]
+  id = "ram:cpu"
+  severity = "caution"
+  title = "Keep System Agent voltage at or under about 1.25 V"
+  detail = "On Core Ultra 200 CPUs, a memory profile can raise System Agent (SA) voltage on some boards. Check it stays at or under about 1.25 V, and stay under that if you set it by hand."
+
+[[cpu]]
+id = "amd_am5"
+pattern = "*RYZEN {:[3579]} {model:d4}{suffix:w0-3} *"
+models = [[7000, 7999], [8000, 8999], [9000, 9999]]
+suffixes = ["", "X", "X3D", "F", "G", "GE"]
+platform = "AMD Ryzen on AM5"
+
+  [[cpu.findings]]
+  id = "ram:cpu"
+  severity = "caution"
+  title = "Keep SoC voltage at or under 1.3 V"
+  detail = "On Ryzen 7000, 8000 and 9000 CPUs, keep SoC voltage at or under 1.3 V. BIOS versions from mid-2023 on cap it for you, which is one more reason to keep the BIOS up to date. 6000 MHz is the usual sweet spot; kits rated higher than 6400 may need to run at 6000 to 6400."
+
+[[cpu]]
+id = "amd_am4"
+pattern = "*RYZEN {:[3579]} {model:d4}{suffix:w0-3} *"
+models = [[1000, 5999]]
+suffixes = ["", "X", "X3D", "XT", "G", "GE", "F", "AF"]
+platform = "AMD Ryzen on AM4"
+
+  [[cpu.findings]]
+  id = "ram:cpu"
+  severity = "info"
+  title = "3600 MHz is the usual sweet spot on AM4"
+  detail = "On Ryzen CPUs for AM4 boards, DDR4-3600 is the usual sweet spot. Speeds above 3800 often need manual tuning to be stable."
