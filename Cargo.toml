@@ -44,6 +44,7 @@ version = "0.59"
 features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Networking_WinHttp",
@@ -54,6 +55,7 @@ features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_ProcessStatus",
+    "Win32_System_RemoteDesktop",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_Storage_Xps",

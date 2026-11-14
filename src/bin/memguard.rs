@@ -274,6 +274,26 @@ enum Cmd {
     Mcp,
     /// Print ready-to-paste setup for Claude Code and Codex
     AgentSetup,
+
+    // ---- Part F: doctor
+    /// Check what is using memory Unreal work doesn't need, and clean up if you ask
+    Doctor {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+        /// Apply the recommended actions, or the ones named as <id>[:action]
+        #[arg(long, num_args = 0.., value_name = "ID[:ACTION]")]
+        fix: Option<Vec<String>>,
+        /// Allow `end`, which ends apps outright (anything unsaved in them is lost)
+        #[arg(long)]
+        force: bool,
+        /// Show what --fix would do, without doing it
+        #[arg(long)]
+        dry_run: bool,
+        /// Undo the last cleanup, or one action by its undo id
+        #[arg(long, num_args = 0..=1, value_name = "UNDO_ID")]
+        undo: Option<Option<String>>,
+    },
 }
 
 fn load_config() -> Config {
@@ -595,6 +615,9 @@ fn main() -> ExitCode {
             print_agent_setup();
             ExitCode::SUCCESS
         }
+
+        // ---- Part F: doctor
+        Cmd::Doctor { json, fix, force, dry_run, undo } => run_doctor(json, fix, force, dry_run, undo),
     }
 }
 
@@ -631,4 +654,206 @@ fn print_agent_setup() {
     println!();
     println!("Before a local build or cook, have the agent call memguard_wait with prime: true.");
     println!("More: docs/AI-AGENTS.md");
+}
+
+// ---- Part F: doctor
+
+fn run_doctor(json: bool, fix: Option<Vec<String>>, force: bool, dry_run: bool, undo: Option<Option<String>>) -> ExitCode {
+    use athermemguard::doctor::{self, OutcomeKind};
+
+    if let Some(id) = undo {
+        let outcomes = doctor::undo(id.is_none(), id.as_deref());
+        if json {
+            print_json(&serde_json::json!({ "outcomes": outcomes }));
+        } else {
+            for o in &outcomes {
+                println!("{}", outcome_line(o));
+            }
+        }
+        let bad = outcomes.iter().any(|o| matches!(o.result, OutcomeKind::Failed | OutcomeKind::Refused));
+        return if bad { ExitCode::from(1) } else { ExitCode::SUCCESS };
+    }
+
+    if fix.is_none() && (dry_run || force) {
+        eprintln!("--dry-run and --force go with --fix.");
+        return ExitCode::from(1);
+    }
+    let report = doctor::scan(&load_config());
+    let Some(fix) = fix else {
+        if json {
+            print_json(&report);
+        } else {
+            print_doctor_report(&report);
+        }
+        return ExitCode::SUCCESS;
+    };
+
+    let picks = if fix.is_empty() {
+        report.recommended_picks()
+    } else {
+        let mut picks = Vec::new();
+        for s in &fix {
+            match doctor::parse_pick(&report, s) {
+                Ok(p) => picks.push(p),
+                Err(e) => {
+                    eprintln!("{}", e);
+                    return ExitCode::from(1);
+                }
+            }
+        }
+        picks
+    };
+    if picks.is_empty() {
+        if json {
+            print_json(&serde_json::json!({ "dry_run": dry_run, "outcomes": [] }));
+        } else {
+            println!("Nothing is recommended right now. Run `memguard doctor` to see everything, then pick with --fix <id>.");
+        }
+        return ExitCode::SUCCESS;
+    }
+    if !json {
+        println!("{}", if dry_run { "Would do:" } else { "Doing:" });
+        for (id, action) in &picks {
+            let title = report.finding(id).map_or(id.as_str(), |f| f.title.as_str());
+            println!("  {}: {} ({})", title, action.name(), id);
+        }
+        if !dry_run && picks.iter().any(|(_, a)| *a == doctor::ActionKind::Close) {
+            println!("Asking apps to close; this can take up to 10 seconds...");
+        }
+    }
+    let outcomes = if dry_run { doctor::dry_run(&report, &picks, force) } else { doctor::apply(&report, &picks, force) };
+    if json {
+        print_json(&serde_json::json!({ "dry_run": dry_run, "outcomes": outcomes }));
+    } else {
+        println!();
+        for o in &outcomes {
+            let title = report.finding(&o.finding_id).map_or(o.finding_id.as_str(), |f| f.title.as_str());
+            println!("{}  {}", title, outcome_line(o));
+        }
+        if outcomes.iter().any(|o| o.undo_id.is_some()) {
+            println!("\nUndo with `memguard doctor --undo`.");
+        }
+        if outcomes.iter().any(|o| o.result == OutcomeKind::StillOpen) && !force {
+            println!("An app that stayed open can be ended with `memguard doctor --fix <id>:end --force` (anything unsaved in it is lost).");
+        }
+    }
+    let bad = outcomes.iter().any(|o| matches!(o.result, OutcomeKind::Failed | OutcomeKind::Refused));
+    if bad {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn outcome_line(o: &athermemguard::doctor::Outcome) -> String {
+    use athermemguard::doctor::OutcomeKind;
+    let tag = match o.result {
+        OutcomeKind::Done => "done",
+        OutcomeKind::StillOpen => "still open",
+        OutcomeKind::Refused => "not done",
+        OutcomeKind::Failed => "failed",
+        OutcomeKind::WouldDo => "dry run",
+        OutcomeKind::Undone => "undone",
+    };
+    match &o.undo_id {
+        Some(id) => format!("[{}] {} ({}; undo id {})", tag, o.message, o.finding_id, id),
+        None if o.finding_id.is_empty() => format!("[{}] {}", tag, o.message),
+        None => format!("[{}] {} ({})", tag, o.message, o.finding_id),
+    }
+}
+
+type SectionPick = fn(&athermemguard::doctor::Finding) -> bool;
+
+fn print_doctor_report(r: &athermemguard::doctor::Report) {
+    use athermemguard::doctor::{mem_label, Finding, FindingKind, Verdict};
+    let s = &r.system;
+    println!("Ather MemGuard checkup   {}", r.time);
+    println!(
+        "RAM {:.1} GB free of {:.1} GB, commit {:.1} GB free of {:.1} GB, Unreal {}",
+        s.ram_free_gb,
+        s.ram_total_gb,
+        s.commit_free_gb,
+        s.commit_limit_gb,
+        if r.unreal_active { "running" } else { "not running" }
+    );
+    let sections: [(&str, SectionPick); 7] = [
+        ("NOT NEEDED FOR UNREAL", |f| f.kind == FindingKind::App && f.verdict == Verdict::Close),
+        ("STARTS WITH WINDOWS", |f| f.kind == FindingKind::Startup),
+        ("BIG TOOLS YOU MIGHT NOT BE USING", |f| f.kind == FindingKind::App && f.verdict == Verdict::HeavyTool),
+        ("WORTH A LOOK", |f| f.kind == FindingKind::App && f.verdict == Verdict::Review),
+        ("HELD BACK, NOT CLOSED (wanted, but should give way to Unreal)", |f| {
+            f.kind == FindingKind::App && f.verdict == Verdict::HoldBack
+        }),
+        ("UNREAL", |f| f.kind == FindingKind::Unreal),
+        ("THIS PC", |f| f.kind == FindingKind::System),
+    ];
+    for (title, pick) in sections {
+        let items: Vec<&Finding> = r.findings.iter().filter(|f| pick(f)).collect();
+        if items.is_empty() {
+            continue;
+        }
+        let total: u64 = items.iter().map(|f| f.ram_mb).sum();
+        println!();
+        if total > 0 && !title.starts_with("STARTS") {
+            println!("{}   {} RAM", title, mem_label(total));
+        } else {
+            println!("{}", title);
+        }
+        for f in items {
+            let mut head = format!("  {}", f.title);
+            if f.processes > 0 && f.kind != FindingKind::System {
+                head = format!(
+                    "{:<36} {:>8} RAM  {:>8} committed  {} process{}",
+                    head,
+                    mem_label(f.ram_mb),
+                    mem_label(f.committed_mb),
+                    f.processes,
+                    if f.processes == 1 { "" } else { "es" }
+                );
+            }
+            println!("{}", head.trim_end());
+            println!("      {}", f.detail);
+            if !f.actions.is_empty() {
+                let acts: Vec<String> = f
+                    .actions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| {
+                        let mut s = a.kind.name().to_string();
+                        if i == 0 && f.recommended {
+                            s.push_str(" (recommended)");
+                        }
+                        if a.needs_force {
+                            s.push_str(" (needs --force)");
+                        }
+                        s
+                    })
+                    .collect();
+                println!("      {}: {}", f.id, acts.join(", "));
+            }
+        }
+    }
+    println!();
+    if r.reclaimable_ram_gb > 0.0 || r.reclaimable_commit_gb > 0.0 {
+        println!(
+            "Could be freed: about {:.1} GB of RAM ({:.1} GB committed) by closing what Unreal doesn't need.",
+            r.reclaimable_ram_gb, r.reclaimable_commit_gb
+        );
+    } else {
+        println!("All clear: nothing Unreal doesn't need is holding much memory.");
+    }
+    let recommended = r.recommended_picks().len();
+    let actionable = r.findings.iter().find(|f| !f.actions.is_empty());
+    match (recommended, actionable) {
+        (n, _) if n > 0 => println!(
+            "To act: `memguard doctor --fix` does the {} recommended action{}; `memguard doctor --fix <id>[:action]` picks your own. Nothing changes until you run one.",
+            n,
+            if n == 1 { "" } else { "s" }
+        ),
+        (_, Some(f)) => println!(
+            "To act: `memguard doctor --fix <id>[:action]`, for example `memguard doctor --fix {}`. Nothing changes until you run one.",
+            f.id
+        ),
+        _ => println!("Nothing to do."),
+    }
 }

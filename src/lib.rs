@@ -7,11 +7,15 @@
 //! - `history` memory history: 24-hour ring, daily CSV files, editor growth slope
 //! - `install` per-user install, autostart, PATH, Start menu, launch mode
 //! - `mcp`     MCP server over stdio, so coding agents can call MemGuard as tools
+//! - `doctor`  checkup: what uses memory Unreal work doesn't need, and what to do about it
+//! - `startup` reading and switching "starts with Windows" entries (used by `doctor`)
 //! - `tray`    tray icon + background loop
 //! - `net`     HTTP(S) GET through WinHTTP
 //! - `updater` check, download, verify and swap in a new version
 
 pub mod config;
+pub mod doctor;
+mod doctor_win;
 pub mod engine;
 pub mod history;
 pub mod install;
@@ -20,6 +24,7 @@ pub mod mcp;
 pub mod net;
 pub mod ops;
 pub mod paths;
+pub mod startup;
 pub mod tray;
 pub mod ui;
 pub mod updater;

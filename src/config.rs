@@ -461,6 +461,10 @@ pub struct Config {
     pub ue: Ue,
     #[serde(default = "default_prime")]
     pub prime: Prime,
+    /// The checkup's own settings (keep / close lists, thresholds). `doctor.rs` reads and
+    /// validates them itself; the table is carried here so the file still loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doctor: Option<toml::Table>,
     /// Every group, including disabled ones (`enabled = false`); the engine skips those.
     #[serde(default, rename = "group")]
     pub groups: Vec<Group>,

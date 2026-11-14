@@ -1,0 +1,1135 @@
+# Ather MemGuard doctor catalogue: what common apps are, and whether Unreal work needs them.
+#
+# Embedded in the program. People extend or override it in settings.toml:
+#   [doctor]
+#   keep = ["SomeTool"]            # never proposed
+#   close = ["SomeGame*"]          # treated as "not needed for Unreal"
+#   close_while_unreal = ["Spotify"]
+#
+# Each [[app]] is one app, which may run several processes. Fields:
+#   name         what people call it
+#   verdict      close       not needed for Unreal work; closing it is safe and frees memory
+#                hold_back   wanted, but shouldn't compete with Unreal: put it in a MemGuard group
+#                keep        part of Unreal work or the system; never proposed
+#                review      known, but whether it's needed depends on the person: shown, not proposed
+#                heavy_tool  a big creative or virtualisation tool that is probably deliberate
+#   category     a few words, shown in the checkup
+#   processes    executable names without .exe; a trailing * is a wildcard; case doesn't matter
+#   description  one line, second person: what it is and why Unreal doesn't need it
+#   group        hold_back only: the MemGuard group it belongs in
+#   family       true for a family of separate apps: each is shown on its own, by exe name
+#
+# Be conservative: when unsure, use review rather than close. Exact names win over
+# wildcards, and longer wildcards over shorter ones.
+
+# ============================================================ game launchers and stores
+
+[[app]]
+name = "Steam"
+verdict = "close"
+category = "Game launcher"
+processes = ["steam", "steamwebhelper", "steamservice", "gameoverlayui", "gameoverlayui64", "steamerrorreporter"]
+description = "Game launcher. Not used by Unreal."
+
+[[app]]
+name = "Epic Games Launcher"
+verdict = "close"
+category = "Game launcher"
+processes = ["EpicGamesLauncher", "EpicOnlineServicesUserHelper", "EOSOverlayRenderer-Win64-Shipping"]
+description = "Store and launcher. You need it to install engine versions, not to run the editor."
+
+[[app]]
+name = "Battle.net"
+verdict = "close"
+category = "Game launcher"
+processes = ["Battle.net", "Battle.net Helper", "BlizzardError"]
+description = "Game launcher. Not used by Unreal."
+
+[[app]]
+name = "Riot Client"
+verdict = "close"
+category = "Game launcher"
+processes = ["RiotClientServices", "RiotClientUx", "RiotClientUxRender", "RiotClientCrashHandler", "vgtray"]
+description = "Game launcher. Not used by Unreal."
+
+[[app]]
+name = "Xbox app"
+verdict = "close"
+category = "Game launcher"
+processes = ["XboxPcApp", "XboxPcAppFT", "XboxPcTray", "XboxAppServices", "XboxApp"]
+description = "Xbox game store and launcher. Not used by Unreal."
+
+[[app]]
+name = "Xbox Game Bar"
+verdict = "close"
+category = "Windows extra"
+processes = ["GameBar", "GameBarFTServer", "GameBarPresenceWriter", "XboxGameBarWidgets", "XboxGameBarSpotify"]
+description = "Game overlay. Not used by Unreal."
+
+[[app]]
+name = "EA app"
+verdict = "close"
+category = "Game launcher"
+processes = ["EADesktop", "EABackgroundService", "EALauncher", "EAConnect_microsoft", "Origin", "OriginWebHelperService"]
+description = "Game launcher. Not used by Unreal."
+
+[[app]]
+name = "Ubisoft Connect"
+verdict = "close"
+category = "Game launcher"
+processes = ["UbisoftConnect", "upc", "UplayWebCore", "UbisoftGameLauncher", "UbisoftGameLauncher64"]
+description = "Game launcher. Not used by Unreal."
+
+[[app]]
+name = "GOG Galaxy"
+verdict = "close"
+category = "Game launcher"
+processes = ["GalaxyClient", "GalaxyClient Helper", "GalaxyCommunication", "GOG Galaxy Notifications Renderer"]
+description = "Game launcher. Not used by Unreal."
+
+[[app]]
+name = "Amazon Games"
+verdict = "close"
+category = "Game launcher"
+processes = ["Amazon Games UI", "Amazon Games Services"]
+description = "Game launcher. Not used by Unreal."
+
+[[app]]
+name = "Rockstar Games Launcher"
+verdict = "close"
+category = "Game launcher"
+processes = ["RockstarService", "SocialClubHelper", "RockstarErrorHandler", "LauncherPatcher"]
+description = "Game launcher. Not used by Unreal."
+
+[[app]]
+name = "itch"
+verdict = "close"
+category = "Game launcher"
+processes = ["itch", "itch-setup"]
+description = "Game launcher. Not used by Unreal."
+
+[[app]]
+name = "Playnite"
+verdict = "close"
+category = "Game launcher"
+processes = ["Playnite.DesktopApp", "Playnite.FullscreenApp"]
+description = "Game library. Not used by Unreal."
+
+[[app]]
+name = "Heroic Games Launcher"
+verdict = "close"
+category = "Game launcher"
+processes = ["heroic"]
+description = "Game launcher. Not used by Unreal."
+
+[[app]]
+name = "Overwolf"
+verdict = "close"
+category = "Game overlay"
+processes = ["Overwolf", "OverwolfBrowser", "OverwolfHelper", "OverwolfHelper64", "OverwolfTSHelper", "OverwolfUpdater"]
+description = "Game overlay and add-ons. Not used by Unreal."
+
+[[app]]
+name = "Medal"
+verdict = "close"
+category = "Game recording"
+processes = ["Medal", "MedalEncoder"]
+description = "Game clip recorder. Not used by Unreal."
+
+[[app]]
+name = "Wallpaper Engine"
+verdict = "close"
+category = "Desktop extra"
+processes = ["wallpaper32", "wallpaper64", "wallpaperservice32"]
+description = "Animated wallpapers. They use memory and GPU time Unreal could have."
+
+[[app]]
+name = "Lively Wallpaper"
+verdict = "close"
+category = "Desktop extra"
+processes = ["Lively", "Lively.PlayerWebView2", "Lively.PlayerMpv"]
+description = "Animated wallpapers. They use memory and GPU time Unreal could have."
+
+[[app]]
+name = "Rainmeter"
+verdict = "close"
+category = "Desktop extra"
+processes = ["Rainmeter"]
+description = "Desktop widgets. Not used by Unreal."
+
+# ============================================================ games and their helpers
+
+[[app]]
+name = "Fortnite"
+verdict = "close"
+category = "Game"
+processes = ["FortniteClient-Win64-Shipping", "FortniteLauncher", "FortniteClient-Win64-Shipping_EAC_EOS"]
+description = "A game. Close it before Unreal work."
+
+[[app]]
+name = "League of Legends"
+verdict = "close"
+category = "Game"
+processes = ["LeagueClient", "LeagueClientUx", "LeagueClientUxRender", "League of Legends"]
+description = "A game and its client. Close it before Unreal work."
+
+[[app]]
+name = "VALORANT"
+verdict = "close"
+category = "Game"
+processes = ["VALORANT", "VALORANT-Win64-Shipping"]
+description = "A game. Close it before Unreal work."
+
+[[app]]
+name = "Counter-Strike 2"
+verdict = "close"
+category = "Game"
+processes = ["cs2"]
+description = "A game. Close it before Unreal work."
+
+[[app]]
+name = "Dota 2"
+verdict = "close"
+category = "Game"
+processes = ["dota2"]
+description = "A game. Close it before Unreal work."
+
+[[app]]
+name = "Minecraft"
+verdict = "close"
+category = "Game"
+processes = ["Minecraft.Windows", "MinecraftLauncher", "Minecraft"]
+description = "A game. Close it before Unreal work."
+
+[[app]]
+name = "Roblox"
+verdict = "close"
+category = "Game"
+processes = ["RobloxPlayerBeta", "RobloxPlayerLauncher", "RobloxCrashHandler"]
+description = "A game. Close it before Unreal work."
+
+[[app]]
+name = "Grand Theft Auto V"
+verdict = "close"
+category = "Game"
+processes = ["GTA5", "GTA5_Enhanced", "PlayGTAV"]
+description = "A game. Close it before Unreal work."
+
+[[app]]
+name = "Apex Legends"
+verdict = "close"
+category = "Game"
+processes = ["r5apex", "r5apex_dx12"]
+description = "A game. Close it before Unreal work."
+
+[[app]]
+name = "Overwatch"
+verdict = "close"
+category = "Game"
+processes = ["Overwatch"]
+description = "A game. Close it before Unreal work."
+
+[[app]]
+name = "World of Warcraft"
+verdict = "close"
+category = "Game"
+processes = ["Wow", "WowClassic"]
+description = "A game. Close it before Unreal work."
+
+[[app]]
+name = "Rocket League"
+verdict = "close"
+category = "Game"
+processes = ["RocketLeague"]
+description = "A game. Close it before Unreal work."
+
+[[app]]
+name = "Genshin Impact"
+verdict = "close"
+category = "Game"
+processes = ["GenshinImpact", "YuanShen", "HYP"]
+description = "A game and its launcher. Close it before Unreal work."
+
+# ============================================================ media and music
+
+[[app]]
+name = "Spotify"
+verdict = "close"
+category = "Music"
+processes = ["Spotify", "SpotifyLauncher", "SpotifyWebHelper", "SpotifyXboxGamebarWebView"]
+description = "Music player. Not used by Unreal; close it when you need the memory."
+
+[[app]]
+name = "Apple Music and iTunes"
+verdict = "close"
+category = "Music"
+processes = ["AppleMusic", "iTunes", "iTunesHelper", "AppleMobileDeviceProcess"]
+description = "Music player. Not used by Unreal."
+
+[[app]]
+name = "Music streaming apps"
+family = true
+verdict = "close"
+category = "Music"
+processes = ["TIDAL", "Deezer", "Amazon Music", "Amazon Music Helper", "YouTube Music Desktop App", "Cider"]
+description = "Music player. Not used by Unreal."
+
+[[app]]
+name = "Music players"
+family = true
+verdict = "close"
+category = "Music"
+processes = ["foobar2000", "AIMP", "MusicBee", "winamp", "Plexamp"]
+description = "Music player. Not used by Unreal."
+
+[[app]]
+name = "Video players"
+family = true
+verdict = "close"
+category = "Video"
+processes = ["vlc", "PotPlayerMini64", "PotPlayerMini", "mpc-hc64", "mpc-be64", "mpv", "kodi", "Plex", "Microsoft.Media.Player", "Video.UI"]
+description = "Video player. Not used by Unreal."
+
+[[app]]
+name = "Plex Media Server"
+verdict = "review"
+category = "Media server"
+processes = ["Plex Media Server", "PlexScriptHost", "Plex Transcoder", "Plex Tuner Service"]
+description = "Media server. Others on your network may be using it."
+
+[[app]]
+name = "Photos"
+verdict = "close"
+category = "Windows extra"
+processes = ["Photos", "Microsoft.Photos", "PhotosService"]
+description = "Windows photo viewer. Not used by Unreal."
+
+[[app]]
+name = "Clipchamp"
+verdict = "close"
+category = "Windows extra"
+processes = ["Clipchamp"]
+description = "Video editor that comes with Windows. Not used by Unreal."
+
+# ============================================================ Windows extras
+
+[[app]]
+name = "Widgets"
+verdict = "close"
+category = "Windows extra"
+processes = ["Widgets", "WidgetService", "WidgetBoard", "MicrosoftStartFeedProvider", "Microsoft.Msn.Widgets"]
+description = "The Windows news and weather panel. Not used by Unreal."
+
+[[app]]
+name = "Copilot"
+verdict = "close"
+category = "Windows extra"
+processes = ["copilotapp", "copilotapphost", "Copilot", "Microsoft.Copilot"]
+description = "The Copilot app that comes with Windows. Not used by Unreal."
+
+[[app]]
+name = "Phone Link"
+verdict = "close"
+category = "Windows extra"
+processes = ["PhoneExperienceHost", "YourPhone", "YourPhoneServer", "CrossDeviceResume", "CrossDeviceService"]
+description = "Connects your phone to Windows. Not used by Unreal."
+
+[[app]]
+name = "Cortana"
+verdict = "close"
+category = "Windows extra"
+processes = ["Cortana"]
+description = "Windows voice assistant. Not used by Unreal."
+
+[[app]]
+name = "Bing Wallpaper"
+verdict = "close"
+category = "Windows extra"
+processes = ["BingWallpaper", "BingWallpaperApp"]
+description = "Daily wallpaper changer. Not used by Unreal."
+
+[[app]]
+name = "Mail and Calendar (old)"
+verdict = "close"
+category = "Windows extra"
+processes = ["HxOutlook", "HxTsr", "HxCalendarAppImm", "HxAccounts"]
+description = "The old Windows Mail and Calendar app. Not used by Unreal."
+
+[[app]]
+name = "Microsoft Office background"
+verdict = "close"
+category = "Windows extra"
+processes = ["OfficeClickToRun", "msoia", "MSOSYNC", "OfficeC2RClient"]
+description = "Office background helper. Office starts it again when you need it."
+
+# ============================================================ peripheral and RGB suites
+
+[[app]]
+name = "Corsair iCUE"
+verdict = "close"
+category = "Lighting and peripherals"
+processes = ["iCUE", "iCUEDevicePluginHost", "Corsair.Service.CpuIdRemote64", "CorsairDeviceControlService"]
+description = "Lighting and peripheral app. Your devices keep working while it's closed; lighting effects stop."
+
+[[app]]
+name = "Razer Synapse"
+verdict = "close"
+category = "Lighting and peripherals"
+processes = ["Razer Synapse*", "RazerAppEngine", "Razer Central", "RazerCentralService", "RazerCortex*", "RzSynapse"]
+description = "Lighting and peripheral app. Your devices keep working while it's closed."
+
+[[app]]
+name = "ASUS Armoury Crate"
+verdict = "close"
+category = "Lighting and peripherals"
+processes = ["ArmouryCrate", "ArmouryCrate.UserSessionHelper", "ArmourySocketServer", "ArmouryCrateControlInterface", "AcPowerNotification", "ArmouryCrateSE"]
+description = "ASUS lighting and system app. Not used by Unreal."
+
+[[app]]
+name = "MSI Center"
+verdict = "close"
+category = "Lighting and peripherals"
+processes = ["MSI Center", "MSI.CentralServer", "MSI_Central_Service", "MysticLight*", "Dragon Center"]
+description = "MSI lighting and system app. Not used by Unreal."
+
+[[app]]
+name = "Gigabyte Control Center"
+verdict = "close"
+category = "Lighting and peripherals"
+processes = ["GCC", "GigabyteControlCenter", "RGBFusion", "RGBFusion2"]
+description = "Gigabyte lighting and system app. Not used by Unreal."
+
+[[app]]
+name = "SteelSeries GG"
+verdict = "close"
+category = "Lighting and peripherals"
+processes = ["SteelSeriesGG", "SteelSeriesGGClient", "SteelSeriesEngine", "SteelSeriesPrism", "SteelSeriesSonar"]
+description = "Lighting and peripheral app. Your devices keep working while it's closed."
+
+[[app]]
+name = "HyperX NGENUITY"
+verdict = "close"
+category = "Lighting and peripherals"
+processes = ["NGenuity2", "HyperX NGENUITY"]
+description = "Lighting and peripheral app. Your devices keep working while it's closed."
+
+[[app]]
+name = "SignalRGB and OpenRGB"
+verdict = "close"
+category = "Lighting and peripherals"
+processes = ["SignalRgb", "SignalRgbLauncher", "OpenRGB"]
+description = "Lighting app. Not used by Unreal."
+
+[[app]]
+name = "Alienware Command Center"
+verdict = "close"
+category = "Lighting and peripherals"
+processes = ["AWCC", "AWCC.Background.Server", "AlienFXSubAgent"]
+description = "Alienware lighting and system app. Not used by Unreal."
+
+[[app]]
+name = "OMEN Gaming Hub"
+verdict = "close"
+category = "Lighting and peripherals"
+processes = ["OmenCommandCenterBackground", "OMEN Command Center", "OmenCap", "OmenInstallMonitor"]
+description = "HP gaming hub. Not used by Unreal."
+
+[[app]]
+name = "Lenovo Vantage and Legion Zone"
+verdict = "close"
+category = "System utility"
+processes = ["LenovoVantage*", "Lenovo.Vantage*", "LegionZone", "LenovoUtility"]
+description = "Lenovo system app. Not used by Unreal; updates and warranty info can wait."
+
+[[app]]
+name = "Dell SupportAssist"
+verdict = "close"
+category = "System utility"
+processes = ["SupportAssist*", "DellSupportAssistRemedation*"]
+description = "Dell support app. Not used by Unreal."
+
+[[app]]
+name = "HP support apps"
+verdict = "close"
+category = "System utility"
+processes = ["HPSmart", "HP.myHP", "HPSupportAssistant", "HPPrintScanDoctor"]
+description = "HP support app. Not used by Unreal."
+
+[[app]]
+name = "Samsung Magician"
+verdict = "close"
+category = "System utility"
+processes = ["SamsungMagician", "Samsung Magician"]
+description = "SSD utility. Not needed while you work."
+
+[[app]]
+name = "Wootility"
+verdict = "close"
+category = "Lighting and peripherals"
+processes = ["wootility", "Wootility"]
+description = "Keyboard settings app. Your keyboard keeps its settings while it's closed."
+
+[[app]]
+name = "Logitech G HUB"
+verdict = "review"
+category = "Peripherals"
+processes = ["lghub", "lghub_agent", "lghub_updater", "lghub_system_tray"]
+description = "Logitech mouse and keyboard app. Closing it can switch off your button and DPI settings."
+
+[[app]]
+name = "Logi Options+"
+verdict = "review"
+category = "Peripherals"
+processes = ["logioptionsplus_agent", "logioptionsplus_appbroker", "logioptionsplus", "LogiOptionsMgr"]
+description = "Logitech mouse and keyboard app. Closing it can switch off your custom buttons."
+
+[[app]]
+name = "NZXT CAM"
+verdict = "review"
+category = "Cooling"
+processes = ["NZXT CAM", "NZXT.CAM*"]
+description = "Fan and pump control. Closing it can change how your PC is cooled."
+
+[[app]]
+name = "MSI Afterburner and RivaTuner"
+verdict = "review"
+category = "GPU tuning"
+processes = ["MSIAfterburner", "RTSS", "RTSSHooksLoader64", "EncoderServer", "EncoderServer64"]
+description = "GPU tuning and overlay. Closing it can reset your fan curve."
+
+[[app]]
+name = "Elgato apps"
+verdict = "review"
+category = "Peripherals"
+processes = ["StreamDeck", "Camera Hub", "WaveLink"]
+description = "Stream Deck, camera or audio app. You may rely on it while you work."
+
+[[app]]
+name = "Seagate Toolkit"
+verdict = "review"
+category = "Backup"
+processes = ["Seagate.Dashboard*", "SeagateToolkit", "DBAgent"]
+description = "Drive backup tool. Closing it pauses backups."
+
+[[app]]
+name = "Nahimic"
+verdict = "review"
+category = "Audio"
+processes = ["Nahimic3", "NahimicSvc64", "NahimicSvc32"]
+description = "Audio effects app. Not used by Unreal; it is known to use a lot of memory."
+
+# ============================================================ GPU vendor apps and overlays
+
+[[app]]
+name = "NVIDIA app and overlay"
+verdict = "close"
+category = "GPU overlay"
+processes = ["NVIDIA app", "NVIDIA Overlay", "NVIDIA Share", "NVIDIA Web Helper", "nvsphelper64", "NVIDIA GeForce Experience", "NVIDIA app SelfUpdate"]
+description = "GPU overlay and game recorder. The driver keeps working while it's closed."
+
+[[app]]
+name = "AMD Software (Adrenalin)"
+verdict = "close"
+category = "GPU overlay"
+processes = ["RadeonSoftware", "AMDRSServ", "AMDRSSrcExt", "amdow", "cncmd", "AMDSoftwareInstaller"]
+description = "GPU overlay and settings app. The driver keeps working while it's closed."
+
+[[app]]
+name = "Intel graphics apps"
+verdict = "close"
+category = "GPU overlay"
+processes = ["IGCC", "IGCCTray", "ArcControl", "ArcControlAssist", "IntelGraphicsSoftware"]
+description = "GPU settings app. The driver keeps working while it's closed."
+
+# ============================================================ cloud sync (held back)
+
+[[app]]
+name = "OneDrive"
+verdict = "hold_back"
+category = "Cloud sync"
+processes = ["OneDrive", "OneDrive.Sync.Service", "FileCoAuth", "Microsoft.SharePoint"]
+description = "Keeps your files in sync. Keep it, but let Unreal go first."
+group = "Background"
+
+[[app]]
+name = "Dropbox"
+verdict = "hold_back"
+category = "Cloud sync"
+processes = ["Dropbox", "DropboxUpdate"]
+description = "Keeps your files in sync. Keep it, but let Unreal go first."
+group = "Background"
+
+[[app]]
+name = "Google Drive"
+verdict = "hold_back"
+category = "Cloud sync"
+processes = ["GoogleDriveFS"]
+description = "Keeps your files in sync. Keep it, but let Unreal go first."
+group = "Background"
+
+[[app]]
+name = "iCloud"
+verdict = "hold_back"
+category = "Cloud sync"
+processes = ["iCloudDrive", "iCloudServices", "iCloudPhotos", "iCloudHome", "iCloud"]
+description = "Keeps your files and photos in sync. Keep it, but let Unreal go first."
+group = "Background"
+
+[[app]]
+name = "Other cloud sync"
+family = true
+verdict = "hold_back"
+category = "Cloud sync"
+processes = ["MEGAsync", "pCloud", "Box", "BoxUI", "nextcloud", "owncloud", "SynologyDrive*", "Resilio Sync", "bzbui", "bztray"]
+description = "Keeps your files in sync. Keep it, but let Unreal go first."
+group = "Background"
+
+# ============================================================ chat, meetings, mail (held back)
+
+[[app]]
+name = "Slack"
+verdict = "hold_back"
+category = "Chat"
+processes = ["Slack"]
+description = "Team chat. Keep it, but let Unreal go first."
+group = "Chat"
+
+[[app]]
+name = "Discord"
+verdict = "hold_back"
+category = "Chat"
+processes = ["Discord", "DiscordPTB", "DiscordCanary"]
+description = "Chat. Keep it, but let Unreal go first."
+group = "Chat"
+
+[[app]]
+name = "Microsoft Teams"
+verdict = "hold_back"
+category = "Chat"
+processes = ["ms-teams", "msteams", "Teams", "msteamsupdate"]
+description = "Team chat and meetings. Keep it, but let Unreal go first."
+group = "Chat"
+
+[[app]]
+name = "Zoom"
+verdict = "hold_back"
+category = "Meetings"
+processes = ["Zoom", "ZoomWebHost", "Zoom_launcher", "CptHost", "aomhost64"]
+description = "Meetings. Keep it, but let Unreal go first."
+group = "Chat"
+
+[[app]]
+name = "Webex"
+verdict = "hold_back"
+category = "Meetings"
+processes = ["Webex", "CiscoCollabHost", "webexmta", "atmgr"]
+description = "Meetings. Keep it, but let Unreal go first."
+group = "Chat"
+
+[[app]]
+name = "Messaging apps"
+family = true
+verdict = "hold_back"
+category = "Chat"
+processes = ["Telegram", "WhatsApp", "WhatsApp.Root", "Signal", "Messenger", "Skype", "Viber", "Element", "Mattermost", "Rocket.Chat", "Guilded"]
+description = "Messaging. Keep it, but let Unreal go first."
+group = "Chat"
+
+[[app]]
+name = "Zalo, Lark and other messengers"
+family = true
+verdict = "hold_back"
+category = "Chat"
+processes = ["Zalo", "ZaloCall", "Lark", "Feishu", "DingTalk", "WeChat", "Weixin", "QQ", "KakaoTalk", "LINE"]
+description = "Messaging. Keep it, but let Unreal go first."
+group = "Chat"
+
+[[app]]
+name = "Email apps"
+family = true
+verdict = "hold_back"
+category = "Email"
+processes = ["olk", "OUTLOOK", "thunderbird", "Mailbird", "eM Client", "MailClient"]
+description = "Email. Keep it, but let Unreal go first."
+group = "Chat"
+
+[[app]]
+name = "Wispr Flow"
+verdict = "hold_back"
+category = "Dictation"
+processes = ["Wispr Flow", "Wispr Flow Helper*"]
+description = "Voice dictation. Keep it, but let Unreal go first."
+group = "Chat"
+
+[[app]]
+name = "Notes and planning apps"
+family = true
+verdict = "hold_back"
+category = "Productivity"
+processes = ["Notion", "Obsidian", "Linear", "ClickUp", "Todoist", "Miro", "Trello", "Evernote", "Loom", "Granola", "Raycast"]
+description = "A work app. Keep it, but let Unreal go first."
+group = "Chat"
+
+[[app]]
+name = "Figma"
+verdict = "hold_back"
+category = "Design"
+processes = ["Figma", "figma_agent", "Figma Agent"]
+description = "Design tool. Keep it, but let Unreal go first."
+group = "Chat"
+
+# ============================================================ browsers (held back)
+
+[[app]]
+name = "Google Chrome"
+verdict = "hold_back"
+category = "Browser"
+processes = ["chrome", "chrome-native-host"]
+description = "Browser. Keep it, but let Unreal go first."
+group = "Browsers"
+
+[[app]]
+name = "Microsoft Edge"
+verdict = "hold_back"
+category = "Browser"
+processes = ["msedge", "msedgewebview2"]
+description = "Browser, also used inside other apps. Keep it, but let Unreal go first."
+group = "Browsers"
+
+[[app]]
+name = "Firefox"
+verdict = "hold_back"
+category = "Browser"
+processes = ["firefox", "librewolf", "waterfox", "floorp"]
+description = "Browser. Keep it, but let Unreal go first."
+group = "Browsers"
+
+[[app]]
+name = "Other browsers"
+family = true
+verdict = "hold_back"
+category = "Browser"
+processes = ["brave", "opera", "opera_gx", "vivaldi", "Arc", "thorium", "chromium", "DuckDuckGo", "Comet", "Dia", "iexplore"]
+description = "Browser. Keep it, but let Unreal go first."
+group = "Browsers"
+
+# ============================================================ agent and AI desktop apps (held back)
+
+[[app]]
+name = "Claude"
+verdict = "hold_back"
+category = "Agent app"
+processes = ["claude", "Claude*"]
+description = "Runs your agents. Keep it, but let Unreal go first."
+group = "Agents"
+
+[[app]]
+name = "Codex"
+verdict = "hold_back"
+category = "Agent app"
+processes = ["codex", "codex-*"]
+description = "Runs your agents. Keep it, but let Unreal go first."
+group = "Agents"
+
+[[app]]
+name = "ChatGPT"
+verdict = "hold_back"
+category = "Agent app"
+processes = ["ChatGPT"]
+description = "AI assistant. Keep it, but let Unreal go first."
+group = "Agents"
+
+[[app]]
+name = "Other AI assistants"
+family = true
+verdict = "hold_back"
+category = "Agent app"
+processes = ["Perplexity", "Gemini", "Paseo", "Superwhisper", "Msty", "Poe", "agents-connector"]
+description = "AI assistant. Keep it, but let Unreal go first."
+group = "Agents"
+
+[[app]]
+name = "Local AI models"
+family = true
+verdict = "heavy_tool"
+category = "Local AI"
+processes = ["ollama", "ollama app", "ollama_llama_server", "LM Studio", "lms", "Jan", "koboldcpp", "llama-server"]
+description = "Runs AI models on this PC, which can hold many GB. Close it if you're not using it."
+
+# ============================================================ creative suites
+
+[[app]]
+name = "Blender"
+verdict = "heavy_tool"
+category = "3D"
+processes = ["blender", "blender-launcher"]
+description = "3D app. Close it if you're not using it."
+
+[[app]]
+name = "Maya"
+verdict = "heavy_tool"
+category = "3D"
+processes = ["maya", "mayabatch", "mayapy"]
+description = "3D app. Close it if you're not using it."
+
+[[app]]
+name = "3ds Max"
+verdict = "heavy_tool"
+category = "3D"
+processes = ["3dsmax"]
+description = "3D app. Close it if you're not using it."
+
+[[app]]
+name = "Houdini"
+verdict = "heavy_tool"
+category = "3D"
+processes = ["houdini", "houdinifx", "houdinicore", "hython", "hserver"]
+description = "3D and effects app. Close it if you're not using it."
+
+[[app]]
+name = "Cinema 4D"
+verdict = "heavy_tool"
+category = "3D"
+processes = ["Cinema 4D", "c4dpy"]
+description = "3D app. Close it if you're not using it."
+
+[[app]]
+name = "ZBrush"
+verdict = "heavy_tool"
+category = "3D"
+processes = ["ZBrush"]
+description = "Sculpting app. Close it if you're not using it."
+
+[[app]]
+name = "Substance 3D"
+verdict = "heavy_tool"
+category = "Texturing"
+processes = ["Adobe Substance 3D Painter", "Adobe Substance 3D Designer", "Adobe Substance 3D Sampler", "Adobe Substance 3D Stager", "Substance Painter", "Substance Designer"]
+description = "Texturing app. Close it if you're not using it."
+
+[[app]]
+name = "Other 3D tools"
+family = true
+verdict = "heavy_tool"
+category = "3D"
+processes = ["Marvelous Designer*", "SpeedTree*", "Rhino", "Fusion360", "SketchUp", "RizomUV", "toolbag", "Cascadeur", "CharacterCreator", "iClone", "Gaea", "WorldCreator", "InstaMAT*", "Plasticity", "Modo"]
+description = "3D tool. Close it if you're not using it."
+
+[[app]]
+name = "Photoshop"
+verdict = "heavy_tool"
+category = "Image editing"
+processes = ["Photoshop"]
+description = "Image editor. Close it if you're not using it."
+
+[[app]]
+name = "Adobe creative apps"
+family = true
+verdict = "heavy_tool"
+category = "Creative"
+processes = ["Illustrator", "AfterFX", "Adobe Premiere Pro", "Adobe Media Encoder", "Audition", "Lightroom", "Adobe Animate*", "InDesign"]
+description = "Creative app. Close it if you're not using it."
+
+[[app]]
+name = "Adobe Creative Cloud background"
+verdict = "close"
+category = "Creative"
+processes = ["Creative Cloud", "Creative Cloud Helper", "CCXProcess", "CCLibrary", "AdobeIPCBroker", "Adobe Desktop Service", "CoreSync", "AdobeCollabSync", "AdobeNotificationClient", "Adobe CEF Helper", "AdobeUpdateService"]
+description = "Creative Cloud background helpers. Adobe apps start them again when you open one."
+
+[[app]]
+name = "Acrobat"
+verdict = "close"
+category = "Documents"
+processes = ["Acrobat", "AcroRd32", "AcroCEF", "RdrCEF"]
+description = "PDF reader. Not used by Unreal."
+
+[[app]]
+name = "Image and paint apps"
+family = true
+verdict = "heavy_tool"
+category = "Image editing"
+processes = ["krita", "gimp-2.10", "gimp-3*", "Affinity*", "PureRef", "Aseprite", "clipstudiopaint"]
+description = "Image editor. Close it if you're not using it."
+
+[[app]]
+name = "DaVinci Resolve"
+verdict = "heavy_tool"
+category = "Video editing"
+processes = ["Resolve", "DaVinci Resolve*", "fuscript"]
+description = "Video editor. Close it if you're not using it."
+
+[[app]]
+name = "OBS Studio"
+verdict = "heavy_tool"
+category = "Recording"
+processes = ["obs64", "obs32", "obs-browser-page"]
+description = "Recording and streaming. Close it if you're not recording."
+
+[[app]]
+name = "Music production"
+family = true
+verdict = "heavy_tool"
+category = "Audio"
+processes = ["reaper", "Ableton Live*", "FL64", "FL", "Cubase*", "StudioOne", "Bitwig Studio"]
+description = "Music production app. Close it if you're not using it."
+
+# ============================================================ virtualisation
+
+[[app]]
+name = "Docker Desktop"
+verdict = "heavy_tool"
+category = "Virtualisation"
+processes = ["Docker Desktop", "com.docker.backend", "com.docker.build", "com.docker.dev-envs", "com.docker.extensions"]
+description = "Runs containers in a virtual machine that holds memory. Close it if you're not using it."
+
+[[app]]
+name = "WSL"
+verdict = "heavy_tool"
+category = "Virtualisation"
+processes = ["vmmem", "vmmemWSL", "wslhost", "wslrelay"]
+description = "The Linux virtual machine keeps memory until it shuts down. Run `wsl --shutdown` if you're not using it."
+
+[[app]]
+name = "Virtual machines"
+family = true
+verdict = "heavy_tool"
+category = "Virtualisation"
+processes = ["VirtualBoxVM", "VirtualBox", "VBoxSVC", "vmware", "vmware-vmx", "vmware-tray", "qemu-system-x86_64", "vmconnect", "prl_client_app"]
+description = "A virtual machine holds its memory while it runs. Close it if you're not using it."
+
+[[app]]
+name = "Android emulators"
+family = true
+verdict = "heavy_tool"
+category = "Virtualisation"
+processes = ["qemu-system-x86_64-headless", "emulator", "HD-Player", "BlueStacks*", "Nox", "LDPlayer", "MEmu"]
+description = "Phone emulator. Close it if you're not using it."
+
+# ============================================================ other game engines
+
+[[app]]
+name = "Unity"
+verdict = "heavy_tool"
+category = "Game engine"
+processes = ["Unity", "Unity.Licensing.Client", "UnityCrashHandler64", "UnityShaderCompiler", "UnityPackageManager"]
+description = "Another game engine. Close it if you're not using it."
+
+[[app]]
+name = "Unity Hub"
+verdict = "close"
+category = "Game engine"
+processes = ["Unity Hub"]
+description = "Unity's launcher. Not used by Unreal."
+
+[[app]]
+name = "Godot"
+verdict = "heavy_tool"
+category = "Game engine"
+processes = ["Godot*", "godot*"]
+description = "Another game engine. Close it if you're not using it."
+
+[[app]]
+name = "Roblox Studio"
+verdict = "heavy_tool"
+category = "Game engine"
+processes = ["RobloxStudioBeta", "RobloxStudioLauncherBeta"]
+description = "Another game engine. Close it if you're not using it."
+
+[[app]]
+name = "Other engines"
+family = true
+verdict = "heavy_tool"
+category = "Game engine"
+processes = ["GameMaker", "O3DE", "Editor.Bin", "CryEngine*", "Defold", "Cocos*", "Stride.GameStudio"]
+description = "Another game engine. Close it if you're not using it."
+
+# ============================================================ keep: Unreal tooling
+
+[[app]]
+name = "Unreal tools"
+verdict = "keep"
+category = "Unreal"
+processes = [
+    "UnrealVersionSelector*", "UnrealGameSync*", "UnrealInsights", "UnrealLightmass", "UnrealMultiUser*",
+    "SwitchboardListener*", "LiveLinkHub", "UnrealFrontend", "SwarmAgent", "SwarmCoordinator", "Horde*",
+    "QuixelBridge", "Bridge", "EpicWebHelper", "zen", "zenserver",
+]
+description = "Part of Unreal work."
+
+[[app]]
+name = "Distributed build tools"
+verdict = "keep"
+category = "Build"
+processes = ["IncrediBuild*", "BuildConsole", "xgConsole", "XGCoordConsole", "BuildService", "FBuild", "FBuildWorker", "sccache", "buildcache"]
+description = "Builds your project."
+
+[[app]]
+name = "Graphics debuggers and profilers"
+verdict = "keep"
+category = "Debugging"
+processes = ["qrenderdoc", "renderdoccmd", "WinPixEventRuntime", "pix", "nsight*", "ncu-ui", "Tracy", "Superluminal*", "VTune*"]
+description = "Profiling and debugging tool."
+
+[[app]]
+name = "Audio middleware"
+verdict = "keep"
+category = "Game audio"
+processes = ["Wwise", "WwiseConsole", "FMOD Studio", "fmodstudio"]
+description = "Game audio authoring, used with Unreal."
+
+# ============================================================ keep: IDEs and editors
+
+[[app]]
+name = "Visual Studio"
+verdict = "keep"
+category = "IDE"
+processes = [
+    "devenv", "ServiceHub.*", "Microsoft.ServiceHub.Controller", "PerfWatson2", "vctip", "VsDebugConsole",
+    "msvsmon", "vcpkgsrv", "Microsoft.VisualStudio.*", "VSIXInstaller", "MSBuild", "VBCSCompiler",
+    "vstest.console", "testhost*", "Microsoft.Alm.Shared.Remoting.RemoteContainer", "VcxprojReader", "StandardCollector.Service",
+]
+description = "Your IDE."
+
+[[app]]
+name = "JetBrains IDEs"
+verdict = "keep"
+category = "IDE"
+processes = ["rider64", "rider", "clion64", "idea64", "pycharm64", "goland64", "webstorm64", "rustrover64", "jetbrains-toolbox", "fsnotifier", "Rider.Backend", "JetBrains.*"]
+description = "Your IDE."
+
+[[app]]
+name = "Code editors"
+verdict = "keep"
+category = "IDE"
+processes = ["Code", "Code - Insiders", "Cursor", "Windsurf", "Zed", "sublime_text", "notepad++", "Kiro", "Antigravity", "VSCodium", "nvim", "vim", "emacs"]
+description = "Your code editor."
+
+[[app]]
+name = "Language servers and runtimes"
+verdict = "keep"
+category = "Development"
+processes = [
+    "node", "python", "python3", "pythonw", "py", "java", "javaw", "deno", "bun", "uv", "cargo", "rustc", "rust-analyzer",
+    "clangd", "cmake", "ninja", "dotnet", "OmniSharp", "Microsoft.CodeAnalysis.LanguageServer", "esbuild", "tsserver",
+]
+description = "Development tools your editor and agents use."
+
+# ============================================================ keep: version control
+
+[[app]]
+name = "Git"
+verdict = "keep"
+category = "Version control"
+processes = ["git", "git-lfs", "git-remote-https", "git-credential-manager*", "ssh", "ssh-agent", "gpg-agent", "gh", "lazygit", "sh", "bash", "mintty"]
+description = "Version control."
+
+[[app]]
+name = "Perforce"
+verdict = "keep"
+category = "Version control"
+processes = ["p4v", "p4", "p4vc", "p4merge", "p4admin", "p4d", "P4VS*", "p4broker"]
+description = "Version control."
+
+[[app]]
+name = "Other version control"
+verdict = "keep"
+category = "Version control"
+processes = ["GitHubDesktop", "Fork", "SourceTree", "TortoiseGitProxy", "TGitCache", "TortoiseProc", "TSVNCache", "svn", "plastic*", "cm", "unityvcs*", "GitKraken", "SmartGit"]
+description = "Version control."
+
+# ============================================================ keep: terminals
+
+[[app]]
+name = "Terminals and shells"
+verdict = "keep"
+category = "Terminal"
+processes = ["WindowsTerminal", "OpenConsole", "conhost", "cmd", "powershell", "pwsh", "wezterm-gui", "alacritty", "Warp", "Tabby", "wsl", "wt", "tail", "grep", "wscript", "cscript"]
+description = "A terminal or shell."
+
+# ============================================================ keep: remote desktop and networking
+
+[[app]]
+name = "Remote desktop tools"
+verdict = "keep"
+category = "Remote access"
+processes = [
+    "RustDesk", "parsecd", "Parsec", "pservice", "TeamViewer*", "tv_w32", "tv_x64", "AnyDesk", "mstsc", "msrdc", "msrdcw",
+    "Moonlight", "sunshine", "Splashtop*", "SRService", "remoting_host", "remoting_desktop", "nxplayer*", "nxserver*", "nxnode*",
+    "ScreenConnect*", "ConnectWiseControl*", "Chrome Remote Desktop*", "Jump Desktop*",
+]
+description = "Remote access. Closing it could cut off the connection you're using."
+
+[[app]]
+name = "VPN and networking"
+verdict = "keep"
+category = "Networking"
+processes = ["tailscale-ipn", "tailscaled", "tailscale", "zerotier*", "ZeroTier One", "wireguard", "openvpn*", "NordVPN*", "ProtonVPN*", "WARP", "Cloudflare WARP", "GlobalProtect*", "PanGPA", "vpnui", "vpnagent"]
+description = "Network connection. Closing it could cut you off."
+
+# ============================================================ keep: security and passwords
+
+[[app]]
+name = "Security software"
+verdict = "keep"
+category = "Security"
+processes = [
+    "MsMpEng", "MpDefenderCoreService", "NisSrv", "SecurityHealthService", "SecurityHealthSystray", "smartscreen",
+    "DefenderSessionHelper", "MpCmdRun", "MsSense", "SenseNdr", "avp", "avpui", "AvastUI", "AvastSvc", "AVGUI", "AVGSvc",
+    "bdagent", "bdservicehost", "ekrn", "egui", "mbam", "MBAMService", "mbamtray", "Norton*", "mcshield", "McUICnt",
+    "CSFalcon*", "SentinelAgent", "SentinelUI", "Sophos*", "WRSA", "ccSvcHst",
+]
+description = "Protects this PC. Never closed."
+
+[[app]]
+name = "Password managers"
+verdict = "keep"
+category = "Security"
+processes = ["1Password", "1Password-BrowserSupport", "Bitwarden", "KeePassXC", "KeePass", "Dashlane", "LastPass", "ProtonPass"]
+description = "Your password manager."
+
+# ============================================================ keep: drivers and hardware services
+
+[[app]]
+name = "Drivers and hardware services"
+verdict = "keep"
+category = "Driver"
+processes = [
+    "NVDisplay.Container", "nvcontainer", "NVIDIA Broadcast", "RtkAudUService64", "RAVBg64", "RtkNGUI64", "igfxEM", "igfxTray",
+    "igfxCUIService", "WavesSvc64", "WavesSysSvc64", "ipf_helper", "ipf_uf", "SynTPEnh", "ETDCtrl", "AsusOSD", "audiodg",
+    "FanControl", "FocusriteControl*", "Focusrite*", "UAD*", "IntelCpHDCPSvc", "jhi_service",
+]
+description = "Keeps your hardware working."
+
+# ============================================================ keep: Windows shell and system
+
+[[app]]
+name = "Windows"
+verdict = "keep"
+category = "Windows"
+processes = [
+    "explorer", "dwm", "csrss", "winlogon", "wininit", "services", "lsass", "smss", "svchost", "sihost", "fontdrvhost",
+    "ctfmon", "taskhostw", "RuntimeBroker", "dllhost", "ShellExperienceHost", "StartMenuExperienceHost", "SearchHost",
+    "SearchApp", "SearchIndexer", "SearchProtocolHost", "SearchFilterHost", "TextInputHost", "TabTip", "LockApp", "LogonUI",
+    "ApplicationFrameHost", "SystemSettings", "ShellHost", "backgroundTaskHost", "AppActions", "MoNotificationUx",
+    "UserOOBEBroker", "WmiPrvSE", "spoolsv", "AggregatorHost", "CompPkgSrv", "WindowsPackageManagerServer", "AppVShNotify",
+    "SnippingTool", "ScreenClippingHost", "StartMenu*", "LsaIso", "Memory Compression", "Registry",
+    "System", "Secure System", "Idle", "WUDFHost", "dasHost", "SgrmBroker", "MicrosoftEdgeUpdate", "msiexec", "TrustedInstaller",
+    "TiWorker", "MusNotifyIcon", "crashpad_handler", "sentry-crash", "WerFault", "WerFaultSecure", "consent", "DataExchangeHost",
+    "PhotosAppBackgroundTask", "Microsoft.SharePoint.NativeMessagingClient", "NgcIso", "unsecapp", "PresentationFontCache",
+]
+description = "Part of Windows."
+
+[[app]]
+name = "Ather apps"
+verdict = "keep"
+category = "Ather"
+processes = ["AtherMemGuard", "memguard", "AtherScreenshot", "Ather*"]
+description = "An Ather app."
+
+[[app]]
+name = "Everyday utilities"
+verdict = "keep"
+category = "Utility"
+processes = ["PowerToys*", "Everything", "AutoHotkey*", "Flow.Launcher", "ShareX", "Greenshot", "f.lux", "TranslucentTB", "EarTrumpet", "Ditto", "7zFM", "7zG", "WinRAR", "Bandizip", "ScreenToGif", "Snipaste", "QuickLook", "Files"]
+description = "A small utility you probably rely on."

@@ -4,7 +4,8 @@
 as tools. It is an MCP server over **stdio**: the agent starts `memguard mcp` itself when it needs it
 and talks to it over stdin and stdout. There is no port, no token and nothing to turn on in the app.
 
-The tools do the same things as the `memguard` commands in the README and return the same JSON as
+The tools do the same things as the `memguard` commands in the README (`memguard_doctor` is the
+read-only checkup, `memguard doctor --json`) and return the same JSON as
 their `--json` output. Without the background app running, `memguard_status` still works (it reports
 `daemon: false`), and priming and waiting still work; only the continuous enforcement is missing.
 
@@ -200,6 +201,55 @@ Example result:
 ```
 
 The 3 GB per compile action is a starting estimate, not a measurement of your project.
+
+### `memguard_doctor`
+
+Read-only checkup: which running apps use memory that Unreal work doesn't need, startup entries worth
+switching off, leftover Unreal helpers and PC-level problems, and how much could be freed. Same as
+`memguard doctor --json`. No arguments. **It changes nothing, and the tool can't fix anything**: relay the
+findings to the person in a few lines and ask before acting. The person runs `memguard doctor --fix` (the
+recommended ones) or `memguard doctor --fix <id>[:action]`; `memguard doctor --undo` reverses it. Don't
+close or end apps yourself.
+
+```json
+{ "name": "memguard_doctor", "arguments": {} }
+```
+
+Example result (shortened):
+
+```json
+{
+  "time": "2026-11-14 15:57:27",
+  "unreal_active": true,
+  "system": { "ram_total_gb": 127.4, "ram_free_gb": 48.6, "commit_free_gb": 43.4, "...": "..." },
+  "findings": [
+    {
+      "id": "app:steam", "kind": "app", "verdict": "close", "title": "Steam",
+      "detail": "Game launcher. Not used by Unreal. It's running in the background with no window open.",
+      "processes": 8, "ram_mb": 98, "committed_mb": 1433,
+      "actions": [ { "kind": "close", "label": "Close", "undo": "Start the app again", "needs_force": false },
+                   { "kind": "block_while_unreal", "label": "Close whenever Unreal is running", "...": "..." } ],
+      "recommended": true, "category": "Game launcher", "names": ["steam", "steamwebhelper"], "pids": [1234, 5678]
+    },
+    { "id": "startup:hkcu:Steam", "kind": "startup", "verdict": "close", "title": "Steam",
+      "actions": [ { "kind": "disable_startup", "label": "Don't start with Windows", "...": "..." } ], "recommended": true, "...": "..." },
+    { "id": "sys:pagefile", "kind": "system", "verdict": "review", "title": "The page file is small for this much RAM", "actions": [], "...": "..." }
+  ],
+  "reclaimable_ram_gb": 0.2,
+  "reclaimable_commit_gb": 2.0
+}
+```
+
+Verdicts: `close` (not needed for Unreal; closing it is safe), `hold_back` (wanted, but should give way:
+put it in a MemGuard group), `review` (unknown and large, or it depends), `heavy_tool` (a big tool that is
+probably deliberate). `keep` items are never listed. Findings with no actions are information only.
+`reclaimable_*` counts the `close` apps and Unreal leftovers, not heavy tools or unknown apps.
+
+A good relay is two or three lines: what could be freed, the recommended actions, and the command to run
+them, for example: "About 2 GB is held by Steam and Copilot running in the background, and Steam starts
+with Windows. `memguard doctor --fix` closes them and switches Steam's startup off; `memguard doctor
+--undo` reverses it. Want me to run it?" Only run `--fix` after the person says yes, and never with
+`--force` unless they asked for that app to be ended.
 
 ## Troubleshooting
 

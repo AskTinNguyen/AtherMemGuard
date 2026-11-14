@@ -32,7 +32,8 @@ const INSTRUCTIONS: &str = "Ather MemGuard keeps this Windows PC's memory free f
 Before starting a local Unreal build, cook or packaging run, call memguard_wait with prime: true and the \
 workload (build or cook); start the job only when it returns ready: true. Call memguard_advise to pick \
 -MaxParallelActions for UnrealBuildTool. Call memguard_status when memory looks tight or a build failed \
-with out-of-memory errors.";
+with out-of-memory errors. When the person asks what is using memory or how to free more, call memguard_doctor \
+and relay its findings; it changes nothing, and you should ask the person before running `memguard doctor --fix`.";
 
 /// Settings source. The real server reads settings.toml on every call (so edits apply
 /// at once); tests pass the built-in defaults.
@@ -211,6 +212,11 @@ impl Server {
             "memguard_advise" => {
                 check_keys(args, &[])?;
                 to_value(&ops::advise(&(self.load_config)()))
+            }
+            // ---- Part F: doctor (report only; fixing stays with the person)
+            "memguard_doctor" => {
+                check_keys(args, &[])?;
+                to_value(&crate::doctor::scan(&(self.load_config)()))
             }
             // TODO(part-b): add `memguard_history` (`hours?` default 1) once Part B's
             // `history` module is merged: register it in `tool_list()` and call
@@ -406,6 +412,21 @@ such as closing the editor during a build. Call it before starting a local build
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             "annotations": { "readOnlyHint": true, "openWorldHint": false },
         }),
+        // ---- Part F: doctor
+        json!({
+            "name": "memguard_doctor",
+            "title": "Checkup",
+            "description": "Read-only checkup: which running apps use memory that Unreal work doesn't need, and \
+what could be done. Each finding has an id, a verdict (close = not needed for Unreal, hold_back = wanted but \
+should give way, review = unknown and large, heavy_tool = a big tool that is probably deliberate), the memory it \
+holds, plain-words detail and the proposed actions (close, end, disable_startup, hold_back, block_while_unreal, \
+leave_it); `recommended` marks the safe ones. Also startup entries worth switching off, leftover Unreal helpers \
+and PC-level problems, plus how much could be freed. It changes nothing. Relay the findings to the person in a \
+few lines and ask before acting: the person runs `memguard doctor --fix` (the recommended ones) or \
+`memguard doctor --fix <id>[:action]`, and `memguard doctor --undo` reverses it. Never close apps yourself.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false },
+        }),
     ]
 }
 
@@ -474,11 +495,11 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_the_four_tools_with_schemas() {
+    fn tools_list_has_the_tools_with_schemas() {
         let r = one(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#);
         let tools = r["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["memguard_status", "memguard_prime", "memguard_wait", "memguard_advise"]);
+        assert_eq!(names, ["memguard_status", "memguard_prime", "memguard_wait", "memguard_advise", "memguard_doctor"]);
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
             assert!(t["inputSchema"]["properties"].is_object());
@@ -514,6 +535,32 @@ mod tests {
         let s = &r["result"]["structuredContent"];
         assert!(s["suggested_max_parallel_actions"].as_u64().unwrap() >= 1);
         assert!(s["notes"].is_array());
+    }
+
+    // ---- Part F: doctor. Read-only: scans this PC and changes nothing.
+    #[test]
+    fn doctor_call_returns_the_report() {
+        let r = one(&call(14, "memguard_doctor", json!({})));
+        let res = &r["result"];
+        assert_eq!(res["isError"], false, "{}", r);
+        let s = &res["structuredContent"];
+        for key in ["time", "system", "unreal_active", "findings", "reclaimable_ram_gb", "reclaimable_commit_gb"] {
+            assert!(s.get(key).is_some(), "doctor report lacks {}", key);
+        }
+        for f in s["findings"].as_array().unwrap() {
+            for key in ["id", "kind", "verdict", "title", "detail", "processes", "ram_mb", "committed_mb", "actions", "recommended"] {
+                assert!(f.get(key).is_some(), "finding lacks {}: {}", key, f);
+            }
+            assert_ne!(f["verdict"], "keep");
+        }
+        let text: Value = serde_json::from_str(res["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(&text, s);
+        let tools = one(r#"{"jsonrpc":"2.0","id":15,"method":"tools/list"}"#);
+        let doctor = tools["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == "memguard_doctor").unwrap().clone();
+        assert_eq!(doctor["annotations"]["readOnlyHint"], true);
+        assert!(doctor["description"].as_str().unwrap().contains("ask before acting"));
+        let t = tool_error_text(&one(&call(16, "memguard_doctor", json!({ "fix": true }))));
+        assert!(t.contains("fix"), "{}", t);
     }
 
     #[test]
