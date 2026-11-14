@@ -1,9 +1,9 @@
 {
     "windows":  {
-                    "version":  "0.2.2",
-                    "url":  "https://github.com/AskTinNguyen/AtherMemGuard/releases/download/v0.2.2/AtherMemGuard-Setup-0.2.2.exe",
-                    "sha256":  "7e37626b37c2d08791242ff5e22919bba867f94e24255fab0622c55bbb841478",
-                    "size":  6164480,
-                    "notes":  "The flyout shows where every GB of RAM goes, and can empty Windows\u0027 file cache. Also half the CPU in the background."
+                    "version":  "0.2.3",
+                    "url":  "https://github.com/AskTinNguyen/AtherMemGuard/releases/download/v0.2.3/AtherMemGuard-Setup-0.2.3.exe",
+                    "sha256":  "ceb9884c8adf0ca3e227e11bea3f19785b65de77baa2146961657c9ce2870b32",
+                    "size":  7363584,
+                    "notes":  "Disk space and Dev Drive alerts, a disk checkup that counts shared space once, and actions on each RAM row in the flyout."
                 }
 }
