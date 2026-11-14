@@ -1,4 +1,4 @@
-# Ather MemGuard
+﻿# Ather MemGuard
 
 Keeps a Windows PC primed for agentic Unreal Engine work: the editor, local builds and cooks get
 memory first, and everything else (browsers, chat apps, agent apps, launchers) gives it up.
@@ -18,7 +18,7 @@ memguard install --add-to-path
 
 This copies them to `%LOCALAPPDATA%\Programs\AtherMemGuard`, starts the tray app at sign-in, starts it now,
 adds an entry under Settings > Apps, and (with `--add-to-path`) puts `memguard` on your user PATH. `memguard uninstall` reverses all of it;
-settings and the log are kept. The files are unsigned, so SmartScreen may ask once (More info → Run anyway).
+settings and the log are kept. The files are unsigned, so SmartScreen may ask once (More info â†’ Run anyway).
 
 ## How it decides
 
@@ -46,7 +46,7 @@ Things worth knowing:
 - Unreal's own processes are on a protect list and are never touched, even if a group lists them.
 - Priority and trimming free **RAM**, not **commit charge**. Only hard caps, closing apps or a bigger
   page file change commit. `memguard status` warns when the page file is small for the RAM.
-- If a group climbs straight back over its soft cap, that memory is in use; MemGuard backs off (up to 16×
+- If a group climbs straight back over its soft cap, that memory is in use; MemGuard backs off (up to 16Ã—
   the cooldown) instead of trimming it over and over.
 - Browser and Electron helper processes are sandboxed and refuse to join a Job Object, so hard caps
   only partly cover those apps. The log says how many processes a cap covers.
@@ -92,9 +92,68 @@ claude mcp add --scope user ather-memguard -- memguard mcp
 Setup for each agent, every tool with an example, and the recommended flow before a build or cook are in
 [docs/AI-AGENTS.md](docs/AI-AGENTS.md).
 
+## Checkup (doctor)
+
+`memguard doctor` answers one question: what is using memory on this PC that Unreal work doesn't need,
+and what should be done about it? It looks and explains; it changes nothing unless you ask, and what it
+changes can be undone.
+
+```
+memguard doctor [--json]                 the checkup, grouped by what to do, with the memory each item holds
+memguard doctor --fix [--dry-run]        do the recommended actions (the safe ones)
+memguard doctor --fix app:steam startup:hkcu:Steam:disable_startup
+                                         do specific ones: <id>[:action]
+memguard doctor --fix app:steam:end --force
+                                         end an app that ignored "close" (anything unsaved is lost)
+memguard doctor --undo [<undo id>]       reverse the last cleanup, or one action
+```
+
+What it reports:
+
+- **Not needed for Unreal** (`close`): game launchers, Spotify, Widgets, Copilot, Phone Link, lighting and
+  peripheral suites, GPU overlays and similar, from a built-in catalogue of over 150 process names.
+- **Starts with Windows**: Run-key and Startup-folder entries for those apps. Yours can be switched off the
+  way Task Manager does it; machine-wide ones need an administrator and are only reported.
+- **Big tools you might not be using** (`heavy_tool`): Blender, Maya, Photoshop, Docker, WSL, local AI
+  models, other game engines. Only ever "close if you're not using it".
+- **Worth a look** (`review`): apps the catalogue doesn't know that hold more than 1 GB, with their file
+  description and company so you can decide.
+- **Held back, not closed** (`hold_back`): browsers, chat and agent apps you want, which aren't in a
+  MemGuard group yet.
+- **Unreal**: leftover helper processes from a closed editor, several editors open, an editor past its
+  restart hint. **This PC**: small page file, low commit, a leaking driver, a git pile-up, MemGuard not
+  running.
+
+Actions: `close` asks the app to close (as if you clicked its X) and waits up to 10 seconds; an app with
+unsaved work shows its own prompt and the result is "still open", never a forced kill. `end` needs
+`--force`. `disable_startup` switches a startup entry off. `hold_back` adds the app to a MemGuard group,
+`block_while_unreal` to `[doctor] close_while_unreal` (closed whenever the editor, a build or a cook runs),
+`leave_it` to `[doctor] keep`. Only two things are ever recommended: switching off startup entries of apps
+Unreal doesn't need, and closing such apps when they have no window open. Closing anything with a window
+is always your pick.
+
+It never touches Unreal's processes, Windows itself, security software, other users' or sessions'
+processes, Ather MemGuard, or the app that started `memguard` (so an agent running `memguard doctor --fix`
+can't close itself). Every applied action goes to `doctor-undo.json` in the data folder.
+
+Settings, in `settings.toml`:
+
+```toml
+[doctor]
+keep = ["MyTool"]               # never proposed
+close = ["SomeLauncher*"]       # treat as not needed for Unreal
+close_while_unreal = []         # closed whenever Unreal is running
+ignore_below_mb = 150           # leave out apps using less than this
+review_above_mb = 1024          # show unknown apps above this
+nudge_above_gb = 4              # the tray suggests a checkup when Unreal starts and this much could be freed
+```
+
+Agents get the same report from the `memguard_doctor` MCP tool, which is read-only: they relay it and ask
+you before anything is fixed.
+
 ## Settings
 
-`%APPDATA%\AtherMemGuard\settings.toml` (tray menu → Settings). Saved changes apply within one
+`%APPDATA%\AtherMemGuard\settings.toml` (tray menu â†’ Settings). Saved changes apply within one
 interval; a mistake keeps the previous settings and is reported in the log. `memguard config --check`
 validates the file. The default file documents every key.
 
