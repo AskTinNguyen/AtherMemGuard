@@ -463,7 +463,25 @@ pub struct InstallResult {
     pub started: bool,
 }
 
-pub fn install(add_to_path: bool, start: bool) -> Result<InstallResult, String> {
+/// What `install` should set up besides copying the program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstallOptions {
+    /// Put the install folder on the user PATH so `memguard` works in any terminal.
+    pub add_to_path: bool,
+    /// Start the tray app when the user signs in. Off removes an existing entry.
+    pub start_with_windows: bool,
+    /// Start the tray app right after installing.
+    pub start: bool,
+}
+
+impl Default for InstallOptions {
+    fn default() -> Self {
+        InstallOptions { add_to_path: true, start_with_windows: true, start: true }
+    }
+}
+
+pub fn install(opts: InstallOptions) -> Result<InstallResult, String> {
+    let InstallOptions { add_to_path, start_with_windows, start } = opts;
     let stopped_previous = stop_running();
     let migrated_from_memcap = migrate_from_memcap();
     let dir = paths::install_dir();
@@ -473,7 +491,7 @@ pub fn install(add_to_path: bool, start: bool) -> Result<InstallResult, String> 
     crate::config::Config::load()?; // writes the default settings file if there is none
 
     let tray = dir.join(paths::TRAY_EXE);
-    set_run_at_startup(true)?;
+    set_run_at_startup(start_with_windows)?;
     write_uninstall_entry(&dir)?;
     if let Err(e) = create_shortcut(&tray, &paths::start_menu_shortcut()) {
         crate::log::write(&format!("could not add the Start menu shortcut: {}", e));

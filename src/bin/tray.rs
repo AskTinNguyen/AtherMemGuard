@@ -15,7 +15,7 @@ enum Command {
     /// From Settings > Apps.
     Uninstall,
     /// Silent install for scripts.
-    Install { add_to_path: bool, start: bool },
+    Install(install::InstallOptions),
     /// Paint every UI surface with sample data into PNG files (docs/UI.md, for review).
     UiSnapshots(String),
     /// Anything else: say so in the log and do nothing.
@@ -36,22 +36,23 @@ fn parse_args(args: &[String]) -> Command {
             _ => Command::Unknown(args.join(" ")),
         },
         "--install" => {
-            let (mut add_to_path, mut start) = (true, true);
+            let mut opts = install::InstallOptions::default();
             for a in rest {
                 match a.to_ascii_lowercase().as_str() {
-                    "--no-path" => add_to_path = false,
-                    "--no-start" => start = false,
+                    "--no-path" => opts.add_to_path = false,
+                    "--no-start" => opts.start = false,
+                    "--no-startup" => opts.start_with_windows = false,
                     _ => return Command::Unknown(args.join(" ")),
                 }
             }
-            Command::Install { add_to_path, start }
+            Command::Install(opts)
         }
         _ => Command::Unknown(args.join(" ")),
     }
 }
 
-fn run_install(add_to_path: bool, start: bool) -> i32 {
-    match install::install(add_to_path, start) {
+fn run_install(opts: install::InstallOptions) -> i32 {
+    match install::install(opts) {
         Ok(_) => 0,
         Err(e) => {
             log::write(&format!("install failed: {}", e));
@@ -69,7 +70,7 @@ fn main() {
                 0
             }
             // INTEGRATION: open E2's setup window (src/ui/setup.rs) here; until then install right away.
-            LaunchMode::Setup => run_install(true, true),
+            LaunchMode::Setup => run_install(install::InstallOptions::default()),
         },
         Command::AfterUpdate(pid) => {
             updater::finish_update(pid);
@@ -84,7 +85,7 @@ fn main() {
                 1
             }
         },
-        Command::Install { add_to_path, start } => run_install(add_to_path, start),
+        Command::Install(opts) => run_install(opts),
         Command::UiSnapshots(dir) => {
             let dir = std::path::Path::new(&dir);
             // INTEGRATION: drop the flyout call once ui::snapshots::write_all includes it.
@@ -125,10 +126,12 @@ mod tests {
         assert_eq!(p(&["--after-update", "1234"]), Command::AfterUpdate(1234));
         assert_eq!(p(&["--uninstall"]), Command::Uninstall);
         assert_eq!(p(&["--UNINSTALL"]), Command::Uninstall);
-        assert_eq!(p(&["--install"]), Command::Install { add_to_path: true, start: true });
-        assert_eq!(p(&["--install", "--no-path"]), Command::Install { add_to_path: false, start: true });
-        assert_eq!(p(&["--install", "--no-start"]), Command::Install { add_to_path: true, start: false });
-        assert_eq!(p(&["--install", "--no-start", "--no-path"]), Command::Install { add_to_path: false, start: false });
+        let opts = |add_to_path, start_with_windows, start| Command::Install(install::InstallOptions { add_to_path, start_with_windows, start });
+        assert_eq!(p(&["--install"]), opts(true, true, true));
+        assert_eq!(p(&["--install", "--no-path"]), opts(false, true, true));
+        assert_eq!(p(&["--install", "--no-start"]), opts(true, true, false));
+        assert_eq!(p(&["--install", "--no-startup"]), opts(true, false, true));
+        assert_eq!(p(&["--install", "--no-start", "--no-path", "--NO-STARTUP"]), opts(false, false, false));
         assert_eq!(p(&["--ui-snapshots", r"C:\shots"]), Command::UiSnapshots(r"C:\shots".into()));
     }
 
