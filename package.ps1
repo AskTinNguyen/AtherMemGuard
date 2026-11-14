@@ -117,8 +117,13 @@ Invoke-Native 'git' @('fetch', '-q', 'origin')
 $onRemote = git branch -r --contains $commit | Select-String 'origin/'
 if (-not $onRemote) { throw "Push $commit first: the release is tagged there." }
 $assets = @($setup, $zip, (Join-Path $dist 'SHA256SUMS.txt'), (Join-Path $dist 'latest.json'))
-& gh release view "v$ver" --repo $repo *> $null
-if ($LASTEXITCODE -ne 0) {
+# "release not found" on stderr is the normal answer for a first release; with
+# ErrorActionPreference = Stop, Windows PowerShell would turn it into a fatal error.
+$ErrorActionPreference = 'Continue'
+& gh release view "v$ver" --repo $repo 2>$null | Out-Null
+$releaseExists = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = 'Stop'
+if (-not $releaseExists) {
     Invoke-Native 'gh' (@('release', 'create', "v$ver") + $assets + @('--repo', $repo, '--target', $commit,
         '--title', "Ather MemGuard $ver", '--notes-file', 'RELEASE_NOTES.md', '--latest'))
 } else {
