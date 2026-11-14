@@ -11,6 +11,10 @@ use super::settings_store::FakeStore;
 use super::status_source::FakeStatus;
 use super::theme::Scale;
 use super::toast;
+use super::setup::{self, FakeBackend, Input, SetupMode, SetupWindow};
+use super::history::{self, FakeHistory, HistoryWindow, Range};
+use super::geom::Pt;
+use super::doctor::{self, DoctorWindow, FakeDoctor};
 use super::window::Surface;
 
 /// A settings window over the mockup's data.
@@ -80,6 +84,73 @@ pub fn write_all(dir: &Path) -> Result<Vec<PathBuf>, String> {
         for (name, t) in toast::catalog::samples() {
             save(&format!("toast-{}", name), &toast::render(&t, scale))?;
         }
+        for (name, mut w) in sample_setups() {
+            save(name, &setup::render(&mut w, scale))?;
+        }
+        for (name, range, empty, hover) in [
+            ("history-1h", Range::H1, false, false),
+            ("history-6h", Range::H6, false, false),
+            ("history-24h", Range::H24, false, false),
+            ("history-7d", Range::D7, false, false),
+            ("history-empty", Range::H6, true, false),
+            ("history-hover", Range::H6, false, true),
+        ] {
+            let src = if empty { FakeHistory::empty() } else { FakeHistory::mockup() };
+            let mut w = HistoryWindow::new(Box::new(src));
+            w.set_range(range);
+            if hover {
+                // Over the tight spell, 72% across the plot.
+                let probe = Canvas::new(scale.s(960.0), scale.s(600.0), scale);
+                let plot = w.layout(&probe).plot;
+                w.set_mouse(Some(Pt::new(plot.x + plot.w * 72 / 100, plot.y + plot.h / 2)));
+            }
+            save(name, &history::render(&mut w, scale, 960, 600))?;
+        }
+        // Checkup: the whole report, all clear, after a cleanup (Spotify stayed open), and the
+        // "End it anyway" confirmation.
+        let mut d = DoctorWindow::new(Box::new(FakeDoctor::new()));
+        d.scan(None);
+        save("doctor", &doctor::render(&mut d, scale, 760, None))?;
+        let mut d = DoctorWindow::new(Box::new(FakeDoctor::all_clear()));
+        d.scan(None);
+        save("doctor-clear", &doctor::render(&mut d, scale, 760, Some(720)))?;
+        let mut d = DoctorWindow::new(Box::new(FakeDoctor::new()));
+        d.scan(None);
+        if let Some(m) = d.model.as_mut() {
+            let spotify = m.report.findings.iter().position(|f| f.id == "app:spotify").unwrap_or(0);
+            m.toggle(spotify);
+        }
+        d.clean_up(None);
+        save("doctor-results", &doctor::render(&mut d, scale, 760, None))?;
+        if let Some(i) = d.model.as_ref().and_then(|m| (0..m.rows.len()).find(|&i| m.still_open(i))) {
+            d.confirm = Some(doctor::Confirm::End(i));
+        }
+        save("doctor-confirm", &doctor::render(&mut d, scale, 760, Some(720)))?;
     }
     Ok(out)
+}
+
+/// One setup window per state, from `FakeBackend`.
+pub fn sample_setups() -> Vec<(&'static str, SetupWindow)> {
+    let v = "0.2.0";
+    let mk = |installed: Option<&str>, mode: SetupMode| SetupWindow::new(Box::new(FakeBackend::new(installed)), mode, v);
+    let mut working = mk(None, SetupMode::Install);
+    working.model.input(Input::Primary);
+    let mut done = mk(None, SetupMode::Install);
+    done.model.input(Input::Primary);
+    done.model.input(Input::Finished(Ok(())));
+    let mut failed = mk(None, SetupMode::Install);
+    failed.model.input(Input::Primary);
+    failed.model.input(Input::Finished(Err(
+        r"Couldn't write C:\Users\you\AppData\Local\Programs\AtherMemGuard\memguard.exe (Access is denied. (os error 5)).".into(),
+    )));
+    vec![
+        ("setup-install", mk(None, SetupMode::Install)),
+        ("setup-update", mk(Some("0.1.4"), SetupMode::Install)),
+        ("setup-reinstall", mk(Some("0.2.0"), SetupMode::Install)),
+        ("setup-working", working),
+        ("setup-done", done),
+        ("setup-failed", failed),
+        ("setup-uninstall", mk(Some("0.2.0"), SetupMode::Uninstall)),
+    ]
 }

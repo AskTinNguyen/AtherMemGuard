@@ -19,3 +19,6 @@ pub mod ui_state;
 pub mod snapshots;
 pub mod flyout;
 pub mod real_store;
+pub mod setup;
+pub mod history;
+pub mod doctor;
