@@ -5,12 +5,14 @@
 //! - `engine`  snapshot -> analyze (pure) -> apply (soft caps, hard caps, throttling)
 //! - `ops`     one-shot operations for agents: prime, wait, run, advise
 //! - `install` per-user install, autostart, PATH
+//! - `mcp`     MCP server over stdio, so coding agents can call MemGuard as tools
 //! - `tray`    tray icon + background loop
 
 pub mod config;
 pub mod engine;
 pub mod install;
 pub mod logo;
+pub mod mcp;
 pub mod ops;
 pub mod paths;
 pub mod tray;

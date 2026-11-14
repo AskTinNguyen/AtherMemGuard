@@ -137,6 +137,12 @@ enum Cmd {
         #[arg(long)]
         reset: bool,
     },
+
+    // ---- Part C: MCP server for agents
+    /// Serve MemGuard's tools to a coding agent over stdio (Model Context Protocol)
+    Mcp,
+    /// Print ready-to-paste setup for Claude Code and Codex
+    AgentSetup,
 }
 
 fn load_config() -> Config {
@@ -437,5 +443,54 @@ fn main() -> ExitCode {
             println!("{}", path.display());
             ExitCode::SUCCESS
         }
+
+        // ---- Part C: MCP server for agents
+        Cmd::Mcp => match athermemguard::mcp::run_stdio() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("memguard mcp: {}", e);
+                ExitCode::from(1)
+            }
+        },
+
+        Cmd::AgentSetup => {
+            print_agent_setup();
+            ExitCode::SUCCESS
+        }
     }
+}
+
+// ---- Part C: MCP server for agents
+
+/// The memguard.exe agents should start: the installed copy if there is one, else this one.
+fn agent_cli_path() -> std::path::PathBuf {
+    let installed = paths::install_dir().join(paths::CLI_EXE);
+    if installed.exists() {
+        return installed;
+    }
+    std::env::current_exe().unwrap_or_else(|_| paths::CLI_EXE.into())
+}
+
+fn print_agent_setup() {
+    let exe = agent_cli_path().display().to_string();
+    let json_exe = serde_json::to_string(&exe).unwrap_or_else(|_| format!("\"{}\"", exe));
+    println!("Ather MemGuard for AI agents: an MCP server your agent starts by itself (no port, nothing to enable).");
+    println!("Tools: memguard_status, memguard_prime, memguard_wait, memguard_advise.");
+    println!();
+    println!("Claude Code, for all your projects:");
+    println!("  claude mcp add --scope user ather-memguard -- \"{}\" mcp", exe);
+    println!("If `memguard` is on your PATH, this short form works too:");
+    println!("  claude mcp add ather-memguard -- memguard mcp");
+    println!();
+    println!("Claude Code, shared with a project (.mcp.json in the repo root):");
+    println!("  {{ \"mcpServers\": {{ \"ather-memguard\": {{ \"command\": {}, \"args\": [\"mcp\"] }} }} }}", json_exe);
+    println!();
+    println!(r"Codex (%USERPROFILE%\.codex\config.toml):");
+    println!("  [mcp_servers.ather-memguard]");
+    println!("  command = '{}'", exe);
+    println!("  args = [\"mcp\"]");
+    println!("  tool_timeout_sec = 3700   # memguard_wait can block for up to an hour");
+    println!();
+    println!("Before a local build or cook, have the agent call memguard_wait with prime: true.");
+    println!("More: docs/AI-AGENTS.md");
 }
