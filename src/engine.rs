@@ -246,7 +246,44 @@ pub fn is_protected(cfg: &Config, p: &Proc) -> bool {
     p.pid == win::current_pid() || p.name.to_ascii_lowercase().contains("memguard") || any_matches(&cfg.ue.protect, &p.name)
 }
 
+/// Lowercased command lines by (pid, creation time). A process's command line doesn't
+/// change, so the engine reads each one once instead of every tick.
+#[derive(Default)]
+pub struct CmdLines(HashMap<ProcKey, String>);
+
+impl CmdLines {
+    /// The lowercased command line of `p`, from the cache or from `read`. Empty if it
+    /// can't be read; failures and empty lines are not cached (a process that just started
+    /// may not have one yet), nor are processes without a creation time.
+    fn get_with(&mut self, p: &Proc, read: impl FnOnce(u32) -> Option<String>) -> String {
+        let key = (p.pid, p.created);
+        if let Some(c) = self.0.get(&key) {
+            return c.clone();
+        }
+        let cmd = read(p.pid).unwrap_or_default().to_ascii_lowercase();
+        if p.created != 0 && !cmd.is_empty() {
+            self.0.insert(key, cmd.clone());
+        }
+        cmd
+    }
+
+    /// Drop the processes that are gone.
+    fn prune(&mut self, procs: &[Proc]) {
+        if self.0.is_empty() {
+            return;
+        }
+        let alive: HashSet<ProcKey> = procs.iter().map(|p| (p.pid, p.created)).collect();
+        self.0.retain(|k, _| alive.contains(k));
+    }
+}
+
 pub fn analyze(cfg: &Config, snap: &Snapshot) -> Status {
+    analyze_with(cfg, snap, &mut CmdLines::default())
+}
+
+/// `analyze` with a command-line cache that lives across calls (the engine's).
+pub fn analyze_with(cfg: &Config, snap: &Snapshot, cmds: &mut CmdLines) -> Status {
+    cmds.prune(&snap.procs);
     // Each pattern list and each process name is lowercased once per call, not once per
     // comparison.
     let protect = Patterns::new(&cfg.ue.protect);
@@ -281,7 +318,7 @@ pub fn analyze(cfg: &Config, snap: &Snapshot) -> Status {
             worker_pids.push((p.pid, p.created));
         }
         if lower.starts_with("unrealeditor") {
-            let cmd = win::command_line(p.pid).unwrap_or_default().to_ascii_lowercase();
+            let cmd = cmds.get_with(p, win::command_line);
             let kind = if cmd.contains("-run=cook") {
                 act.cook = true;
                 "cook"
@@ -305,7 +342,7 @@ pub fn analyze(cfg: &Config, snap: &Snapshot) -> Status {
         } else if lower == "unrealpak" {
             act.cook = true;
         } else if lower == "dotnet" || lower == "automationtool" {
-            let cmd = win::command_line(p.pid).unwrap_or_default().to_ascii_lowercase();
+            let cmd = cmds.get_with(p, win::command_line);
             if cmd.contains("unrealbuildtool") {
                 act.build = true;
             }
@@ -549,6 +586,7 @@ pub struct Engine {
     /// Memory priority and CPU policy last set per process, so unchanged ones aren't set
     /// again every tick.
     applied: HashMap<ProcKey, Applied>,
+    cmdlines: CmdLines,
     suspended: HashSet<u32>,
     workers_paused: HashSet<u32>,
     cap_misses: HashMap<String, usize>,
@@ -586,6 +624,7 @@ impl Engine {
             cpu_touched: HashMap::new(),
             eco_touched: HashSet::new(),
             applied: HashMap::new(),
+            cmdlines: CmdLines::default(),
             suspended: HashSet::new(),
             workers_paused: HashSet::new(),
             cap_misses: HashMap::new(),
@@ -677,7 +716,7 @@ impl Engine {
             self.set_paused(false);
         }
         let snap = snapshot();
-        let mut st = analyze(&self.cfg, &snap);
+        let mut st = analyze_with(&self.cfg, &snap, &mut self.cmdlines);
         st.daemon = true;
         st.paused = self.paused;
         if self.cfg.history.enabled {
@@ -1337,6 +1376,34 @@ mod tests {
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
+    }
+
+    #[test]
+    fn command_lines_are_cached_per_process() {
+        let p = |pid: u32, created: u64| Proc { pid, ppid: 1, name: "dotnet".into(), ram: 0, committed: 0, created, queryable: true };
+        let mut c = CmdLines::default();
+        let reads = std::cell::Cell::new(0);
+        let read = |s: &'static str| {
+            let reads = &reads;
+            move |_pid: u32| {
+                reads.set(reads.get() + 1);
+                Some(s.to_string())
+            }
+        };
+        assert_eq!(c.get_with(&p(8, 1), read("dotnet UnrealBuildTool.dll")), "dotnet unrealbuildtool.dll");
+        assert_eq!(c.get_with(&p(8, 1), read("something else")), "dotnet unrealbuildtool.dll");
+        assert_eq!(reads.get(), 1);
+        // A recycled pid is read again.
+        assert_eq!(c.get_with(&p(8, 2), read("dotnet other.dll")), "dotnet other.dll");
+        assert_eq!(reads.get(), 2);
+        // Failures, empty lines and unknown creation times are not kept.
+        assert_eq!(c.get_with(&p(12, 1), |_| None), "");
+        assert_eq!(c.get_with(&p(12, 1), read("")), "");
+        assert_eq!(c.get_with(&p(16, 0), read("x")), "x");
+        assert_eq!(c.0.len(), 2);
+        // Pruned to the processes still running.
+        c.prune(&[p(8, 2)]);
+        assert_eq!(c.0.keys().copied().collect::<Vec<_>>(), [(8, 2)]);
     }
 
     #[test]
