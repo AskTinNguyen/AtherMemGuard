@@ -156,16 +156,15 @@ now** checks at once). When there is one, a toast offers it; clicking it downloa
 size and SHA-256, swaps it in and restarts. Your settings stay. Nothing is installed if the download doesn't
 match.
 
-Updates download from this repository's GitHub releases (the manifest is
-`releases/latest/download/latest.json`). **The repository is private, so automatic updates only work for
-teammates who can reach its releases**; for everyone else the check fails quietly and the app keeps running
-the version it has. Teams can host the files elsewhere and point `[updates] manifest_url` at their own
-`latest.json`.
+Updates download from this repository's public GitHub releases (the manifest is
+`releases/latest/download/latest.json`), so any PC that can reach github.com gets them. Only the version
+check is sent. If GitHub can't be reached the check fails quietly and the app keeps running the version it
+has. Teams that host builds themselves can point `[updates] manifest_url` at their own `latest.json`.
 
 ## Known limits
 
 - **Not code-signed.** SmartScreen warns once per download.
-- **Updates need reachable releases.** See [Updates](#updates).
+- **Updates need github.com.** A PC that can't reach it keeps the version it has. See [Updates](#updates).
 - **Soft caps free RAM, not commit.** If Windows runs out of commit (apps fail with RAM still free), the fix
   is a larger page file; the checkup says when yours is small.
 - **Checkup:** startup tasks of Microsoft Store apps aren't listed. A background app with no window may

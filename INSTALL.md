@@ -35,7 +35,7 @@ Settings has a window (tray menu → Settings); changes apply as you make them. 
 
 ## Update
 
-From 0.2 the app updates itself. Once a day it checks this repository's GitHub releases for a newer version, downloads it, checks its size and SHA-256, swaps it in and restarts. Your settings and log are kept. The releases have to be reachable from your PC: while the repository is private, that means you need access to it.
+From 0.2 the app updates itself. Once a day it checks this repository's GitHub releases for a newer version, downloads it, checks its size and SHA-256, swaps it in and restarts. Your settings and log are kept. If your PC can't reach github.com, it keeps the version it has.
 
 Running a newer `AtherMemGuard-Setup-<version>.exe` works too.
 

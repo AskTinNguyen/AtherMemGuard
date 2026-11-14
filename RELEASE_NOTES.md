@@ -10,7 +10,7 @@
 
 ### One file to install, and updates in the app
 - **One setup exe:** `AtherMemGuard-Setup-<version>.exe` is the app itself. It opens a small setup window with two switches, **Start with Windows** and **Add the memguard command**, installs both programs, adds a **Start menu** shortcut and an entry in **Settings › Apps**, and starts. **Run without installing** runs it from where it is.
-- **Updates itself:** the app checks GitHub once a day for a newer version, downloads it next to itself, checks its size and SHA-256, swaps it in and restarts. Nothing is installed if the download doesn't match. The release files have to be reachable from your PC: while the repository is private, only teammates with access get automatic updates.
+- **Updates itself:** the app checks GitHub once a day for a newer version, downloads it next to itself, checks its size and SHA-256, swaps it in and restarts. Nothing is installed if the download doesn't match. It needs to reach github.com; if it can't, it keeps the version it has.
 - **Your own update server:** `[updates] manifest_url` in the settings points the app at another `latest.json`, for teams that host their own builds.
 - **Uninstall the usual way:** Settings › Apps › Ather MemGuard › Uninstall asks first, then puts every app back to normal. Settings, history and the log are kept.
 - **Silent install for scripts:** `AtherMemGuard-Setup-<version>.exe --install [--no-path] [--no-startup] [--no-start]`, or `memguard install --no-startup`.
