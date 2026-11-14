@@ -55,9 +55,28 @@ worker_throttle = false
 min_workers = 4
 
 [prime]
-editor = { ram_gb = 16, commit_gb = 24 }
-build = { ram_gb = 24, commit_gb = 40 }
-cook = { ram_gb = 32, commit_gb = 48 }
+editor = { ram_gb = 16, commit_gb = 24, disk_gb = 20 }
+build = { ram_gb = 24, commit_gb = 40, disk_gb = 50 }
+cook = { ram_gb = 32, commit_gb = 48, disk_gb = 100 }
+
+[disk]
+enabled = true
+watch = ["auto"]
+elevated_free_gb = 150
+elevated_free_pct = 10
+critical_free_gb = 50
+critical_free_pct = 5
+cache_min_free_gb = 20
+project_dirs = []
+lane_dirs = []
+scan_depth = 3
+scan_budget_sec = 60
+scan_threads = 4
+fresh_sec = 300
+min_age_hours = 2
+hold_hours = 24
+keep = []
+check_dev_drive = true
 
 [[group]]
 name = "Browsers"
@@ -160,9 +179,31 @@ preset = "balanced"
 
 # [prime]
 # Headroom `memguard prime --for X` and `memguard wait --for X` aim for. Tune to your project.
-# editor = { ram_gb = 16, commit_gb = 24 }
-# build = { ram_gb = 24, commit_gb = 40 }
-# cook = { ram_gb = 32, commit_gb = 48 }
+# disk_gb is the free disk space `memguard wait` wants on the project's drive (--disk-path).
+# editor = { ram_gb = 16, commit_gb = 24, disk_gb = 20 }
+# build = { ram_gb = 24, commit_gb = 40, disk_gb = 50 }
+# cook = { ram_gb = 32, commit_gb = 48, disk_gb = 100 }
+
+# [disk]
+# enabled = true                # watch free space and say once when a drive gets low
+# watch = ["auto"]              # Dev Drives, the system drive and drives with projects, DDC/Zen
+#                               # or TEMP; or drive letters and folders, e.g. ["D:", 'E:\Builds']
+# A level applies below the smaller of the GB and the percent figure.
+# elevated_free_gb = 150
+# elevated_free_pct = 10
+# critical_free_gb = 50
+# critical_free_pct = 5
+# cache_min_free_gb = 20        # what `memguard wait` wants free where the DDC, Zen and TEMP are
+# project_dirs = []             # where the disk checkup looks for Unreal projects
+# lane_dirs = []                # extra folders holding worktrees or lanes (siblings are found anyway)
+# scan_depth = 3                # how deep to look for project roots
+# scan_budget_sec = 60          # how long a disk checkup may count, in seconds
+# scan_threads = 4
+# fresh_sec = 300               # older counts are reported as "about"
+# min_age_hours = 2             # (for cleanup, in a later version)
+# hold_hours = 24               # (for cleanup, in a later version)
+# keep = []                     # folders the disk checkup never lists
+# check_dev_drive = true        # Dev Drive health rows in the checkups
 
 # App groups. The built-in ones are Browsers, Chat, Agents and Background. A [[group]] here
 # with the same name changes only the keys you set; a new name adds a group.
@@ -378,8 +419,7 @@ fn default_growth_alert() -> f64 {
 pub struct Target {
     pub ram_gb: f64,
     pub commit_gb: f64,
-    /// Reserved for the disk gate in a later version: accepted so a newer settings or team
-    /// file still loads here, and ignored.
+    /// Free disk space `memguard wait` wants on the project's volume. None = no disk gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_gb: Option<f64>,
 }
@@ -450,6 +490,58 @@ impl Default for HistorySettings {
     }
 }
 
+/// `[disk]`: headroom levels, the wait gate's cache volumes and the disk checkup.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiskSettings {
+    pub enabled: bool,
+    /// `["auto"]`, or drive letters and folders.
+    pub watch: Vec<String>,
+    pub elevated_free_gb: f64,
+    pub elevated_free_pct: f64,
+    pub critical_free_gb: f64,
+    pub critical_free_pct: f64,
+    /// Free space `memguard wait` wants on the volumes holding the DDC, Zen and TEMP.
+    pub cache_min_free_gb: f64,
+    pub project_dirs: Vec<String>,
+    pub lane_dirs: Vec<String>,
+    pub scan_depth: u32,
+    pub scan_budget_sec: u64,
+    pub scan_threads: usize,
+    pub fresh_sec: u64,
+    /// For cleanup in a later version (items written more recently are refused). Carried now.
+    pub min_age_hours: f64,
+    /// For the bin in a later version (how long moved items are kept). Carried now.
+    pub hold_hours: f64,
+    /// Folders the disk checkup never lists.
+    pub keep: Vec<String>,
+    pub check_dev_drive: bool,
+}
+
+impl Default for DiskSettings {
+    fn default() -> Self {
+        DiskSettings {
+            enabled: true,
+            watch: vec!["auto".into()],
+            elevated_free_gb: 150.0,
+            elevated_free_pct: 10.0,
+            critical_free_gb: 50.0,
+            critical_free_pct: 5.0,
+            cache_min_free_gb: 20.0,
+            project_dirs: Vec::new(),
+            lane_dirs: Vec::new(),
+            scan_depth: 3,
+            scan_budget_sec: 60,
+            scan_threads: 4,
+            fresh_sec: 300,
+            min_age_hours: 2.0,
+            hold_hours: 24.0,
+            keep: Vec::new(),
+            check_dev_drive: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -473,10 +565,10 @@ pub struct Config {
     /// validates them itself; the table is carried here so the file still loads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doctor: Option<toml::Table>,
-    /// Reserved for disk and Dev Drive settings in a later version: accepted so a newer
-    /// settings or team file still loads here, and ignored.
+    /// Disk and Dev Drive settings; `Config::disk()` fills in the defaults when the table is
+    /// missing. 0.2.1 carries this table untyped, so files stay compatible both ways.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub disk: Option<toml::Table>,
+    pub disk: Option<DiskSettings>,
     /// Every group, including disabled ones (`enabled = false`); the engine skips those.
     #[serde(default, rename = "group")]
     pub groups: Vec<Group>,
@@ -574,11 +666,34 @@ impl Config {
                 return Err(format!("general.prime_hotkey \"{}\" should look like \"Ctrl+Alt+M\", or be empty", hk));
             }
         }
+        for t in [self.prime.editor, self.prime.build, self.prime.cook] {
+            if t.disk_gb.is_some_and(|g| !(g.is_finite() && g >= 0.0)) {
+                return Err("prime: disk_gb must be 0 or more".into());
+            }
+        }
+        if let Some(d) = &self.disk {
+            let pct_ok = |v: f64| v.is_finite() && (0.0..=100.0).contains(&v);
+            let non_negative = |v: f64| v.is_finite() && v >= 0.0;
+            if ![d.elevated_free_pct, d.critical_free_pct].into_iter().all(pct_ok) {
+                return Err("disk: elevated_free_pct and critical_free_pct must be between 0 and 100".into());
+            }
+            if ![d.elevated_free_gb, d.critical_free_gb, d.cache_min_free_gb, d.min_age_hours, d.hold_hours].into_iter().all(non_negative) {
+                return Err("disk: GB and hour settings must be 0 or more".into());
+            }
+            if !(1..=16).contains(&d.scan_depth) || !(1..=64).contains(&d.scan_threads) || !(1..=3600).contains(&d.scan_budget_sec) {
+                return Err("disk: scan_depth must be 1 to 16, scan_threads 1 to 64, scan_budget_sec 1 to 3600".into());
+            }
+        }
         let url = self.updates.manifest_url.trim();
         if !url.is_empty() && !url.starts_with("https://") && !url.starts_with("http://") {
             return Err("updates.manifest_url must be empty or start with https://".into());
         }
         Ok(())
+    }
+
+    /// The `[disk]` settings, with the defaults when the table is missing.
+    pub fn disk(&self) -> DiskSettings {
+        self.disk.clone().unwrap_or_default()
     }
 
     /// Groups the engine acts on.
@@ -1363,6 +1478,25 @@ mod tests {
         assert!(cfg.disk.is_some());
         // Typos elsewhere are still caught.
         assert!(config_from_layers(None, "[prime]\ncook = { ram_gb = 32, commit_gb = 48, dsk_gb = 100 }").is_err());
+    }
+
+    #[test]
+    fn disk_settings_are_typed_with_defaults() {
+        let b = Config::builtin();
+        assert_eq!(b.disk(), DiskSettings::default(), "the built-in file matches the struct default");
+        assert_eq!(b.prime.cook.disk_gb, Some(100.0));
+        assert_eq!(b.prime.editor.disk_gb, Some(20.0));
+        let (cfg, _) = config_from_layers(Some("[disk]\ncritical_free_gb = 40\n"), "[disk]\nproject_dirs = ['D:\\s2']\n").unwrap();
+        let d = cfg.disk();
+        assert_eq!(d.critical_free_gb, 40.0);
+        assert_eq!(d.project_dirs, vec![r"D:\s2".to_string()]);
+        assert_eq!(d.elevated_free_gb, 150.0);
+        assert!(config_from_layers(None, "[disk]\ncritical_free_gbb = 40\n").is_err());
+        assert!(config_from_layers(None, "[disk]\nelevated_free_pct = 140\n").is_err());
+        assert!(config_from_layers(None, "[prime]\ncook = { ram_gb = 32, commit_gb = 48, disk_gb = -1 }").is_err());
+        // What this build exports still has the shapes 0.2.1 accepts.
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("disk_gb = 100.0") && text.contains("[disk]"), "{}", text);
     }
 
     #[test]
