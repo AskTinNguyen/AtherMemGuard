@@ -25,7 +25,7 @@ fn gb(bytes: u64) -> f64 {
 
 // ---------------------------------------------------------------- status model
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Level {
     Normal,
@@ -168,6 +168,9 @@ pub struct Status {
     /// Where the RAM in use is.
     pub ram: RamBreakdown,
     pub advice: Vec<String>,
+    /// Free space on the watched drives (set by the CLI, the MCP server and the tray app).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk: Option<crate::disk::DiskBrief>,
     #[serde(skip)]
     pub worker_pids: Vec<(u32, u64)>,
 }
@@ -448,6 +451,7 @@ pub fn analyze_with(cfg: &Config, snap: &Snapshot, cmds: &mut CmdLines) -> Statu
         ram,
         advice,
         worker_pids,
+        disk: None,
     }
 }
 
@@ -621,6 +625,8 @@ pub struct Engine {
     history: History,
     /// The process list of the last tick, for watchers in the tray (the doctor's guard).
     last_procs: Vec<Proc>,
+    /// The latest disk poll (the tray polls every 60 s; the engine never reads disks).
+    disk: Option<crate::disk::DiskBrief>,
 }
 
 impl Engine {
@@ -657,6 +663,7 @@ impl Engine {
             events: Vec::new(),
             history: History::in_memory(),
             last_procs: Vec::new(),
+            disk: None,
         }
     }
 
@@ -675,6 +682,11 @@ impl Engine {
     /// The memory history this engine records.
     pub fn history(&self) -> &History {
         &self.history
+    }
+
+    /// The disk block for status.json, from the tray's 60-second disk poll.
+    pub fn set_disk(&mut self, disk: Option<crate::disk::DiskBrief>) {
+        self.disk = disk;
     }
 
     /// The processes seen by the last `tick`.
@@ -752,6 +764,7 @@ impl Engine {
                 self.auto_prime(reason, &snap, &st);
             }
         }
+        st.disk = self.disk.clone();
         write_status(&st);
         self.last_procs = snap.procs;
         st
@@ -1151,6 +1164,7 @@ mod tests {
             ram: RamBreakdown::default(),
             advice: Vec::new(),
             worker_pids: Vec::new(),
+            disk: None,
         }
     }
 

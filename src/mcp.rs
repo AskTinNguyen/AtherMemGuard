@@ -33,6 +33,8 @@ const HISTORY_MAX_HOURS: f64 = 168.0;
 /// Longer spans are thinned to about this many samples (evenly, always keeping the newest),
 /// so a week of history doesn't flood the agent's context.
 const HISTORY_MAX_SAMPLES: usize = 720;
+const DISK_BUDGET_DEFAULT_SEC: u64 = 60;
+const DISK_BUDGET_MAX_SEC: u64 = 300;
 
 const INSTRUCTIONS: &str = "Ather MemGuard keeps this Windows PC's memory free for Unreal Engine work. \
 Before starting a local Unreal build, cook or packaging run, call memguard_wait with prime: true and the \
@@ -40,7 +42,14 @@ workload (build or cook); start the job only when it returns ready: true. Call m
 -MaxParallelActions for UnrealBuildTool. Call memguard_status when memory looks tight or a build failed \
 with out-of-memory errors. When the person asks what is using memory or how to free more, call memguard_doctor \
 and relay its findings; it changes nothing, and you should ask the person before running `memguard doctor --fix`. \
-When the person asks whether their RAM runs at full speed, call memguard_ram; only the person can change BIOS settings.";
+When the person asks whether their RAM runs at full speed, call memguard_ram; only the person can change BIOS settings. \
+Before a cook, pass disk_path (the project folder) to memguard_wait; if blocked_by contains disk, don't start: call \
+memguard_disk_checkup and relay it in two lines. Every frees number is predicted, not measured: quote only \
+totals[].frees_together_gb or one item's frees_alone_gb, with its confidence word (exact as is, lower_bound as at least, \
+estimate as about, upper_bound as at most) and the word predicted; never add numbers yourself, never present logical_gb as \
+space that can be freed, and never promise the space right after a delete (on ReFS it can take a long time to show up). \
+To check that a set frees enough, call memguard_disk_plan and use free_after_gb, only when exact or lower_bound. Nothing \
+here deletes files: the person removes them. Mention dev:* findings from memguard_disk once and never claim to have fixed them.";
 
 /// Settings source. The real server reads settings.toml on every call (so edits apply
 /// at once); tests pass the built-in defaults.
@@ -50,9 +59,17 @@ pub type ConfigLoader = Box<dyn Fn() -> Config>;
 /// files in the data folder, like `memguard history --json`; tests pass fixed samples.
 pub type HistoryLoader = Box<dyn Fn(Duration) -> Vec<Sample>>;
 
+/// How disk counting runs: the low-priority child process, or in-process in tests.
+pub type ScanRunner = Box<dyn Fn(&crate::disk_scan::ScanJob, crate::disk_scan::Progress) -> Result<crate::disk_scan::ScanOutput, String>>;
+
+/// The latest disk checkup, for `memguard_disk_plan`.
+pub type CheckupLoader = Box<dyn Fn() -> Option<crate::disk_scan::CachedCheckup>>;
+
 pub struct Server {
     load_config: ConfigLoader,
     load_history: HistoryLoader,
+    run_scan: ScanRunner,
+    load_checkup: CheckupLoader,
 }
 
 impl Default for Server {
@@ -72,7 +89,19 @@ struct ToolError(String);
 
 impl Server {
     pub fn new(load_config: ConfigLoader) -> Self {
-        Server { load_config, load_history: Box::new(crate::history::load_since) }
+        Server {
+            load_config,
+            load_history: Box::new(crate::history::load_since),
+            run_scan: Box::new(|job, progress| crate::disk_scan::run_child(job, progress)),
+            load_checkup: Box::new(crate::disk_scan::load_cache),
+        }
+    }
+
+    /// Use another disk counter and checkup store (tests count in-process).
+    pub fn with_disk(mut self, run_scan: ScanRunner, load_checkup: CheckupLoader) -> Self {
+        self.run_scan = run_scan;
+        self.load_checkup = load_checkup;
+        self
     }
 
     /// Use another history source (tests).
@@ -98,6 +127,8 @@ impl Server {
     /// Handle one incoming line. Returns the reply, or `None` for notifications and for
     /// responses the client sends us. Progress notifications go straight to `out`.
     pub fn handle_line<W: Write>(&self, line: &str, out: &mut W) -> io::Result<Option<Value>> {
+        // Some shells put a byte-order mark before the first line they pipe.
+        let line = line.trim_start_matches('\u{feff}');
         let msg: Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(e) => return Ok(Some(error_reply(Value::Null, PARSE_ERROR, &format!("Parse error: {}", e)))),
@@ -183,29 +214,41 @@ impl Server {
                 to_value(&ops::prime(&(self.load_config)(), workload, kill_orphans))
             }
             "memguard_wait" => {
-                check_keys(args, &["workload", "ram_gb", "commit_gb", "timeout_sec", "prime"])?;
+                check_keys(args, &["workload", "ram_gb", "commit_gb", "timeout_sec", "prime", "disk_gb", "disk_path"])?;
                 let workload = workload_arg(args)?;
                 let ram_gb = gb_arg(args, "ram_gb")?;
                 let commit_gb = gb_arg(args, "commit_gb")?;
+                let disk_gb = gb_arg(args, "disk_gb")?;
+                let disk_path = str_arg(args, "disk_path")?;
                 let timeout = timeout_arg(args)?;
                 let prime = bool_arg(args, "prime")?.unwrap_or(false);
-                if workload.is_none() && ram_gb.is_none() && commit_gb.is_none() {
+                if workload.is_none() && ram_gb.is_none() && commit_gb.is_none() && disk_gb.is_none() {
                     return Err(ToolError(
-                        "Say what to wait for: workload (editor, build or cook), or ram_gb / commit_gb.".into(),
+                        "Say what to wait for: workload (editor, build or cook), or ram_gb / commit_gb / disk_gb.".into(),
                     ));
+                }
+                if let Some(p) = &disk_path {
+                    if !std::path::Path::new(p).exists() {
+                        return Err(ToolError(format!("disk_path {} doesn't exist on this PC.", p)));
+                    }
                 }
                 let cfg = (self.load_config)();
                 let base = workload.and_then(|w| cfg.prime.target(w)).unwrap_or(Target { ram_gb: 0.0, commit_gb: 0.0, disk_gb: None });
-                let need = Target { ram_gb: ram_gb.unwrap_or(base.ram_gb), commit_gb: commit_gb.unwrap_or(base.commit_gb), disk_gb: None };
-                if need.ram_gb <= 0.0 && need.commit_gb <= 0.0 {
-                    return Err(ToolError("Nothing to wait for: the RAM and commit needed are both 0.".into()));
+                let need = Target { ram_gb: ram_gb.unwrap_or(base.ram_gb), commit_gb: commit_gb.unwrap_or(base.commit_gb), disk_gb: disk_gb.or(base.disk_gb) };
+                if need.ram_gb <= 0.0 && need.commit_gb <= 0.0 && need.disk_gb.unwrap_or(0.0) <= 0.0 {
+                    return Err(ToolError("Nothing to wait for: the RAM, commit and disk needed are all 0.".into()));
+                }
+                // Disk doesn't free itself: a shortfall returns at once, before priming.
+                let disk = ops::disk_gate(&cfg, disk_path.as_deref(), need.disk_gb);
+                if let Some(checks) = disk.as_ref().filter(|c| c.iter().any(|c| !c.ok)) {
+                    return to_value(&ops::WaitResult::blocked_by_disk(need, checks.clone()));
                 }
                 if prime {
                     ops::prime(&cfg, None, false);
                 }
                 let total = timeout.as_secs_f64();
                 let started = std::time::Instant::now();
-                let result = ops::wait_for(need, timeout, |sys| {
+                let mut result = ops::wait_for(need, timeout, |sys| {
                     if let Some(token) = &progress_token {
                         let note = json!({
                             "jsonrpc": "2.0",
@@ -225,7 +268,45 @@ impl Server {
                         }
                     }
                 });
+                if let Some(checks) = disk {
+                    result.set_disk(checks);
+                }
                 to_value(&result)
+            }
+            // ---- Disk and Dev Drive (report only; nothing here deletes or moves anything)
+            "memguard_disk" => {
+                check_keys(args, &["refresh"])?;
+                let refresh = bool_arg(args, "refresh")?.unwrap_or(false);
+                to_value(&crate::disk::report(&(self.load_config)(), refresh))
+            }
+            "memguard_disk_checkup" => {
+                check_keys(args, &["path", "refresh", "budget_sec"])?;
+                let path = str_arg(args, "path")?;
+                let refresh = bool_arg(args, "refresh")?.unwrap_or(false);
+                let budget = match args.get("budget_sec") {
+                    None | Some(Value::Null) => DISK_BUDGET_DEFAULT_SEC,
+                    Some(v) => match v.as_f64() {
+                        Some(n) if n.is_finite() && n >= 1.0 => (n.round() as u64).min(DISK_BUDGET_MAX_SEC),
+                        _ => return Err(ToolError("budget_sec must be a number of seconds, 1 or more (at most 300).".into())),
+                    },
+                };
+                let cfg = (self.load_config)();
+                let mut note = progress_writer(&progress_token, out, budget as f64, "Counting");
+                crate::disk_scan::checkup(&cfg, path.as_deref(), refresh, Some(budget), &*self.run_scan, &mut note).map_err(ToolError).and_then(|c| to_value(&c))
+            }
+            "memguard_disk_plan" => {
+                check_keys(args, &["ids"])?;
+                let ids: Vec<String> = match args.get("ids") {
+                    None | Some(Value::Null) => Vec::new(),
+                    Some(Value::Array(a)) if a.iter().all(Value::is_string) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+                    Some(_) => return Err(ToolError("ids must be a list of item ids from memguard_disk_checkup, like [\"d1\", \"d7\"].".into())),
+                };
+                let cfg = (self.load_config)();
+                let mut note = progress_writer(&progress_token, out, 300.0, "Counting");
+                let cache = (self.load_checkup)().ok_or_else(|| {
+                    ToolError("Call memguard_disk_checkup first: a plan uses the item ids of the latest checkup.".into())
+                })?;
+                crate::disk_scan::plan_from(&cfg, &cache, &ids, &*self.run_scan, &mut note).map_err(ToolError)
             }
             "memguard_advise" => {
                 check_keys(args, &[])?;
@@ -266,6 +347,7 @@ pub fn run_stdio() -> io::Result<()> {
 pub fn current_status(cfg: &Config) -> Status {
     let mut st = analyze(cfg, &snapshot());
     st.daemon = win::instance_running(paths::mutex());
+    st.disk = crate::disk::status_brief(cfg);
     // Paused / suspended state only the background app knows: take it from its last report.
     if st.daemon {
         if let Ok(text) = std::fs::read_to_string(paths::status_file()) {
@@ -352,6 +434,30 @@ fn gb_arg(args: &Map<String, Value>, key: &str) -> Result<Option<f64>, ToolError
             Some(n) if n.is_finite() && n >= 0.0 => Ok(Some(n)),
             _ => Err(ToolError(format!("{} must be a number of GB, 0 or more.", key))),
         },
+    }
+}
+
+fn str_arg(args: &Map<String, Value>, key: &str) -> Result<Option<String>, ToolError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
+        Some(_) => Err(ToolError(format!("{} must be a folder path as a string.", key))),
+    }
+}
+
+/// Progress notifications for a disk count, when the client sent a progress token.
+fn progress_writer<'a, W: Write>(token: &'a Option<Value>, out: &'a mut W, total: f64, what: &'a str) -> impl FnMut(u64, f64) + 'a {
+    move |files, secs| {
+        if let Some(token) = token {
+            let note = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": { "progressToken": token, "progress": secs.min(total), "total": total, "message": format!("{}: {} files", what, files) }
+            });
+            if let Err(e) = write_message(out, &note) {
+                eprintln!("memguard mcp: could not send progress: {}", e);
+            }
+        }
     }
 }
 
@@ -448,7 +554,9 @@ and show memguard_status rather than starting anyway. Give either `workload` or 
                     "ram_gb": { "type": "number", "minimum": 0, "description": "Free RAM needed, in GB. Overrides the workload's figure." },
                     "commit_gb": { "type": "number", "minimum": 0, "description": "Free commit charge needed, in GB. Overrides the workload's figure." },
                     "timeout_sec": { "type": "integer", "minimum": 0, "maximum": WAIT_MAX_SEC, "default": WAIT_DEFAULT_SEC, "description": "Give up after this many seconds. At most 3600." },
-                    "prime": { "type": "boolean", "default": false, "description": "Free RAM once (like memguard_prime) before waiting. Recommended before a build or cook." }
+                    "prime": { "type": "boolean", "default": false, "description": "Free RAM once (like memguard_prime) before waiting. Recommended before a build or cook." },
+                    "disk_gb": { "type": "number", "minimum": 0, "description": "Free disk space needed on the project's drive, in GB. Overrides the workload's disk_gb. The drives holding Unreal's DDC, Zen and TEMP are checked against [disk] cache_min_free_gb too." },
+                    "disk_path": { "type": "string", "description": "The project folder whose drive needs the space, e.g. D:\\s2. Default: the server's current folder." }
                 },
                 "additionalProperties": false
             },
@@ -509,6 +617,58 @@ settings, so never claim to have changed anything, and don't paraphrase the step
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             "annotations": { "readOnlyHint": true, "openWorldHint": false },
         }),
+        // ---- Disk and Dev Drive (report only)
+        json!({
+            "name": "memguard_disk",
+            "title": "Drives and Dev Drive",
+            "description": "Read-only. Every drive once (by volume id): free space available to this user, level \
+(normal, elevated, critical: below the smaller of the GB and percent settings), roles (dev_drive, system, pagefile, \
+projects, ddc, zen, temp), Dev Drive and trusted state, block cloning, plus Dev Drive health findings (dev:not_trusted, \
+dev:perf_mode_off, dev:av_disallowed, dev:caches_on_c, dev:vhd_host_low, dev:third_party_av) with the exact admin \
+command and how to check it. Fast: no folder is counted. Mention dev:* findings once; never claim to have fixed one.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "refresh": { "type": "boolean", "default": false, "description": "Read the Defender and Dev Drive facts again instead of today's saved ones." } },
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false },
+        }),
+        json!({
+            "name": "memguard_disk_checkup",
+            "title": "Disk checkup",
+            "description": "Read-only and report-only: what could go from a drive and what removing it would really free, \
+counted without double counting (block clones, hard links, nested folders). Items: project build files, caches, logs, \
+lanes and worktrees, with ids d1, d2, ... Numbers: logical_gb (holds), footprint_gb (occupies), frees_alone_gb with \
+frees_confidence (exact, lower_bound = at least, estimate = about, upper_bound = at most, unknown) and \
+frees_basis: predicted. Quote only totals[].frees_together_gb or one item's frees_alone_gb, with its confidence word, \
+and say it is predicted; never add numbers yourself and never present logical_gb as space that can be freed. Answers \
+from the saved result (with its age) unless refresh is true. Deletes nothing.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Only this folder: a project, a lane, or a folder of them. Default: the configured project folders, projects on Dev Drives and the shared caches." },
+                    "refresh": { "type": "boolean", "default": false, "description": "Count again instead of answering from the saved result." },
+                    "budget_sec": { "type": "integer", "minimum": 1, "maximum": DISK_BUDGET_MAX_SEC, "default": DISK_BUDGET_DEFAULT_SEC, "description": "How long counting may take, in seconds. At most 300. Items not finished are lower_bound." }
+                },
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false },
+        }),
+        json!({
+            "name": "memguard_disk_plan",
+            "title": "Disk plan",
+            "description": "Read-only. Counts exactly the items you name (ids from the latest memguard_disk_checkup) \
+again, fresh, and returns per drive frees_together_gb (counted once across the set), free_now_gb and free_after_gb, \
+all predicted. Use it to decide whether removing a set makes enough room for a job; rely only on exact or lower_bound. \
+On ReFS, deleted space can take a long time to show up as free: never promise the space right after a delete. \
+Ather MemGuard deletes nothing; the person removes the folders (or runs git worktree remove for a lane).",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "ids": { "type": "array", "items": { "type": "string" }, "description": "Item ids from the latest disk checkup, e.g. [\"d7\", \"d9\"]. Empty = all of them." } },
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false },
+        }),
     ]
 }
 
@@ -534,7 +694,8 @@ pub fn agent_setup_text(exe: &std::path::Path) -> String {
         s.push('\n');
     };
     line("Ather MemGuard for AI agents: an MCP server your agent starts by itself (no port, nothing to enable).");
-    line("Tools: memguard_status, memguard_prime, memguard_wait, memguard_advise, memguard_doctor, memguard_history, memguard_ram.");
+    line("Tools: memguard_status, memguard_prime, memguard_wait, memguard_advise, memguard_doctor, memguard_history, memguard_ram,");
+    line("       memguard_disk, memguard_disk_checkup, memguard_disk_plan.");
     line("");
     line("Claude Code, for all your projects:");
     line(&format!("  claude mcp add --scope user ather-memguard -- \"{}\" mcp", exe));
@@ -624,7 +785,13 @@ mod tests {
         let r = one(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#);
         let tools = r["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["memguard_status", "memguard_prime", "memguard_wait", "memguard_advise", "memguard_doctor", "memguard_history", "memguard_ram"]);
+        assert_eq!(
+            names,
+            ["memguard_status", "memguard_prime", "memguard_wait", "memguard_advise", "memguard_doctor", "memguard_history", "memguard_ram", "memguard_disk", "memguard_disk_checkup", "memguard_disk_plan"]
+        );
+        for t in tools.iter().filter(|t| t["name"].as_str().unwrap().starts_with("memguard_disk")) {
+            assert_eq!(t["annotations"]["readOnlyHint"], true, "{}", t["name"]);
+        }
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
             assert!(t["inputSchema"]["properties"].is_object());
@@ -710,6 +877,63 @@ mod tests {
         assert!(d.contains("headline") && d.contains("only the person can change BIOS"), "{}", d);
         let t = tool_error_text(&one(&call(19, "memguard_ram", json!({ "apply": true }))));
         assert!(t.contains("apply"), "{}", t);
+    }
+
+    // ---- Disk: read-only. The checkup counts a small tree this test creates, in-process.
+    #[test]
+    fn disk_tools_over_stdio() {
+        let root = std::env::temp_dir().join(format!("amg-mcp-disk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(r"Game\Intermediate")).unwrap();
+        std::fs::write(root.join(r"Game\Game.uproject"), b"{}").unwrap();
+        std::fs::write(root.join(r"Game\Intermediate\x.bin"), vec![3u8; 200_000]).unwrap();
+        let srv = server().with_disk(
+            Box::new(|job, p| Ok(crate::disk_scan::run_job(job, p))),
+            Box::new(|| None),
+        );
+        let run = |line: &str| -> Vec<Value> {
+            let mut out = Vec::new();
+            srv.serve(line.as_bytes(), &mut out).unwrap();
+            String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+        };
+        // memguard_disk
+        let r = run(&call(1, "memguard_disk", json!({})));
+        let s = &r[0]["result"]["structuredContent"];
+        assert_eq!(r[0]["result"]["isError"], false, "{}", r[0]);
+        assert!(s["volumes"].as_array().unwrap().iter().any(|v| v["free_basis"] == "available_to_caller"));
+        assert!(s["dev_drive"]["av_filters"].is_string());
+        // memguard_disk_checkup on the test tree, with progress allowed
+        let req = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "memguard_disk_checkup", "arguments": { "path": root.display().to_string(), "refresh": true, "budget_sec": 30 }, "_meta": { "progressToken": "d" } } });
+        let out = run(&req.to_string());
+        let reply = out.iter().find(|m| m.get("id").is_some()).unwrap();
+        assert_eq!(reply["result"]["isError"], false, "{}", reply);
+        let c = &reply["result"]["structuredContent"];
+        assert_eq!(c["basis"], "predicted");
+        assert_eq!(c["items"][0]["key"], "ue:intermediate");
+        assert_eq!(c["items"][0]["frees_basis"], "predicted");
+        assert!(c["do_not_sum"].as_str().unwrap().contains("never promise"));
+        // memguard_disk_plan without a saved checkup is a tool error that says what to do
+        let t = tool_error_text(&run(&call(3, "memguard_disk_plan", json!({ "ids": ["d1"] })))[0]);
+        assert!(t.contains("memguard_disk_checkup"), "{}", t);
+        tool_error_text(&run(&call(4, "memguard_disk_plan", json!({ "ids": "d1" })))[0]);
+        tool_error_text(&run(&call(5, "memguard_disk_checkup", json!({ "budget_sec": 0 })))[0]);
+        tool_error_text(&run(&call(6, "memguard_disk", json!({ "clean": true })))[0]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The wait gate: a disk need nobody can meet returns at once, blocked by disk.
+    #[test]
+    fn wait_blocked_by_disk_returns_at_once() {
+        let started = std::time::Instant::now();
+        let r = one(&call(20, "memguard_wait", json!({ "disk_gb": 1.0e9, "disk_path": std::env::temp_dir().display().to_string(), "timeout_sec": 600 })));
+        let s = &r["result"]["structuredContent"];
+        assert_eq!(r["result"]["isError"], false, "{}", r);
+        assert_eq!(s["ready"], false);
+        assert_eq!(s["blocked_by"], json!(["disk"]));
+        assert!(s["disk_free_gb"].is_number() && s["need_disk_gb"] == 1.0e9);
+        assert!(started.elapsed() < Duration::from_secs(20));
+        tool_error_text(&one(&call(21, "memguard_wait", json!({ "disk_gb": 10, "disk_path": r"Q:\no\such\folder" }))));
     }
 
     fn sample(unix: i64) -> Sample {

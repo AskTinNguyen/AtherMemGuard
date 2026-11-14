@@ -1,0 +1,125 @@
+# What the disk checkup looks for. Report only: Ather MemGuard never deletes or moves these.
+#
+# class: regenerable  Unreal or the tool rebuilds it
+#        disposable   not rebuilt, but not needed
+#        rebuild_cost rebuilt, but it takes long (hours of shader or cook work)
+#        review       your call (lanes, worktrees, the git LFS store)
+#
+# [[project]] paths are relative to an Unreal project root (the folder with the .uproject).
+# [[global]] paths start with an environment variable.
+
+[[project]]
+key = "ue:intermediate"
+class = "regenerable"
+title = "Build files (Intermediate)"
+path = 'Intermediate'
+
+[[project]]
+key = "ue:plugin_intermediate"
+class = "regenerable"
+title = "Plugin build files"
+plugins = true
+path = 'Intermediate'
+
+[[project]]
+key = "ue:ddc"
+class = "regenerable"
+title = "Project cache (DDC)"
+path = 'DerivedDataCache'
+
+[[project]]
+key = "ue:crashes"
+class = "regenerable"
+title = "Crash reports"
+path = 'Saved\Crashes'
+
+[[project]]
+key = "ue:shader_debug"
+class = "regenerable"
+title = "Shader debug files"
+path = 'Saved\ShaderDebugInfo'
+
+[[project]]
+key = "ue:logs"
+class = "disposable"
+title = "Logs"
+path = 'Saved\Logs'
+
+[[project]]
+key = "ue:cooked"
+class = "rebuild_cost"
+title = "Cooked content"
+path = 'Saved\Cooked'
+
+[[project]]
+key = "ue:staged"
+class = "rebuild_cost"
+title = "Staged builds"
+path = 'Saved\StagedBuilds'
+
+[[project]]
+key = "git:lfs"
+class = "review"
+title = "Git LFS store"
+path = '.git\lfs\objects'
+
+[[global]]
+key = "ue:global_ddc"
+class = "rebuild_cost"
+title = "Unreal's shared cache (DDC)"
+path = '%DDC%'
+
+[[global]]
+key = "ue:zen"
+class = "rebuild_cost"
+title = "Unreal's Zen cache"
+path = '%ZEN%'
+
+[[global]]
+key = "temp:old"
+class = "disposable"
+title = "Temporary files older than 7 days"
+path = '%TEMP%'
+older_than_days = 7
+
+[[global]]
+key = "cache:npm"
+class = "regenerable"
+title = "npm cache"
+path = '%LOCALAPPDATA%\npm-cache\_cacache'
+
+[[global]]
+key = "cache:pip"
+class = "regenerable"
+title = "pip cache"
+path = '%LOCALAPPDATA%\pip\cache'
+
+[[global]]
+key = "cache:uv"
+class = "regenerable"
+title = "uv cache"
+path = '%LOCALAPPDATA%\uv\cache'
+
+[[global]]
+key = "cache:nuget_http"
+class = "regenerable"
+title = "NuGet download cache"
+path = '%LOCALAPPDATA%\NuGet\v3-cache'
+
+[[global]]
+key = "sys:crashdumps"
+class = "regenerable"
+title = "Crash dumps"
+path = '%LOCALAPPDATA%\CrashDumps'
+
+[[global]]
+key = "gpu:d3dscache"
+class = "regenerable"
+title = "DirectX shader cache"
+path = '%LOCALAPPDATA%\D3DSCache'
+
+[[global]]
+key = "gpu:nv_dxcache"
+class = "regenerable"
+title = "NVIDIA shader cache"
+path = '%LOCALAPPDATA%\NVIDIA\DXCache'

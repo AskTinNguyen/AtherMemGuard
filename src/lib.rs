@@ -14,9 +14,17 @@
 //! - `updater` check, download, verify and swap in a new version
 //! - `ramcheck` RAM and BIOS check: memory below its rated speed, slots, BIOS age (Part G)
 //! - `smbios`  reading and parsing the firmware SMBIOS tables (Part G)
+//! - `disk`    disk headroom, Dev Drive health and the wait gate
+//! - `disk_space` space accounting without double counting (pure)
+//! - `disk_scan` the report-only disk checkup and plan, scanned in a low-priority child
+//! - `disk_win` volumes, FSCTLs and the read-only scanner
 
 pub mod breakdown;
 pub mod config;
+pub mod disk; // disk headroom and Dev Drive health
+pub mod disk_scan; // the disk checkup and plan (report only)
+pub mod disk_space; // space accounting without double counting (pure)
+pub mod disk_win;
 pub mod doctor;
 pub mod drivers; // which drivers and Windows processes hold the "Windows and drivers" RAM
 mod doctor_win;

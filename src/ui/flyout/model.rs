@@ -100,6 +100,9 @@ pub struct FlyoutData {
     /// One muted line above the buttons (at most two lines when painted).
     pub advice: Option<String>,
     pub paused: bool,
+    /// "D: Dev Drive · 370 GB free", from the tray's 60-second disk poll; coloured when low.
+    pub disk: Option<String>,
+    pub disk_color: Rgb,
     /// For the row menus: every group's name, the biggest other apps (exe, GB) and whether
     /// Unreal is running.
     pub group_names: Vec<String>,
@@ -213,6 +216,7 @@ impl FlyoutData {
         // The engine's own "Memory is critical" line says the box's numbers again: it gives way.
         let engine_advice = || st.advice.iter().find(|a| fix.is_none() || !a.starts_with("Memory is critical")).cloned();
         let advice = if st.paused { pause_note.or_else(engine_advice) } else { engine_advice() };
+        let disk_line = st.disk.as_ref().and_then(crate::disk::brief_line);
         FlyoutData {
             eyebrow: mode_words(&st.mode).to_uppercase(),
             headline,
@@ -233,6 +237,12 @@ impl FlyoutData {
             },
             advice,
             paused: st.paused,
+            disk: disk_line.as_ref().map(|d| d.0.clone()),
+            disk_color: match disk_line.map(|d| d.1) {
+                Some(Level::Critical) => ERROR,
+                Some(Level::Elevated) => WARN,
+                _ => MUTED,
+            },
             group_names: st.groups.iter().map(|g| g.name.clone()).collect(),
             top_apps: br.top_apps.iter().filter(|a| a.ram_gb >= 0.1).map(|a| (a.name.clone(), a.ram_gb)).collect(),
             ue_running,

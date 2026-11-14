@@ -49,6 +49,8 @@ pub struct Layout {
     pub commit: (Rect, Rect),
     pub commit_hint: Rect,
     pub commit_hint_lines: Vec<String>,
+    /// The disk line under the commit hint, when the tray has polled the drives.
+    pub disk: Option<Rect>,
     pub actions_band: Rect,
     pub buttons: [Rect; 3],
 }
@@ -197,7 +199,14 @@ pub fn layout(c: &Canvas, d: &FlyoutData) -> Layout {
     let commit_hint_lines = c.wrap_lines(COMMIT_HINT, F_READ_SMALL, inner, 3);
     let sh = c.line_height(F_READ_SMALL);
     let commit_hint = Rect::new(pad, y, inner, sh * commit_hint_lines.len() as i32);
-    y += commit_hint.h + c.s(14.0);
+    y += commit_hint.h;
+    let disk = d.disk.as_ref().map(|_| {
+        y += c.s(8.0);
+        let r = Rect::new(pad, y, inner, c.line_height(F_HINT));
+        y += r.h;
+        r
+    });
+    y += c.s(14.0);
 
     let band_top = y;
     let bh = c.s(34.0);
@@ -237,6 +246,7 @@ pub fn layout(c: &Canvas, d: &FlyoutData) -> Layout {
         commit: (commit_label, commit_bar),
         commit_hint,
         commit_hint_lines,
+        disk,
         actions_band: Rect::new(0, band_top, w, height - band_top),
         buttons,
     }
@@ -436,6 +446,9 @@ pub fn paint(c: &mut Canvas, d: &FlyoutData, mouse: Option<Pt>, focus: Option<Ta
     c.text(label, &d.commit.value, F_METER_VALUE, TEXT, Align::Right);
     paint_bar(c, bar, d.commit.frac, d.commit.color);
     paint_lines(c, l.commit_hint, &l.commit_hint_lines, F_READ_SMALL, MUTED);
+    if let (Some(r), Some(text)) = (l.disk, &d.disk) {
+        paint_lines(c, r, std::slice::from_ref(text), F_HINT, d.disk_color);
+    }
 
     c.fill_rect(l.actions_band, SURFACE);
     c.hline(0, l.actions_band.y, l.width, BORDER);
@@ -556,6 +569,7 @@ mod tests {
                 assert_eq!(l.width, scale.s(WIDTH));
                 let mut rects = vec![l.eyebrow, l.headline, l.ram_label, l.ram_bar, l.ue_band, l.ue_title, l.checkup, l.commit.0, l.commit.1, l.commit_hint, l.actions_band];
                 rects.extend(l.rows.iter().flat_map(|(_, n, v)| [*n, *v]));
+                rects.extend(l.disk);
                 rects.extend(l.buttons);
                 rects.extend(l.advice);
                 rects.extend(l.ue_detail);

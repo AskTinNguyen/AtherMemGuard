@@ -88,6 +88,10 @@ pub fn sample_status() -> Status {
         ram: sample_breakdown(),
         advice: Vec::new(),
         worker_pids: Vec::new(),
+        disk: Some(crate::disk::DiskBrief {
+            level: Level::Normal,
+            volumes: vec![crate::disk::BriefVolume { volume: "D:".into(), free_gb: 369.5, free_pct: 19.4, level: Level::Normal, roles: vec!["dev_drive".into(), "projects".into()] }],
+        }),
     }
 }
 

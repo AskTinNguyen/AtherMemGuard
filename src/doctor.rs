@@ -553,7 +553,47 @@ pub fn scan(cfg: &Config) -> Report {
     // The RAM check reads firmware tables, so it runs once per process (`check_cached`).
     // Only reading here: the "Show me how" page is written when the person clicks it.
     add_ram_findings(&mut report, cfg.general.check_ram_speed, crate::ramcheck::check_cached);
+    add_disk_findings(&mut report, cfg);
     report
+}
+
+/// THIS PC rows for drives: low free space on a watched drive (`disk:low:<drive>`) and the
+/// Dev Drive health findings (`dev:*`). Reads volumes and the day's Defender facts; walks no
+/// folders (the disk checkup does that, in its own process).
+pub fn add_disk_findings(report: &mut Report, cfg: &Config) {
+    let s = cfg.disk();
+    if !s.enabled && !s.check_dev_drive {
+        return;
+    }
+    let vols = crate::disk::read_volumes(cfg, &crate::disk::DiskWatch::default());
+    let dev = if s.check_dev_drive { Some(crate::disk::dev_drive_state(false)) } else { None };
+    let caches = crate::disk_scan::cached_system_caches();
+    report.findings.extend(disk_findings(&vols, dev.as_ref(), caches.as_ref(), cfg));
+}
+
+/// The drive rows, pure: what `add_disk_findings` appends.
+pub fn disk_findings(vols: &[crate::disk::Volume], dev: Option<&crate::disk::DevDriveState>, caches: Option<&crate::disk::CachesOnSystem>, cfg: &Config) -> Vec<Finding> {
+    use crate::engine::Level;
+    let s = cfg.disk();
+    let mut out = Vec::new();
+    if s.enabled {
+        for v in vols.iter().filter(|v| crate::disk::is_watched(v, &s) && v.level > Level::Normal) {
+            if let Some((title, detail)) = crate::disk::level_change_words(v, Level::Normal, v.level, cfg.prime.cook.disk_gb) {
+                let id = format!("disk:low:{}", slug(v.name().trim_end_matches(':')));
+                out.push(Finding::new(id, FindingKind::System, Verdict::Review, title, detail));
+            }
+        }
+    }
+    if let Some(dev) = dev {
+        for f in crate::disk::dev_findings(vols, dev, caches, &s) {
+            let mut detail = f.detail.clone();
+            if let Some(fix) = &f.fix {
+                detail.push_str(&format!(" {}: {} Check: {}.", if fix.needs_admin { "Fix, as administrator" } else { "Fix" }, fix.command, fix.check));
+            }
+            out.push(Finding::new(f.id, FindingKind::System, Verdict::Review, f.title, detail));
+        }
+    }
+    out
 }
 
 /// Is this a THIS PC row from the RAM and BIOS check?
