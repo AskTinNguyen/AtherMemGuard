@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde::Serialize;
 
-use crate::config::{any_matches, limit_mb, scale_soft_cap, Config, Cpu, Group, MemPriority, Policy, Preset};
+use crate::config::{any_matches, limit_mb, scale_soft_cap, Config, Cpu, Group, MemPriority, Patterns, Policy, Preset};
 use crate::history::History;
 use crate::win::{self, Proc, SysInfo};
 
@@ -247,22 +247,35 @@ pub fn is_protected(cfg: &Config, p: &Proc) -> bool {
 }
 
 pub fn analyze(cfg: &Config, snap: &Snapshot) -> Status {
+    // Each pattern list and each process name is lowercased once per call, not once per
+    // comparison.
+    let protect = Patterns::new(&cfg.ue.protect);
+    let workers = Patterns::new(&cfg.ue.workers);
+    let me = win::current_pid();
+    let lowers: Vec<String> = snap.procs.iter().map(|p| p.name.to_ascii_lowercase()).collect();
+    let protected: Vec<bool> = snap
+        .procs
+        .iter()
+        .zip(&lowers)
+        .map(|(p, lower)| p.pid == me || lower.contains("memguard") || protect.matches_lower(lower))
+        .collect();
+
     let mut act = Activities::default();
     let mut ue = UeStatus::default();
     let mut worker_pids = Vec::new();
     let (mut ue_committed, mut ue_ram, mut workers_committed) = (0u64, 0u64, 0u64);
     let mut git_count = 0usize;
 
-    for p in &snap.procs {
-        let lower = p.name.to_ascii_lowercase();
+    for (p, lower) in snap.procs.iter().zip(&lowers) {
+        let lower = lower.as_str();
         if lower == "git" {
             git_count += 1;
         }
-        if any_matches(&cfg.ue.protect, &p.name) {
+        if protect.matches_lower(lower) {
             ue_committed += p.committed;
             ue_ram += p.ram;
         }
-        if any_matches(&cfg.ue.workers, &p.name) {
+        if workers.matches_lower(lower) {
             ue.workers += 1;
             workers_committed += p.committed;
             worker_pids.push((p.pid, p.created));
@@ -312,11 +325,14 @@ pub fn analyze(cfg: &Config, snap: &Snapshot) -> Status {
     let groups: Vec<GroupStatus> = cfg
         .active_groups()
         .map(|g| {
+            let pats = Patterns::new(&g.processes);
             // Processes we can't open can't be trimmed or re-prioritized: they don't count.
             let members: Vec<&Proc> = snap
                 .procs
                 .iter()
-                .filter(|p| p.queryable && any_matches(&g.processes, &p.name) && !is_protected(cfg, p))
+                .enumerate()
+                .filter(|&(i, p)| p.queryable && !protected[i] && pats.matches_lower(&lowers[i]))
+                .map(|(_, p)| p)
                 .collect();
             GroupStatus {
                 name: g.name.clone(),

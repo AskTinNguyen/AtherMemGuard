@@ -607,6 +607,37 @@ pub fn any_matches(patterns: &[String], name: &str) -> bool {
     patterns.iter().any(|p| name_matches(p, name))
 }
 
+/// A pattern list lowercased once, for matching many process names: the same rules as
+/// `name_matches`, without lowercasing both sides on every comparison.
+#[derive(Debug, Clone, Default)]
+pub struct Patterns {
+    exact: Vec<String>,
+    prefixes: Vec<String>,
+}
+
+impl Patterns {
+    pub fn new(patterns: &[String]) -> Patterns {
+        let mut out = Patterns::default();
+        for p in patterns {
+            let p = p.to_ascii_lowercase();
+            match p.strip_suffix('*') {
+                Some(prefix) => out.prefixes.push(prefix.to_string()),
+                None => out.exact.push(p),
+            }
+        }
+        out
+    }
+
+    /// Does `lower_name` (already ASCII-lowercased) match any pattern?
+    pub fn matches_lower(&self, lower_name: &str) -> bool {
+        self.exact.iter().any(|p| p == lower_name) || self.prefixes.iter().any(|p| lower_name.starts_with(p.as_str()))
+    }
+
+    pub fn matches(&self, name: &str) -> bool {
+        self.matches_lower(&name.to_ascii_lowercase())
+    }
+}
+
 // ---------------------------------------------------------------- layering
 
 /// Where a value comes from.
@@ -1290,6 +1321,22 @@ mod tests {
         assert!(name_matches("cl", "CL"));
         assert!(!name_matches("cl", "clang-cl"));
         assert!(name_matches("Wispr Flow", "wispr flow"));
+    }
+
+    #[test]
+    fn precompiled_patterns_match_like_name_matches() {
+        let list: Vec<String> =
+            ["UnrealEditor*", "CL", "Wispr Flow", "MsEdge", "*", "ShaderCompileWorker"].iter().map(|s| s.to_string()).collect();
+        let pats = Patterns::new(&list);
+        let names = ["unrealeditor-cmd", "UNREALEDITOR", "cl", "Cl", "clang-cl", "WISPR FLOW", "msedge", "MSEDGEwebview2", "", "shadercompileworker"];
+        for n in names {
+            assert_eq!(pats.matches(n), any_matches(&list, n), "{}", n);
+            assert_eq!(pats.matches_lower(&n.to_ascii_lowercase()), any_matches(&list, n), "{}", n);
+        }
+        let mixed = Patterns::new(&["MsEdge".to_string(), "Discord*".to_string()]);
+        assert!(mixed.matches("msedge") && mixed.matches("MSEDGE") && mixed.matches("discordPTB"));
+        assert!(!mixed.matches("msedgewebview2") && !mixed.matches("Disc"));
+        assert!(!Patterns::new(&[]).matches("anything"));
     }
 
     #[test]

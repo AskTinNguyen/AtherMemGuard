@@ -6,7 +6,7 @@
 
 use std::time::Instant;
 
-use athermemguard::config::{any_matches, Config};
+use athermemguard::config::{any_matches, Config, Patterns};
 use athermemguard::engine::{self, Snapshot};
 use athermemguard::win;
 
@@ -58,4 +58,22 @@ fn main() {
         std::hint::black_box(n);
     });
     println!("name matching (as before) {:8.3} ms", ms);
+
+    // The same with each pattern list and name lowercased once (what analyze does now).
+    let ms = median_ms(iters, || {
+        let protect = Patterns::new(&cfg.ue.protect);
+        let workers = Patterns::new(&cfg.ue.workers);
+        let groups: Vec<Patterns> = cfg.active_groups().map(|g| Patterns::new(&g.processes)).collect();
+        let mut n = 0usize;
+        for p in &procs {
+            let lower = p.name.to_ascii_lowercase();
+            let protected = lower.contains("memguard") || protect.matches_lower(&lower);
+            n += protect.matches_lower(&lower) as usize + workers.matches_lower(&lower) as usize;
+            for g in &groups {
+                n += (g.matches_lower(&lower) && !protected) as usize;
+            }
+        }
+        std::hint::black_box(n);
+    });
+    println!("name matching (once)      {:8.3} ms", ms);
 }
