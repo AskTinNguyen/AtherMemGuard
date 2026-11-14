@@ -48,8 +48,13 @@ memguard_disk_checkup and relay it in two lines. Every frees number is predicted
 totals[].frees_together_gb or one item's frees_alone_gb, with its confidence word (exact as is, lower_bound as at least, \
 estimate as about, upper_bound as at most) and the word predicted; never add numbers yourself, never present logical_gb as \
 space that can be freed, and never promise the space right after a delete (on ReFS it can take a long time to show up). \
-To check that a set frees enough, call memguard_disk_plan and use free_after_gb, only when exact or lower_bound. Nothing \
-here deletes files: the person removes them. Mention dev:* findings from memguard_disk once and never claim to have fixed them.";
+To check that a set frees enough, call memguard_disk_plan and use free_after_gb, only when exact or lower_bound. \
+memguard_disk_clean is the only tool that deletes: prefer it only for regenerable build output and caches (Intermediate, \
+DerivedDataCache, crash and shader debug files, tool caches), only on ids from a memguard_disk_plan you made less than 10 \
+minutes before, and always tell the person what you deleted (titles and paths) and the predicted frees. Its measured \
+result comes later, in memguard_disk recent_cleanups: report that as measured, never earlier. Moves to the bin, tool \
+cleans, logs, cooked output and the shared caches are the person's call (memguard disk clean --fix); lanes and worktrees \
+are never deleted by Ather MemGuard. Mention dev:* findings from memguard_disk once and never claim to have fixed them.";
 
 /// Settings source. The real server reads settings.toml on every call (so edits apply
 /// at once); tests pass the built-in defaults.
@@ -70,6 +75,10 @@ pub struct Server {
     load_history: HistoryLoader,
     run_scan: ScanRunner,
     load_checkup: CheckupLoader,
+    /// Where plans, the undo log and the measured watches are kept.
+    disk_files: crate::disk_clean::DiskFiles,
+    /// How `memguard_disk_clean` acts (tests: no waiting, no watcher, fixed Unreal facts).
+    clean_opts: crate::disk_clean::CleanOpts,
 }
 
 impl Default for Server {
@@ -94,7 +103,16 @@ impl Server {
             load_history: Box::new(crate::history::load_since),
             run_scan: Box::new(|job, progress| crate::disk_scan::run_child(job, progress)),
             load_checkup: Box::new(crate::disk_scan::load_cache),
+            disk_files: crate::disk_clean::DiskFiles::default(),
+            clean_opts: crate::disk_clean::CleanOpts { agent: true, presample_secs: 5, start_watcher: true, ..Default::default() },
         }
+    }
+
+    /// Keep plans, the undo log and watches in `files`, and clean with `opts` (tests).
+    pub fn with_clean(mut self, files: crate::disk_clean::DiskFiles, opts: crate::disk_clean::CleanOpts) -> Self {
+        self.disk_files = files;
+        self.clean_opts = crate::disk_clean::CleanOpts { agent: true, ..opts };
+        self
     }
 
     /// Use another disk counter and checkup store (tests count in-process).
@@ -306,7 +324,32 @@ impl Server {
                 let cache = (self.load_checkup)().ok_or_else(|| {
                     ToolError("Call memguard_disk_checkup first: a plan uses the item ids of the latest checkup.".into())
                 })?;
-                crate::disk_scan::plan_from(&cfg, &cache, &ids, &*self.run_scan, &mut note).map_err(ToolError)
+                let (v, rec) = crate::disk_scan::plan_record(&cfg, &cache, &ids, None, &*self.run_scan, &mut note).map_err(ToolError)?;
+                if let Err(e) = self.disk_files.save_plan(&rec) {
+                    eprintln!("memguard mcp: could not save the plan: {}", e);
+                }
+                Ok(v)
+            }
+            // ---- The one tool that deletes: regenerable items of a fresh plan, rules re-checked now.
+            "memguard_disk_clean" => {
+                check_keys(args, &["ids", "plan_id"])?;
+                let ids: Vec<String> = match args.get("ids") {
+                    Some(Value::Array(a)) if !a.is_empty() && a.iter().all(Value::is_string) => a.iter().filter_map(|v| v.as_str().map(|s| s.trim().to_string())).collect(),
+                    _ => return Err(ToolError("ids must be a non-empty list of item ids from your memguard_disk_plan, like [\"d1\", \"d2\"].".into())),
+                };
+                let plan_id = str_arg(args, "plan_id")?;
+                let plans = self.disk_files.plans();
+                let plan = crate::disk_clean::plan_for_agent(&plans, plan_id.as_deref(), &ids, crate::disk_clean::unix_now()).map_err(ToolError)?;
+                let picks: Vec<(String, Option<crate::disk_clean::CleanAction>)> = ids.iter().map(|i| (i.clone(), Some(crate::disk_clean::CleanAction::Now))).collect();
+                let r = crate::disk_clean::clean(&(self.load_config)(), &self.disk_files, plan, &picks, &self.clean_opts);
+                let mut v = r.to_json();
+                let deleted: Vec<String> = r.outcomes.iter().filter(|o| matches!(o.result.as_str(), "done" | "partial")).map(|o| o.title.clone()).collect();
+                v["tell_the_person"] = json!(if deleted.is_empty() {
+                    "Nothing was deleted; tell the person why (outcomes[].message).".to_string()
+                } else {
+                    format!("Tell the person you deleted: {}. Give the predicted frees as predicted; the measured result comes later in memguard_disk recent_cleanups.", deleted.join("; "))
+                });
+                Ok(v)
             }
             "memguard_advise" => {
                 check_keys(args, &[])?;
@@ -669,6 +712,28 @@ Ather MemGuard deletes nothing; the person removes the folders (or runs git work
             },
             "annotations": { "readOnlyHint": true, "openWorldHint": false },
         }),
+        json!({
+            "name": "memguard_disk_clean",
+            "title": "Delete regenerable build output",
+            "description": "DELETES FILES for good (no undo). Only for regenerable items (class regenerable: Intermediate, \
+DerivedDataCache, crash reports, shader debug files, tool caches) whose ids are in a memguard_disk_plan made less than 10 \
+minutes ago. Every safety rule is checked again now and an item is refused whole if anything in it was written in the last \
+2 hours or since the plan, if an Unreal editor, build or cook works in that project, if git tracks a file in it, if its folder \
+changed (file id), or if it is a link, in a cloud folder, or outside the allow-list. Lanes, worktrees, Content, Config, \
+Source, Saved\\Autosaves and the like are never touched, and bin moves and tool cleans are not available here. Returns \
+the predicted frees per drive (predicted, not measured) and outcomes per item; the measured result comes later in \
+memguard_disk recent_cleanups. Tell the person what you deleted.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Ids of regenerable items from your latest memguard_disk_plan, e.g. [\"d1\", \"d2\"]." },
+                    "plan_id": { "type": "string", "description": "The plan_id memguard_disk_plan returned. Default: the newest plan holding all the ids." }
+                },
+                "required": ["ids"],
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false },
+        }),
     ]
 }
 
@@ -695,7 +760,7 @@ pub fn agent_setup_text(exe: &std::path::Path) -> String {
     };
     line("Ather MemGuard for AI agents: an MCP server your agent starts by itself (no port, nothing to enable).");
     line("Tools: memguard_status, memguard_prime, memguard_wait, memguard_advise, memguard_doctor, memguard_history, memguard_ram,");
-    line("       memguard_disk, memguard_disk_checkup, memguard_disk_plan.");
+    line("       memguard_disk, memguard_disk_checkup, memguard_disk_plan, memguard_disk_clean (deletes regenerable build output only).");
     line("");
     line("Claude Code, for all your projects:");
     line(&format!("  claude mcp add --scope user ather-memguard -- \"{}\" mcp", exe));
@@ -787,10 +852,12 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(
             names,
-            ["memguard_status", "memguard_prime", "memguard_wait", "memguard_advise", "memguard_doctor", "memguard_history", "memguard_ram", "memguard_disk", "memguard_disk_checkup", "memguard_disk_plan"]
+            ["memguard_status", "memguard_prime", "memguard_wait", "memguard_advise", "memguard_doctor", "memguard_history", "memguard_ram", "memguard_disk", "memguard_disk_checkup", "memguard_disk_plan", "memguard_disk_clean"]
         );
         for t in tools.iter().filter(|t| t["name"].as_str().unwrap().starts_with("memguard_disk")) {
-            assert_eq!(t["annotations"]["readOnlyHint"], true, "{}", t["name"]);
+            let deletes = t["name"] == "memguard_disk_clean";
+            assert_eq!(t["annotations"]["readOnlyHint"], !deletes, "{}", t["name"]);
+            assert_eq!(t["annotations"]["destructiveHint"] == true, deletes, "{}", t["name"]);
         }
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
@@ -919,6 +986,131 @@ mod tests {
         tool_error_text(&run(&call(4, "memguard_disk_plan", json!({ "ids": "d1" })))[0]);
         tool_error_text(&run(&call(5, "memguard_disk_checkup", json!({ "budget_sec": 0 })))[0]);
         tool_error_text(&run(&call(6, "memguard_disk", json!({ "clean": true })))[0]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Set every file's and folder's write time under `root` to `secs` ago (deepest first).
+    fn age_tree(root: &std::path::Path, secs: u64) {
+        use std::os::windows::fs::OpenOptionsExt;
+        let when = std::time::SystemTime::now() - Duration::from_secs(secs);
+        fn walk(p: &std::path::Path, when: std::time::SystemTime) {
+            if let Ok(rd) = std::fs::read_dir(p) {
+                for e in rd.flatten() {
+                    walk(&e.path(), when);
+                }
+            }
+            // FILE_WRITE_ATTRIBUTES, and FILE_FLAG_BACKUP_SEMANTICS so folders open too.
+            if let Ok(f) = std::fs::OpenOptions::new().access_mode(0x100).custom_flags(0x0200_0000).open(p) {
+                let _ = f.set_modified(when);
+            }
+        }
+        walk(root, when);
+    }
+
+    // ---- The one tool that deletes, over stdio, on a tree this test creates.
+    #[test]
+    fn disk_clean_over_stdio_deletes_only_what_the_rules_allow() {
+        use crate::disk_clean::{CleanOpts, DiskFiles, PlanRecord};
+        let root = std::env::temp_dir().join(format!("amg-mcp-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let game = root.join("Game");
+        for d in [r"Intermediate\Build\Win64", r"Saved\Logs", r"Saved\Autosaves", "Content", "Config"] {
+            std::fs::create_dir_all(game.join(d)).unwrap();
+        }
+        std::fs::write(game.join("Game.uproject"), b"{}").unwrap();
+        std::fs::write(game.join(r"Intermediate\Build\Win64\a.obj"), vec![1u8; 300_000]).unwrap();
+        std::fs::write(game.join(r"Saved\Logs\Game.log"), vec![2u8; 50_000]).unwrap();
+        std::fs::write(game.join(r"Saved\Autosaves\Map_auto1.umap"), b"autosave").unwrap();
+        std::fs::write(game.join(r"Content\Hero.uasset"), b"asset").unwrap();
+        std::fs::write(game.join(r"Config\DefaultGame.ini"), b"[x]").unwrap();
+        age_tree(&root, 3 * 3600);
+        // The checkup the plan builds on, counted in-process.
+        let cfg = Config::builtin();
+        let items = crate::disk_scan::discover(&cfg, Some(&root.display().to_string()));
+        let keys: Vec<&str> = items.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, ["ue:intermediate", "ue:logs"]);
+        let job = crate::disk_scan::ScanJob { items: items.iter().map(|i| i.paths.clone()).collect(), sets: vec![], threads: 2, budget_sec: 30, stop_on_build: false };
+        let out = crate::disk_scan::run_job(&job, &mut |_, _| {});
+        let rep = crate::disk_scan::build_checkup(&items, &out, &[], &cfg.disk(), 0, false, &[], "now");
+        let cached = crate::disk_scan::CachedCheckup { scope: "t".into(), unix: 0, time: String::new(), items: items.clone(), root_ids: vec![], last_writes: vec![], report: rep };
+        let files = DiskFiles::in_dir(root.join("data"));
+        let srv = server()
+            .with_disk(Box::new(|job, p| Ok(crate::disk_scan::run_job(job, p))), Box::new(move || Some(cached.clone())))
+            .with_clean(files.clone(), CleanOpts { presample_secs: 1, start_watcher: false, busy: Some((vec![], false)), ..Default::default() });
+        let run = |id: u32, name: &str, args: Value| -> Value {
+            let mut o = Vec::new();
+            srv.serve(call(id, name, args).as_bytes(), &mut o).unwrap();
+            let msgs: Vec<Value> = String::from_utf8(o).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+            msgs.into_iter().find(|m| m.get("id").is_some()).unwrap()
+        };
+        let plan = |id: u32| -> String {
+            let r = run(id, "memguard_disk_plan", json!({ "ids": ["d1", "d2"] }));
+            assert_eq!(r["result"]["isError"], false, "{}", r);
+            r["result"]["structuredContent"]["plan_id"].as_str().unwrap().to_string()
+        };
+        // No plan yet: refused, and nothing is touched.
+        assert!(tool_error_text(&run(1, "memguard_disk_clean", json!({ "ids": ["d1"] }))).contains("memguard_disk_plan"));
+        let p1 = plan(2);
+        // Logs are disposable: not for agents.
+        let r = run(3, "memguard_disk_clean", json!({ "ids": ["d2"], "plan_id": p1 }));
+        let s = &r["result"]["structuredContent"];
+        assert_eq!(s["outcomes"][0]["result"], "refused", "{}", s);
+        assert!(s["outcomes"][0]["message"].as_str().unwrap().contains("regenerable"));
+        assert!(game.join(r"Saved\Logs\Game.log").is_file());
+        // A stale plan (older than 10 minutes) is refused.
+        let mut plans = files.plans();
+        for p in plans.iter_mut() {
+            p.unix -= 700;
+        }
+        std::fs::write(root.join(r"data\disk-plans.json"), serde_json::to_string(&plans).unwrap()).unwrap();
+        assert!(tool_error_text(&run(4, "memguard_disk_clean", json!({ "ids": ["d1"], "plan_id": p1 }))).contains("under 10 minutes"));
+        // A recent write refuses the whole item.
+        let p2 = plan(5);
+        std::fs::write(game.join(r"Intermediate\Build\fresh.txt"), b"just now").unwrap();
+        let r = run(6, "memguard_disk_clean", json!({ "ids": ["d1"], "plan_id": p2 }));
+        let s = &r["result"]["structuredContent"];
+        assert_eq!(s["outcomes"][0]["result"], "refused", "{}", s);
+        assert!(s["outcomes"][0]["message"].as_str().unwrap().contains("last 2 hours"), "{}", s);
+        assert!(game.join(r"Intermediate\Build\Win64\a.obj").is_file(), "nothing in it was touched");
+        // Old again, but written after the plan: refused until a new plan.
+        age_tree(&game.join("Intermediate"), 2 * 3600 + 600);
+        let r = run(7, "memguard_disk_clean", json!({ "ids": ["d1"], "plan_id": p2 }));
+        assert!(r["result"]["structuredContent"]["outcomes"][0]["message"].as_str().unwrap().contains("after the plan"), "{}", r);
+        // A protected path smuggled into a plan record is refused by the rules at apply time.
+        let mut forged: PlanRecord = files.plans().last().unwrap().clone();
+        forged.id = "pforged".into();
+        forged.unix = crate::disk_clean::unix_now();
+        forged.items[0].paths = vec![game.join("Content").display().to_string()];
+        forged.items[0].path_ids = vec![crate::disk_win::identity(&game.join("Content").display().to_string()).map(|x| x.1)];
+        forged.items[0].last_write = u64::MAX;
+        files.save_plan(&forged).unwrap();
+        let r = run(8, "memguard_disk_clean", json!({ "ids": ["d1"], "plan_id": "pforged" }));
+        let s = &r["result"]["structuredContent"];
+        assert_eq!(s["outcomes"][0]["result"], "refused", "{}", s);
+        assert!(s["outcomes"][0]["message"].as_str().unwrap().contains("never touches"), "{}", s);
+        assert!(game.join(r"Content\Hero.uasset").is_file());
+        // A fresh plan: deleted, predicted (not measured), and the person is to be told.
+        let p3 = plan(9);
+        let r = run(10, "memguard_disk_clean", json!({ "ids": ["d1"], "plan_id": p3 }));
+        let s = &r["result"]["structuredContent"];
+        assert_eq!(r["result"]["isError"], false, "{}", r);
+        assert_eq!(s["outcomes"][0]["result"], "done", "{}", s);
+        assert_eq!(s["outcomes"][0]["basis"], "predicted");
+        assert!(s["volumes"][0]["predicted_freed_gb"].is_number());
+        assert_eq!(s["volumes"][0]["measured"], "later");
+        assert!(s["measured_note"].as_str().unwrap().contains("not yet measured"));
+        assert!(s["tell_the_person"].as_str().unwrap().contains("Build files"), "{}", s);
+        assert!(!game.join("Intermediate").exists());
+        for keep in [r"Content\Hero.uasset", r"Config\DefaultGame.ini", r"Saved\Autosaves\Map_auto1.umap", r"Saved\Logs\Game.log", "Game.uproject"] {
+            assert!(game.join(keep).is_file(), "{} must survive", keep);
+        }
+        // The delete is logged as can't-be-undone, and a measured watch waits for the watcher.
+        assert!(!files.undo_log().can_undo());
+        let w = files.watches();
+        assert_eq!(w.len(), 1);
+        assert!(w[0].measured.is_none() && w[0].predicted > 0);
+        tool_error_text(&run(11, "memguard_disk_clean", json!({ "ids": [] })));
+        tool_error_text(&run(12, "memguard_disk_clean", json!({ "ids": ["d1"], "force": true })));
         let _ = std::fs::remove_dir_all(&root);
     }
 

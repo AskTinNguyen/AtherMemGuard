@@ -562,6 +562,9 @@ pub struct DiskReport {
     pub dev_drive: DevDriveState,
     pub findings: Vec<DiskFinding>,
     pub advice: Vec<String>,
+    /// The latest cleanups: predicted at once, measured once the drive has been watched.
+    #[serde(default)]
+    pub recent_cleanups: Vec<serde_json::Value>,
 }
 
 fn defender_cache_file() -> PathBuf {
@@ -629,7 +632,8 @@ pub fn report(cfg: &Config, refresh: bool) -> DiskReport {
     if caches.is_none() && s.check_dev_drive && vols.iter().any(|v| v.dev_drive) {
         advice.push("Run `memguard disk checkup` once to size the caches on the system drive.".into());
     }
-    DiskReport { level: overall_level(&vols, &s), volumes: vols, dev_drive: dev, findings, advice }
+    let recent_cleanups = crate::disk_clean::recent_cleanups(&crate::disk_clean::DiskFiles::default(), 5);
+    DiskReport { level: overall_level(&vols, &s), volumes: vols, dev_drive: dev, findings, advice, recent_cleanups }
 }
 
 /// `memguard disk` as text.
@@ -693,6 +697,24 @@ pub fn render_text(r: &DiskReport) -> String {
     }
     for a in &r.advice {
         s.push_str(&format!("- {}\n", a));
+    }
+    if !r.recent_cleanups.is_empty() {
+        s.push_str("\nRecent cleanups:\n");
+        for c in &r.recent_cleanups {
+            let other = c["other_activity"] == true;
+            let measured = match c["measured_freed_gb"].as_f64() {
+                Some(m) => format!("{}{:.1} GB came back (measured){}", if other { "about " } else { "" }, m.max(0.0), if other { ", other writes made it unclear" } else { "" }),
+                None if c["state"] == "watching" => "being measured".to_string(),
+                None => "not measured".to_string(),
+            };
+            s.push_str(&format!(
+                "  {} {}: predicted {:.1} GB, {}\n",
+                c["time"].as_str().unwrap_or(""),
+                c["volume"].as_str().unwrap_or(""),
+                c["predicted_freed_gb"].as_f64().unwrap_or(0.0),
+                measured
+            ));
+        }
     }
     s
 }

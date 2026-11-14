@@ -1209,6 +1209,81 @@ pub fn empty_runs(files: &DiskFiles, runs: &[BinRun]) -> Vec<(BinRun, DeleteRepo
     out
 }
 
+/// The roots of the fixed drives with a letter (`C:\`, `D:\`): where bins can be.
+pub fn fixed_roots() -> Vec<String> {
+    disk_win::volumes().into_iter().filter(|v| v.drive_type == 3).flat_map(|v| v.paths.into_iter().filter(|p| p.len() <= 3)).collect()
+}
+
+/// Empty bin runs and leave a measured watch per drive for what they were predicted to free
+/// (the sum of the moved items' own numbers: an "at least").
+pub fn empty_bins(files: &DiskFiles, runs: &[BinRun], presample_secs: u32, start_watcher: bool) -> (Vec<(BinRun, DeleteReport)>, Vec<WatchRecord>) {
+    let mut roots: Vec<String> = runs.iter().map(|r| r.volume_root.clone()).collect();
+    roots.sort();
+    roots.dedup();
+    let before: Vec<(String, u64, u64)> = roots.iter().map(|r| {
+        let (f, m) = presample(r, presample_secs.max(1));
+        (r.clone(), f, m)
+    }).collect();
+    let done = empty_runs(files, runs);
+    let run = run_id();
+    let mut watches = Vec::new();
+    for (root, free_before, motion) in before {
+        let mine: Vec<&(BinRun, DeleteReport)> = done.iter().filter(|(r, _)| r.volume_root.eq_ignore_ascii_case(&root)).collect();
+        let predicted: u64 = mine.iter().map(|(r, _)| r.frees_alone).sum();
+        if predicted == 0 {
+            continue;
+        }
+        let guid = disk_win::volume_of(&root).map(|(_, g)| g).unwrap_or_default();
+        let fs = disk_win::volumes().into_iter().find(|v| v.guid.eq_ignore_ascii_case(&guid)).map(|v| v.fs).unwrap_or_default();
+        let rec = WatchRecord {
+            id: format!("{}-bin-{}", run, root.chars().next().unwrap_or('v')),
+            run_id: run.clone(),
+            volume: guid,
+            volume_root: root.clone(),
+            fs,
+            started_unix: unix_now(),
+            time: crate::win::local_time_string(),
+            free_before,
+            pre_motion: motion,
+            predicted,
+            predicted_confidence: "lower_bound".into(),
+            titles: vec![format!("Ather MemGuard's bin on {}", root.trim_end_matches('\\'))],
+            watcher_pid: 0,
+            measured: None,
+            toasted: false,
+        };
+        let mut all = files.watches();
+        all.push(rec.clone());
+        let _ = files.save_watches(&all);
+        if start_watcher {
+            spawn_watcher(&rec.id);
+        }
+        watches.push(rec);
+    }
+    (done, watches)
+}
+
+/// The latest cleanups for `memguard disk` and `memguard_disk`: predicted, and measured once
+/// the watcher is done.
+pub fn recent_cleanups(files: &DiskFiles, n: usize) -> Vec<Value> {
+    let all = files.watches();
+    all.iter()
+        .rev()
+        .take(n)
+        .map(|w| {
+            json!({
+                "run_id": w.run_id, "time": w.time, "volume": w.volume_root.trim_end_matches('\\'), "items": w.titles,
+                "predicted_freed_gb": gb2(w.predicted), "predicted_confidence": w.predicted_confidence,
+                "measured_freed_gb": w.measured.as_ref().map(|m| (m.measured_freed as f64 / (1u64 << 30) as f64 * 100.0).round() / 100.0),
+                "measured": w.measured.is_some(), "settled": w.measured.as_ref().map(|m| m.settled),
+                "other_activity": w.measured.as_ref().map(|m| m.other_activity),
+                "appeared_after_sec": w.measured.as_ref().and_then(|m| m.appeared_after_sec),
+                "state": if w.measured.is_some() { "measured" } else if unix_now().saturating_sub(w.started_unix) > WATCH_MAX_SEC + 120 { "not_watched" } else { "watching" },
+            })
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------- the measured result (pure)
 
 /// What came back after acting, as read from the volume's free space.
