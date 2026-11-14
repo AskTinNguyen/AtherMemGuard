@@ -12,3 +12,4 @@ pub mod status_source;
 pub use commands::Command;
 pub mod dialogs;
 pub mod window;
+pub mod toast;
