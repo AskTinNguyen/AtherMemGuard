@@ -449,6 +449,8 @@ struct App {
     /// The latest status, shared with the settings window.
     status: Rc<RefCell<Option<Status>>>,
     exit_event: Option<Handle>,
+    /// `AtherMemGuard.exe --settings` signals this to open the settings window.
+    settings_event: Option<Handle>,
     taskbar_created: u32,
     brain: ToastBrain,
     /// The hotkey text last tried, and whether it is registered.
@@ -918,10 +920,12 @@ fn on_select(hwnd: HWND, keyboard: bool) {
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_TIMER => {
+            let mut open_settings = false;
             let quit = with_app(|a| {
                 if a.exit_event.as_ref().is_some_and(win::event_is_set) {
                     return true;
                 }
+                open_settings = a.settings_event.as_ref().is_some_and(win::event_is_set);
                 let due = a.last_tick.map_or(true, |t| t.elapsed().as_secs() >= a.engine.cfg.interval_sec);
                 if due {
                     a.tick();
@@ -934,6 +938,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             if quit == Some(true) {
                 crate::log::write("asked to stop");
                 PostQuitMessage(0);
+            } else if open_settings {
+                // Outside the app borrow: opening a window runs its own messages.
+                dispatch(hwnd, Command::OpenSettings);
             }
             0
         }
@@ -989,17 +996,40 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
 
 /// Run the tray app until Quit or `memguard stop`. Returns at once if a copy is already running.
 pub fn run() {
-    run_with(false);
+    run_with(false, false);
 }
 
 /// Like `run`, started by the updater: says "Updated to Ather MemGuard {v}" once it is up.
 pub fn run_after_update() {
-    run_with(true);
+    run_with(true, false);
 }
 
-fn run_with(after_update: bool) {
+/// Like `run`, and open the settings window once the tray is up (`AtherMemGuard.exe --settings`
+/// when no copy was running).
+pub fn run_and_open_settings() {
+    run_with(false, true);
+}
+
+/// Ask the running tray to open its settings window. Waits up to `wait` for a copy that is
+/// still starting to begin listening. False when no copy answered.
+pub fn ask_running_to_open_settings(wait: Duration) -> bool {
+    win::allow_any_foreground();
+    let until = Instant::now() + wait;
+    loop {
+        if win::signal_event(paths::settings_event()) {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn run_with(after_update: bool, open_settings: bool) {
     let Some(_instance) = win::acquire_instance(paths::mutex(), 8000) else { return };
     let exit_event = win::create_event(paths::exit_event());
+    let settings_event = win::create_event(paths::settings_event());
 
     unsafe {
         let class = wide("AtherMemGuardTrayWindow");
@@ -1027,6 +1057,7 @@ fn run_with(after_update: bool) {
             last_tick: None,
             status: Rc::new(RefCell::new(None)),
             exit_event,
+            settings_event,
             taskbar_created: RegisterWindowMessageW(created.as_ptr()),
             brain: ToastBrain::default(),
             hotkey_keys: None,
@@ -1062,6 +1093,9 @@ fn run_with(after_update: bool) {
             }
         });
         SetTimer(hwnd, TIMER_ID, 1000, None);
+        if open_settings {
+            post_command(Command::OpenSettings);
+        }
 
         let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {

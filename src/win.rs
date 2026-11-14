@@ -429,6 +429,13 @@ pub fn signal_event(name: &str) -> bool {
     unsafe { SetEvent(h.0) != 0 }
 }
 
+/// Let whichever process we wake up next bring its window to the front (a signalled tray
+/// opening its settings window). Only works while this process may set the foreground.
+pub fn allow_any_foreground() {
+    const ASFW_ANY: u32 = u32::MAX;
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(ASFW_ANY) };
+}
+
 pub fn null_handle() -> HANDLE {
     null_mut()
 }

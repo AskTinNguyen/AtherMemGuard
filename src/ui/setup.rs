@@ -119,7 +119,8 @@ impl SetupBackend for RealBackend {
     }
 
     fn open_settings(&self) {
-        // Needs `--settings` in bin/tray.rs (forwarded to the running tray); see the notes.
+        // `--settings` asks the running tray (just started by install) to open its settings
+        // window, or starts the tray with it open.
         let _ = Self::launch(&Self::installed_exe(), "--settings");
     }
 

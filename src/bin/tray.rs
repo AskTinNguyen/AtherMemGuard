@@ -3,7 +3,8 @@
 #![windows_subsystem = "windows"]
 
 use athermemguard::install::{self, LaunchMode};
-use athermemguard::{log, tray, updater};
+use athermemguard::ui::setup::{run_setup, RealBackend, SetupMode};
+use athermemguard::{log, paths, tray, updater, win};
 
 /// What the command line asks for.
 #[derive(Debug, PartialEq, Eq)]
@@ -12,8 +13,10 @@ enum Command {
     Default,
     /// Started by the updater: finish the update, then run the tray.
     AfterUpdate(u32),
-    /// From Settings > Apps.
+    /// From Settings > Apps: the setup window's "Uninstall?" screen.
     Uninstall,
+    /// Open the settings window: in the running tray if there is one, else start the tray.
+    Settings,
     /// Silent install for scripts.
     Install(install::InstallOptions),
     /// Paint every UI surface with sample data into PNG files (docs/UI.md, for review).
@@ -31,6 +34,7 @@ fn parse_args(args: &[String]) -> Command {
             _ => Command::Unknown(args.join(" ")),
         },
         "--uninstall" if rest.is_empty() => Command::Uninstall,
+        "--settings" if rest.is_empty() => Command::Settings,
         "--ui-snapshots" => match rest {
             [dir] => Command::UiSnapshots(dir.clone()),
             _ => Command::Unknown(args.join(" ")),
@@ -69,22 +73,32 @@ fn main() {
                 tray::run();
                 0
             }
-            // INTEGRATION: open E2's setup window (src/ui/setup.rs) here; until then install right away.
-            LaunchMode::Setup => run_install(install::InstallOptions::default()),
+            LaunchMode::Setup => run_setup(Box::new(RealBackend), SetupMode::Install),
         },
         Command::AfterUpdate(pid) => {
             updater::finish_update(pid);
             tray::run_after_update();
             0
         }
-        // INTEGRATION: E2's setup window has an "UNINSTALL?" state for this; until then uninstall right away.
-        Command::Uninstall => match install::uninstall() {
-            Ok(()) => 0,
-            Err(e) => {
-                log::write(&format!("uninstall failed: {}", e));
-                1
+        Command::Uninstall => run_setup(Box::new(RealBackend), SetupMode::Uninstall),
+        Command::Settings => {
+            if win::instance_running(paths::mutex()) {
+                if tray::ask_running_to_open_settings(std::time::Duration::from_secs(5)) {
+                    0
+                } else {
+                    log::write("--settings: the running copy didn't answer (an older version?)");
+                    1
+                }
+            } else {
+                match install::launch_mode() {
+                    LaunchMode::Tray => {
+                        tray::run_and_open_settings();
+                        0
+                    }
+                    LaunchMode::Setup => run_setup(Box::new(RealBackend), SetupMode::Install),
+                }
             }
-        },
+        }
         Command::Install(opts) => run_install(opts),
         Command::UiSnapshots(dir) => {
             let dir = std::path::Path::new(&dir);
@@ -126,6 +140,7 @@ mod tests {
         assert_eq!(p(&["--after-update", "1234"]), Command::AfterUpdate(1234));
         assert_eq!(p(&["--uninstall"]), Command::Uninstall);
         assert_eq!(p(&["--UNINSTALL"]), Command::Uninstall);
+        assert_eq!(p(&["--settings"]), Command::Settings);
         let opts = |add_to_path, start_with_windows, start| Command::Install(install::InstallOptions { add_to_path, start_with_windows, start });
         assert_eq!(p(&["--install"]), opts(true, true, true));
         assert_eq!(p(&["--install", "--no-path"]), opts(false, true, true));
@@ -143,6 +158,7 @@ mod tests {
             &["--after-update", "-1"],
             &["--after-update", "1", "2"],
             &["--uninstall", "now"],
+            &["--settings", "now"],
             &["--ui-snapshots"],
             &["--ui-snapshots", "a", "b"],
             &["--install", "--add-to-path"],
