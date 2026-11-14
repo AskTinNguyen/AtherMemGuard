@@ -78,6 +78,20 @@ memguard wait --for build --prime --timeout 900 && RunUAT.bat BuildCookRun ...
 The tray app also writes `%APPDATA%\AtherMemGuard\status.json` every interval, with the same content as
 `memguard status --json`, for tools that would rather read a file.
 
+## AI agents (MCP)
+
+`memguard mcp` is an MCP server over stdio, so Claude Code, Codex and other coding agents can call
+MemGuard as tools: `memguard_status`, `memguard_prime`, `memguard_wait` and `memguard_advise`. The agent
+starts it by itself; there is no port and nothing to enable. Run `memguard agent-setup` for ready-to-paste
+setup, or add it to Claude Code with:
+
+```
+claude mcp add --scope user ather-memguard -- memguard mcp
+```
+
+Setup for each agent, every tool with an example, and the recommended flow before a build or cook are in
+[docs/AI-AGENTS.md](docs/AI-AGENTS.md).
+
 ## Settings
 
 `%APPDATA%\AtherMemGuard\settings.toml` (tray menu → Settings). Saved changes apply within one
@@ -99,6 +113,8 @@ instance name, so a test copy can run beside the installed one.
 
 The exe icon is the Ather mark, drawn in code (`src/logo.rs`). To regenerate `res/app.ico` after changing it:
 
-```ncargo run --bin memguard -- write-icon res\app.ico
-```n
+```
+cargo run --bin memguard -- write-icon res\app.ico
+```
+
 Ather MemGuard was first prototyped as MemCap; `memguard install` replaces a MemCap install and carries its settings over. The early PowerShell and C# versions are in `prototype/`.
