@@ -271,6 +271,50 @@ downsampled to at most 1500 points).
 - Empty state: "No history yet. It starts filling in as soon as Ather MemGuard has been
   running for a minute."
 
+## 6. Checkup window, the doctor (`src/ui/doctor.rs`) — Part E
+
+760 x 720, resizable. Title "Ather MemGuard — Checkup". Opened from the tray menu
+("Run a checkup", between "Memory history" and the update item), the flyout (a link
+"Run a checkup" under the group bars) and the checkup toast. Data and actions come from
+`doctor::scan`, `doctor::apply` and `doctor::undo` (docs/DESIGN.md, Part F).
+
+- **Hero**: eyebrow "ATHER MEMGUARD", headline "CHECKUP". On the right the result in one
+  number: "{x} GB" over the caption "COULD BE FREED" (lime), or "ALL CLEAR" when nothing is
+  proposed. A link "Check again" re-scans.
+- **Sections**, in this order, each a lime header with the memory it covers on the right;
+  empty sections are hidden:
+
+| Section | Findings | Row |
+|---|---|---|
+| NOT NEEDED FOR UNREAL | verdict `close` | Checkbox · app name · "N processes · X GB" · hint saying what it is ("Game launcher. Not used by Unreal.") · action pill: "Close" / "Close and don't start with Windows" / "Close whenever Unreal is running" |
+| STARTS WITH WINDOWS | startup entries | Checkbox · entry name · hint "Starts every time you sign in. Uses about X GB." · pill "Don't start with Windows" (or the muted text "Needs an administrator" and no checkbox) |
+| BIG TOOLS YOU MIGHT NOT BE USING | verdict `heavy_tool` | Unchecked by default · "Close if you're not using it" |
+| WORTH A LOOK | verdict `review` | Unchecked · app name, company, "X GB" · pill: "Close" / "Hold back" / "Leave it" (Leave it adds it to `[doctor] keep`) |
+| HELD BACK, NOT CLOSED | `hold_back` apps not yet in a group | Checked · "Hold back" (adds the app to the matching group) |
+| UNREAL | leftovers | "3 leftover Unreal helpers from a closed editor · 1.2 GB" · "End them" |
+| THIS PC | system | Text rows, each with a link: "The page file is small for this much RAM." → "How to fix" |
+
+- Rows whose finding is `recommended` start checked. The footer shows the running total of
+  what is checked, "Selected: frees about {x} GB", on the left; on the right the primary
+  button "CLEAN UP" (disabled with nothing checked) and a link "Undo last cleanup" when
+  there is one to undo.
+- **Clean up** runs the picks on a worker thread; each row turns into its result in place:
+  "Closed", "Still open — it may be asking you to save", "Switched off", "Added to
+  Browsers". An app that stayed open gets a red link "End it anyway", which asks first:
+  "End {app}? Anything unsaved in it is lost." buttons "End it" / "Cancel".
+- Nothing in this window changes anything without a visible checkbox and the CLEAN UP click.
+
+Toasts added to the catalogue:
+
+| When | Kind | Title | Body | Buttons |
+|---|---|---|---|---|
+| Unreal work starts and the checkup finds at least `nudge_above_gb` (default 4) to free; at most once a day | Info | {x} GB is in use by apps Unreal doesn't need | {top three app names}. | Review |
+| Cleanup finished | Info | Checkup done | Freed about {x} GB. {n} apps won't start with Windows any more. | Undo |
+| A `close_while_unreal` app was closed | Info | Closed {app} | It's on your list to stay closed while Unreal is running. | Allow this time |
+
+`Command` gains `OpenDoctor` and `UndoDoctor`. Snapshots: `doctor.png`, `doctor-clear.png`,
+`doctor-results.png`.
+
 ## Accessibility and robustness
 
 - Every interactive element is reachable with Tab, shows a 1 px `ACCENT` focus ring, and

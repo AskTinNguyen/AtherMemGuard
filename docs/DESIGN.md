@@ -274,4 +274,107 @@ Specified in `docs/UI.md` (written by the designer). **Owns:** `src/ui/` (new).
 
 ## Part E: setup window, history window, prime hotkey, tray wiring
 
-Specified in `docs/UI.md`. **Owns:** `src/tray.rs`, `src/ui/setup.rs`, `src/ui/history.rs`.
+Specified in `docs/UI.md`. **Owns:** `src/tray.rs`, `src/ui/setup.rs`, `src/ui/history.rs`,
+`src/ui/doctor.rs`.
+
+---
+
+## Part F: Doctor
+
+**Owns:** `src/doctor.rs` (new), `src/doctor_catalog.toml` (new, embedded with `include_str!`),
+`src/startup.rs` (new: reading and switching startup entries).
+**Shared edits:** `Cargo.toml`, `src/lib.rs`, `src/bin/memguard.rs` (the `doctor` subcommand
+only, under a `// ---- Part F` marker), `src/mcp.rs` (register `memguard_doctor`, report only),
+`README.md` (one section), `docs/AI-AGENTS.md` (the new tool).
+Do not edit `config.rs` or `engine.rs`; Part B owns them. Read your `[doctor]` settings
+straight from the settings TOML with the `toml` crate (missing file or key = defaults), and
+list the keys in your report so the integrator can add them to the schema.
+
+The doctor answers one question: **what is using memory on this PC that Unreal work doesn't
+need, and what should be done about it?** It looks, explains, and proposes. It changes
+nothing unless asked, and everything it changes can be undone.
+
+### What it checks
+
+1. **Apps.** Every process of the current user that isn't protected (`engine::is_protected`),
+   grouped into apps by executable name, with process count, RAM and committed memory.
+   Each app is matched against the catalogue and gets a verdict:
+
+| Verdict | Meaning | Examples (the catalogue has many more) |
+|---|---|---|
+| `close` | Not needed for Unreal work; closing it is safe and frees real memory | Game launchers and games (Steam, Epic Games Launcher, Battle.net, Riot, Xbox app), media (Spotify), Widgets, Copilot, Phone Link, peripheral suites (iCUE, Razer Synapse, Armoury Crate) |
+| `hold_back` | Wanted, but shouldn't compete with Unreal: put it in a MemGuard group | Browsers, chat apps, agent apps (Claude, Codex, ChatGPT), cloud sync (OneDrive, Dropbox) |
+| `keep` | Part of Unreal work or the system; never proposed | Visual Studio, Rider, VS Code, Perforce, git, Windows Defender, drivers, terminals, remote-desktop tools, MemGuard |
+| `review` | Unknown to the catalogue and large (over `review_above_mb`, default 1024 MB committed) | Anything unrecognised: shown with what it is (file description and company from the exe's version info) so the person can decide |
+| `heavy_tool` | A big creative or virtualisation tool that is probably deliberate | Blender, Maya, Photoshop, Substance, Docker Desktop, WSL (`vmmem`), another game engine. Proposed only as "close if you're not using it" |
+
+   Apps under `ignore_below_mb` (default 150 MB committed) are left out unless they have a
+   startup entry worth switching off.
+2. **Startup entries.** `HKCU\...\Run`, the user's Startup folder, `HKLM\...\Run` and the
+   common Startup folder (those two read-only: changing them needs admin, so they are
+   reported with "needs an administrator"), each with its enabled state from
+   `Explorer\StartupApproved`. An entry whose app has verdict `close` or `heavy_tool` gets
+   the proposal "don't start with Windows".
+3. **Unreal leftovers.** Helper processes with no parent (reuse the orphan logic in
+   `ops.rs`; copy it rather than editing `ops.rs`), more than one editor open, editors past
+   the restart hint.
+4. **System.** Page file small for the RAM, commit headroom low, non-paged pool above 4 GB,
+   a git process pile-up (20 or more), MemGuard not running or paused.
+
+### Actions
+
+Every finding carries zero or more proposed actions. Nothing runs unless the person picks it.
+
+| Action | What it does | Undo |
+|---|---|---|
+| `close` | Asks the app to close: `WM_CLOSE` to its top-level windows, wait up to 10 s. Apps with unsaved work show their own prompt; if it's still running the result is "still open", never a forced kill | Start the app again |
+| `end` | Ends the processes (`TerminateProcess`). Offered only for windowless leftovers and for apps that ignored `close`, and only with `--force` / an explicit second confirmation | None; say so |
+| `disable_startup` | Switches the startup entry off through `StartupApproved` (the same switch Task Manager uses), for HKCU and the user's Startup folder | Switch it back on |
+| `hold_back` | Adds the app to the matching MemGuard group in the settings file | Remove it from the group |
+| `block_while_unreal` | Adds the app to `[doctor] close_while_unreal`: while the editor, a build or a cook is running, MemGuard asks it to close when it appears. Opt-in per app, never offered for `keep`, `hold_back` or `review` apps | Remove it from the list |
+
+- Every applied action is appended to `doctor-undo.json` in the data folder; `undo` reverses
+  the most recent run, or one action by id.
+- Never act on: protected processes, anything not owned by the current user, anything in
+  another session, security software, MemGuard itself, and the process tree MemGuard was
+  launched from (so `memguard doctor --fix` run by an agent never closes that agent).
+
+### API
+
+```rust
+pub struct Report { pub time: String, pub system: SystemStatus, pub findings: Vec<Finding>,
+                    pub reclaimable_ram_gb: f64, pub reclaimable_commit_gb: f64 }
+pub struct Finding { pub id: String,            // stable: "app:steam", "startup:hkcu:Steam", "ue:orphans", "sys:pagefile"
+                     pub kind: FindingKind,     // App | Startup | Unreal | System
+                     pub verdict: Verdict, pub title: String, pub detail: String,  // plain words, app voice
+                     pub processes: usize, pub ram_mb: u64, pub committed_mb: u64,
+                     pub actions: Vec<Action>,  // proposed, most recommended first
+                     pub recommended: bool }    // true = included in "fix the safe ones"
+pub fn scan(cfg: &Config) -> Report;                       // read-only
+pub fn apply(report: &Report, picks: &[(String /*finding id*/, ActionKind)], force: bool) -> Vec<Outcome>;
+pub fn undo(last_run: bool, action_id: Option<&str>) -> Vec<Outcome>;
+pub struct Guard { .. }                                    // close_while_unreal watcher
+impl Guard { pub fn on_tick(&mut self, procs: &[win::Proc], unreal_active: bool) -> Vec<GuardEvent>; }
+```
+
+`recommended` is true only for `disable_startup` on `close` apps and for `close` on apps that
+have no visible window (background launchers). Closing anything with a window is always the
+person's explicit pick.
+
+### CLI and MCP
+
+- `memguard doctor` prints the report grouped by verdict with the memory each item would
+  free and a total, then says how to act. `--json` for machines.
+- `memguard doctor --fix` applies the `recommended` actions after printing them; `--fix
+  <id>[:action] ...` applies specific ones; `--force` allows `end`; `--dry-run` shows what
+  would happen. `memguard doctor --undo` reverses the last run.
+- MCP tool `memguard_doctor`: the report only. Its description tells agents to relay the
+  findings and ask the person before running `--fix`.
+
+### Tests
+
+The catalogue matcher, verdict rules, reclaimable totals, `StartupApproved` encode/decode,
+undo log round trip, and "never act on" rules are pure functions over data: unit-test them.
+Closing and startup switching are tested only against things the test creates itself: a
+process it starts (`notepad` or `ping`), and a throwaway `HKCU\...\Run` value named
+`AtherMemGuardDoctorTest` that the test deletes afterwards.
