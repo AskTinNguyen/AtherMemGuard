@@ -1,0 +1,51 @@
+# Builds and tests on GitHub's Windows runner for every push and pull request. Nothing is published.
+name: Check
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      # Anything that reads settings or writes a log uses this folder, never the runner's profile.
+      ATHER_MEMGUARD_DIR: ${{ github.workspace }}\target\test-home
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-cargo-
+      - name: Build
+        shell: pwsh
+        run: |
+          $env:RUSTFLAGS = '-D warnings'
+          cargo build --locked
+      - name: Test
+        shell: pwsh
+        run: |
+          $env:RUSTFLAGS = '-D warnings'
+          cargo test --locked
+      - name: Release build with the embedded CLI
+        shell: pwsh
+        run: |
+          cargo build --release --locked --bin memguard
+          New-Item -ItemType Directory -Force target\embed | Out-Null
+          Copy-Item target\release\memguard.exe target\embed\memguard.exe
+          $env:MEMGUARD_CLI = "$PWD\target\embed\memguard.exe"
+          cargo build --release --locked --features embed-cli --bin AtherMemGuard

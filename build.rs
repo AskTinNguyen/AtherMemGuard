@@ -24,9 +24,28 @@ const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?
   </application></compatibility>
 </assembly>"#;
 
+/// Dev builds run as the tray app from target\<profile>, never as the installer: drop an
+/// `AtherMemGuard.portable` marker there. package.ps1 copies only the exes, so releases
+/// don't carry it.
+fn mark_build_folder_portable() {
+    let (Some(out), Ok(profile)) = (std::env::var_os("OUT_DIR"), std::env::var("PROFILE")) else { return };
+    // OUT_DIR is target\<profile>\build\<pkg>-<hash>\out (or ...\build\<pkg>\<hash>\out).
+    let profile_dir = std::path::Path::new(&out)
+        .ancestors()
+        .find(|p| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(profile.as_str())));
+    if let Some(profile_dir) = profile_dir {
+        let marker = profile_dir.join("AtherMemGuard.portable");
+        if !marker.exists() {
+            let _ = std::fs::write(marker, "Run AtherMemGuard.exe from this folder without installing.\r\n");
+        }
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=res/app.ico");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=MEMGUARD_CLI");
+    mark_build_folder_portable();
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
