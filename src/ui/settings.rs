@@ -1863,6 +1863,11 @@ mod tests {
         w.layout(&c);
         let sections: Vec<String> = w.items().iter().filter_map(|i| if let Paint::Section(s) = &i.paint { Some(s.clone()) } else { None }).collect();
         assert_eq!(sections, vec!["GENERAL".to_string()]);
+        w.set_query("sold slower");
+        w.layout(&c);
+        let labels: Vec<String> =
+            w.items().iter().filter_map(|i| if let Paint::Label { label, .. } = &i.paint { Some(label.clone()) } else { None }).collect();
+        assert_eq!(labels, ["Check memory speed"]);
         w.set_query("zzz nothing");
         w.layout(&c);
         assert!(w.items().iter().all(|i| !matches!(i.paint, Paint::Label { .. })));
@@ -1908,7 +1913,11 @@ mod interaction_tests {
         click(&mut w, Pt::new(toggle.cx(), toggle.cy()));
         assert_eq!(value(&w, "general.notifications"), Some(Value::Bool(false)));
         painted(&mut w);
-        let seg = w.item_with(&Act::Seg("general.preset".into())).unwrap().rect;
+        let toggle = w.item_with(&Act::Toggle("general.check_ram_speed".into())).unwrap().rect;
+        click(&mut w, Pt::new(toggle.cx(), toggle.cy()));
+        assert_eq!(value(&w, "general.check_ram_speed"), Some(Value::Bool(false)));
+        painted(&mut w);
+        let seg =w.item_with(&Act::Seg("general.preset".into())).unwrap().rect;
         click(&mut w, Pt::new(seg.right() - 10, seg.cy()));
         assert_eq!(value(&w, "general.preset"), Some(Value::Text("aggressive".into())));
 

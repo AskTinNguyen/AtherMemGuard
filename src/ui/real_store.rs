@@ -592,6 +592,13 @@ pub(crate) mod tests {
         assert_eq!(s.get("general.prime_hotkey").unwrap().value, Value::Text("Ctrl+Shift+F9".into()));
         s.set("general.notifications", Value::Bool(false)).unwrap();
         assert_eq!(s.get("general.notifications").unwrap().value, Value::Bool(false));
+        let ram = s.get("general.check_ram_speed").unwrap();
+        assert_eq!((ram.value, ram.layer), (Value::Bool(true), Layer::Builtin));
+        s.set("general.check_ram_speed", Value::Bool(false)).unwrap();
+        assert_eq!(s.get("general.check_ram_speed").unwrap().value, Value::Bool(false));
+        assert!(!crate::config::load_layered().unwrap().0.general.check_ram_speed, "the engine sees it");
+        s.reset("general.check_ram_speed").unwrap();
+        assert_eq!(s.get("general.check_ram_speed").unwrap().layer, Layer::Builtin);
         assert!(matches!(s.get("ue.protect").unwrap().value, Value::List(l) if l.contains(&"git".to_string())));
         assert!(s.get("no.such.key").is_none());
 

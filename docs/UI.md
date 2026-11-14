@@ -95,7 +95,7 @@ Layout, top to bottom (see mockup):
 
 | Section | Rows |
 |---|---|
-| GENERAL | How hard to push other apps (segmented: Gentle / Balanced / Aggressive) · Free memory when a build or cook starts (toggle) · Run at Windows startup (toggle, registry not settings file) · Notifications (toggle) · Free memory now (hotkey field) |
+| GENERAL | How hard to push other apps (segmented: Gentle / Balanced / Aggressive) · Free memory when a build or cook starts (toggle) · Run at Windows startup (toggle, registry not settings file) · Notifications (toggle) · Free memory now (hotkey field) · Check memory speed (toggle, `general.check_ram_speed`) |
 | APP GROUPS | One card per group, then "Add a group" (button "Add group…") |
 | UNREAL | Never touched (chips) · Suggest restarting the editor above (GB) · Warn when the editor grows faster than (GB / hour) · Pause compile workers when memory is critical (toggle, danger hint) · Keep at least this many workers running (number, only visible when the toggle is on) |
 | MEMORY PRESSURE | "Memory is tight when RAM free drops below" (%) · "…or commit free drops below" (%) · "Memory is critical when RAM free drops below" (%) · "…or commit free drops below" (%). Each shows the GB it means on this PC as its unit text |
