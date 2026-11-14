@@ -11,7 +11,8 @@ Read `README.md` first for what the app does today, then `src/lib.rs` for the mo
 - Rust stable, MSVC. Cargo is at `%USERPROFILE%\.cargo\bin` and may not be on PATH:
   in PowerShell run `$env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"` first.
 - `cargo build` and `cargo test` must pass with no warnings before you finish.
-- All `unsafe` Win32 code stays in `win.rs`, `tray.rs`, `logo.rs`, `net.rs` and `ui/`.
+- All `unsafe` Win32 code stays in `win.rs`, `tray.rs`, `logo.rs`, `net.rs`, `doctor_win.rs`,
+  `smbios.rs`, `startup.rs`, `disk_win.rs` and `ui/`.
   Use `windows-sys` 0.59 (add features to `Cargo.toml` as needed). New crates need a reason;
   the ones already agreed are listed per part.
 - **A copy of the app is installed and running on this PC. Do not disturb it.** Never run
@@ -380,3 +381,46 @@ undo log round trip, and "never act on" rules are pure functions over data: unit
 Closing and startup switching are tested only against things the test creates itself: a
 process it starts (`notepad` or `ping`), and a throwaway `HKCU\...\Run` value named
 `AtherMemGuardDoctorTest` that the test deletes afterwards.
+
+---
+
+## Part H: disk and Dev Drive (Phase 1: look, warn, gate, count)
+
+**Owns:** `src/disk.rs` (volumes, levels, roles, Dev Drive findings, the wait gate; pure parts
+tested), `src/disk_space.rs` (the accounting, pure), `src/disk_scan.rs` (catalogue, discovery,
+checkup, plan, cache), `src/disk_win.rs` (unsafe: volumes, FSCTLs, the read-only scanner, the
+Defender probe), `src/disk_catalog.toml`.
+**Shared edits:** `config.rs` (`[disk]`, `disk_gb` on prime targets), `ops.rs` (wait gate),
+`engine.rs` (`Status.disk`, `Engine::set_disk`; the engine never reads disks), `mcp.rs`,
+`doctor.rs` (`add_disk_findings`), `tray.rs` (60 s poll, toasts), `ui/flyout.rs` (disk line),
+`ui/toast.rs`, `bin/memguard.rs`. The spec is the disk proposal, sections 1-8.
+
+- Volumes are keyed by GUID path. Levels use space available to the caller and the smaller of
+  the GB and percent settings, with 5 GB hysteresis; one toast per level change.
+- The tray polls volumes every 60 s on a worker thread. Counting folders never happens in the
+  tray: `memguard disk scan-child` does it at background priority (CPU, I/O and memory),
+  `[disk] scan_threads` threads, a time budget, stopping if a build or cook starts. It opens
+  files with `FILE_READ_ATTRIBUTES` only and never follows reparse points.
+- Every "frees" number is **predicted** from ReFS reference counts (`basis: "predicted"`). It
+  has not been confirmed against a real delete (see the risk below). Nothing in Phase 1 deletes
+  or moves files, and there is no "measured after acting" step.
+- Caches: the last checkup (`disk-checkup.json`, per item root file id and newest write) and
+  the day's Defender facts (`disk-defender.json`) in the data folder. Only the CLI, the MCP
+  server and the tray write them; library tests never do.
+
+### Open risk: ReFS returns deleted space late, so Phase 2 is blocked
+
+The controlled delete test on the team PC (2026-11-14, Dev Drive D:, ReFS 3.14, 4 KB
+clusters) deleted two throwaway folders: one with 0.50 GB predicted to free (unique data plus
+block clones of existing files), one with 1.00 GB of unique, never-cloned data. In the next
+4 to 30 minutes `GetDiskFreeSpaceEx` showed no increase at all. The same 1 GB delete on NTFS
+(C:) showed at once. Later, free space on D: rose from about 341 GB to 504 GB within roughly
+20 minutes; whether that was a batch of delayed ReFS frees or an unrelated large delete is not
+known. An elevated `fsutil fsinfo refsinfo D:` and `GetDiskFreeSpaceEx` agreed (504 GB free,
+8.68 GB reserved) and there are no shadow copies on D:. What was observed: on this ReFS
+volume, deleted space can come back much later, and in bulk. The cause is not established.
+
+Until it is: "frees" stays labelled predicted; ReFS volumes carry the note "Deleting on this
+drive may take a long time to show up as free space."; agents are told never to promise space
+right after a delete; and Phase 2 (clean, bin, undo, relocate, the measured result after
+acting) stays out of scope.

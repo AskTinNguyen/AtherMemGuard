@@ -267,8 +267,8 @@ fn global_items() -> Vec<CatItem> {
     out
 }
 
-/// Top-level entries of `dir` not written for `days` days (folders only: files at the top of
-/// TEMP are counted with... nothing; the scanner walks folders).
+/// Top-level folders of `dir` not written for `days` days. Loose files at the top of TEMP are
+/// not listed: the scanner walks folders (a known gap, usually small).
 fn old_entries(dir: &Path, days: u64) -> Vec<String> {
     let cutoff = std::time::SystemTime::now() - Duration::from_secs(days * 86400);
     let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
@@ -1259,7 +1259,7 @@ pub fn render_plan(p: &Value) -> String {
     for pl in p["plans"].as_array().into_iter().flatten() {
         let ids: Vec<&str> = pl["item_ids"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).collect();
         let conf = pl["frees_confidence"].as_str().unwrap_or("");
-        s.push_str(&format!("{}: removing {} frees {} (predicted, {}).\n", pl["volume"].as_str().unwrap_or(""), ids.join(" "), qualified(&pl["frees_together_gb"], conf), conf));
+        s.push_str(&format!("On {}, removing {} frees {} (predicted, {}).\n", pl["volume"].as_str().unwrap_or(""), ids.join(" "), qualified(&pl["frees_together_gb"], conf), conf));
         for it in pl["per_item"].as_array().into_iter().flatten() {
             s.push_str(&format!("  {:<4}{:<40} alone: {}\n", it["id"].as_str().unwrap_or(""), it["title"].as_str().unwrap_or(""), qualified(&it["frees_alone_gb"], it["frees_confidence"].as_str().unwrap_or(""))));
         }

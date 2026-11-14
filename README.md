@@ -145,6 +145,37 @@ to do if it doesn't start, and how to check it worked.
 - Settings › General › **Check memory speed** turns all of it off (`[general] check_ram_speed = false`).
   `memguard ram` still works.
 
+## Disk and Dev Drive
+
+A cook that runs out of disk fails late, and on a Dev Drive the usual folder sizes are wrong several times
+over: lanes, worktrees and the git LFS store share the same clusters (block clones), so Explorer counts
+them again and again. On the team PC, files on D: add up to 4.5 TB on a 1.9 TB drive. Ather MemGuard
+watches free space, checks the Dev Drive is set up to be fast, and counts what could go without counting
+anything twice. It only reports: it never deletes or moves files, and needs no admin rights.
+
+- **Watching:** every 60 seconds the tray reads free space on Dev Drives, the system drive (page file) and
+  drives holding projects, Unreal's DDC or Zen, or TEMP; each drive is one row however it's reached. A
+  drive is **getting full** below the smaller of 150 GB and 10% free, and **almost full** below the smaller
+  of 50 GB and 5%. A toast says so once per change ("Your Dev Drive is almost full. D: has 38 GB free, and
+  a cook usually needs 100 GB."), with 5 GB of slack before it changes back. The flyout shows one line,
+  "D: Dev Drive · 469 GB free".
+- **Dev Drive health:** whether the Dev Drive is trusted, whether Defender's performance mode is on,
+  whether antivirus filters are allowed on Dev Drives, whether big caches sit on C:, and another antivirus.
+  Fixes that need an administrator are shown with the exact command and how to check it worked; Ather
+  MemGuard doesn't run them. These rows also show under **This PC** in the checkup.
+- **Before a cook:** `memguard wait --for cook --disk-path D:\s2` returns at once with exit code 2 when the
+  project's drive has less than `disk_gb` free (or the DDC, Zen or TEMP drive less than
+  `cache_min_free_gb`), because disk space doesn't free itself.
+- **Disk checkup:** `memguard disk checkup [--path D:\s2]` lists build files, caches, logs, lanes and
+  worktrees, each with what it holds and what removing it would free, counted from the drive's own
+  reference counts, with how far to trust each number (exact, at least, about, at most). Totals exist only
+  for a named set, counted once. `memguard disk plan d7 d9` counts exactly those again, fresh. Counting
+  runs in a separate low-priority process, a few threads at a time, for at most a minute by default, and
+  stops if a build or cook starts.
+- **"Frees" is predicted.** It comes from the drive's reference counts and has not been checked against a
+  real delete. On ReFS (Dev Drives), deleted space has been seen to come back much later, and in bulk:
+  **deleting on this drive may take a long time to show up as free space.**
+
 ## Memory history
 
 **Memory history** (tray menu) charts the last 1 hour, 6 hours, 24 hours or 7 days: Unreal's committed
@@ -223,6 +254,13 @@ memguard prime [--for build] [--kill-orphans] [--json]
 memguard wait --for cook [--prime] [--timeout 600] [--json]
 memguard wait --ram-gb 24 --commit-gb 40
                                   block until there's enough headroom; exit 0 = ready, 2 = timed out
+memguard wait --for cook --disk-path D:\s2 [--disk-gb 100]
+                                  also check the project's drive (and the DDC, Zen, TEMP drives);
+                                  too little disk returns at once with exit 2, blocked_by ["disk"]
+memguard disk [--json] [--refresh]  drives, how full they are, Dev Drive health (changes nothing)
+memguard disk checkup [--path D:\s2] [--refresh] [--budget-sec 60] [--json]
+                                  what could go and what removing it frees (predicted; deletes nothing)
+memguard disk plan d7 d9 [--json]   fresh numbers for exactly these checkup items
 memguard run --cap-gb 48 [--per-process-cap-gb N] [--priority low] [--cpu below] -- <command...>
                                   run a command (and its children) under a hard memory cap;
                                   the command's exit code is passed through
@@ -249,8 +287,10 @@ The tray app also writes `%APPDATA%\AtherMemGuard\status.json` every interval, w
 
 `memguard mcp` is an MCP server over stdio, so Claude Code, Codex and other coding agents can call
 MemGuard as tools: `memguard_status`, `memguard_prime`, `memguard_wait`, `memguard_advise`,
-`memguard_history`, `memguard_doctor` and `memguard_ram`. Only `memguard_prime` and `memguard_wait` with
-`prime` change anything (they free memory); the rest are read-only. The agent
+`memguard_history`, `memguard_doctor`, `memguard_ram`, `memguard_disk`, `memguard_disk_checkup` and
+`memguard_disk_plan`. Only `memguard_prime` and `memguard_wait` with `prime` change anything (they free
+memory); the rest are read-only, and no tool deletes files. Agents are told to quote disk "frees" numbers
+as predicted and never to promise space right after a delete. The agent
 starts it by itself; there is no port and nothing to enable. Run `memguard agent-setup` for ready-to-paste
 setup, or add it to Claude Code with:
 
@@ -366,6 +406,24 @@ keep_days = 7                  # day files this old are deleted
 
 [ue]
 editor_growth_alert_gb_per_hour = 6   # tell you when an editor keeps growing this fast; 0 = off
+
+[prime]
+cook = { ram_gb = 32, commit_gb = 48, disk_gb = 100 }   # disk_gb: free disk `memguard wait` wants
+
+[disk]
+enabled = true                 # watch free space; see Disk and Dev Drive
+watch = ["auto"]               # Dev Drives, system drive, drives with projects, DDC/Zen, TEMP
+elevated_free_gb = 150         # a level applies below the smaller of the GB and the percent figure
+elevated_free_pct = 10
+critical_free_gb = 50
+critical_free_pct = 5
+cache_min_free_gb = 20         # what `memguard wait` wants free where the DDC, Zen and TEMP are
+project_dirs = []              # where the disk checkup looks for Unreal projects
+lane_dirs = []                 # extra folders holding lanes or worktrees
+scan_budget_sec = 60           # how long a disk checkup may count
+scan_threads = 4
+fresh_sec = 300                # older counts are reported as "about"
+check_dev_drive = true         # Dev Drive health rows
 
 [[group]]
 name = "Browsers"

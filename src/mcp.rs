@@ -127,6 +127,8 @@ impl Server {
     /// Handle one incoming line. Returns the reply, or `None` for notifications and for
     /// responses the client sends us. Progress notifications go straight to `out`.
     pub fn handle_line<W: Write>(&self, line: &str, out: &mut W) -> io::Result<Option<Value>> {
+        // Some shells put a byte-order mark before the first line they pipe.
+        let line = line.trim_start_matches('\u{feff}');
         let msg: Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(e) => return Ok(Some(error_reply(Value::Null, PARSE_ERROR, &format!("Parse error: {}", e)))),
