@@ -70,6 +70,7 @@ pub fn sample_status() -> Status {
                 committed_gb: 43.8,
                 ram_gb: 31.2,
                 uptime_min: 30,
+                created: 0,
             }],
             workers: 3,
             workers_committed_gb: 2.4,

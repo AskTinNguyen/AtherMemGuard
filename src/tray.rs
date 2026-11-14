@@ -930,7 +930,7 @@ impl App {
             .iter()
             .filter(|p| p.kind == "editor")
             .max_by(|a, b| a.committed_gb.total_cmp(&b.committed_gb))
-            .and_then(|p| self.engine.history().editor_growth_gb_per_hour(p.pid));
+            .and_then(|p| self.engine.history().editor_growth_gb_per_hour(p.pid, p.created));
         let note = self.engine.paused.then(|| match self.engine.pause_until() {
             Some(t) => format!("Other apps are back to normal until {}.", clock_after(t.saturating_duration_since(Instant::now()))),
             None => "Other apps are back to normal until you resume.".to_string(),

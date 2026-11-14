@@ -20,7 +20,12 @@ const DAY_SECS: i64 = 86_400;
 /// Window for the editor growth slope.
 const GROWTH_WINDOW_SECS: i64 = 30 * 60;
 /// Less history than this for an editor and there is no slope.
-const GROWTH_MIN_SPAN_SECS: i64 = 10 * 60;
+const GROWTH_MIN_SPAN_SECS: i64 = 20 * 60;
+/// An editor's first minutes are spent loading (tens of GB in a couple of minutes, then
+/// flat); that ramp is not growth, so samples this young are left out.
+const GROWTH_SETTLE_SECS: i64 = 10 * 60;
+/// Seconds between 1601-01-01 (FILETIME) and 1970-01-01.
+const FILETIME_UNIX_DIFF_SECS: i64 = 11_644_473_600;
 const FIXED_COLUMNS: [&str; 8] =
     ["time", "mode", "pressure", "ram_free_gb", "commit_free_gb", "ue_committed_gb", "editor_committed_gb", "workers"];
 
@@ -44,15 +49,21 @@ pub struct Sample {
     pub editor_committed_gb: f64,
     pub workers: usize,
     pub groups: Vec<GroupRam>,
-    /// Committed GB per editor process (pid, GB). In memory only, not in the CSV.
+    /// Committed GB per editor process (pid, creation time as FILETIME or 0, GB). The
+    /// creation time tells a recycled pid apart. In memory only, not in the CSV.
     #[serde(skip)]
-    pub editors: Vec<(u32, f64)>,
+    pub editors: Vec<(u32, u64, f64)>,
 }
 
 impl Sample {
     pub fn from_status(st: &Status, unix: i64) -> Sample {
-        let editors: Vec<(u32, f64)> =
-            st.ue.processes.iter().filter(|p| p.kind == "editor").map(|p| (p.pid, p.committed_gb)).collect();
+        let editors: Vec<(u32, u64, f64)> = st
+            .ue
+            .processes
+            .iter()
+            .filter(|p| p.kind == "editor")
+            .map(|p| (p.pid, p.created, p.committed_gb))
+            .collect();
         Sample {
             unix,
             time: st.time.clone(),
@@ -61,7 +72,7 @@ impl Sample {
             ram_free_gb: st.system.ram_free_gb,
             commit_free_gb: st.system.commit_free_gb,
             ue_committed_gb: st.ue.total_committed_gb,
-            editor_committed_gb: round2(editors.iter().map(|e| e.1).sum()),
+            editor_committed_gb: round2(editors.iter().map(|e| e.2).sum()),
             workers: st.ue.workers,
             groups: st.groups.iter().map(|g| GroupRam { name: g.name.clone(), ram_gb: round2(g.ram_mb as f64 / 1024.0) }).collect(),
             editors,
@@ -193,21 +204,35 @@ impl History {
         load_day_from(&dir, date, local_offset_secs())
     }
 
-    /// Least-squares slope of this editor's committed memory over the last 30 minutes, in GB
-    /// per hour. `None` with under 10 minutes of samples for it.
-    pub fn editor_growth_gb_per_hour(&self, pid: u32) -> Option<f64> {
+    /// How fast this editor's committed memory grows, in GB per hour: the least-squares
+    /// slope over the last 30 minutes, capped at twice the slope of either half of that
+    /// window. `created` is the process creation time (FILETIME, 0 if unknown), so a
+    /// recycled pid gets its own series.
+    ///
+    /// `None` until there are 20 minutes of samples for it, not counting its first 10
+    /// minutes (loading). The cap keeps a load ramp that went flat, or a single step, from
+    /// reading as steady growth: both halves have to grow.
+    pub fn editor_growth_gb_per_hour(&self, pid: u32, created: u64) -> Option<f64> {
         let end = self.ring.back()?.unix;
+        let mut from = end - GROWTH_WINDOW_SECS;
+        if created > 0 {
+            from = from.max((created / 10_000_000) as i64 - FILETIME_UNIX_DIFF_SECS + GROWTH_SETTLE_SECS);
+        }
         let points: Vec<(f64, f64)> = self
             .ring
             .iter()
-            .filter(|s| s.unix >= end - GROWTH_WINDOW_SECS)
-            .filter_map(|s| s.editors.iter().find(|e| e.0 == pid).map(|e| (s.unix as f64, e.1)))
+            .filter(|s| s.unix >= from)
+            .filter_map(|s| s.editors.iter().find(|e| e.0 == pid && e.1 == created).map(|e| (s.unix as f64, e.2)))
             .collect();
         let (first, last) = (points.first()?.0, points.last()?.0);
         if last - first < GROWTH_MIN_SPAN_SECS as f64 {
             return None;
         }
-        slope_per_hour(&points)
+        let slope = slope_per_hour(&points)?;
+        let mid = points.partition_point(|p| p.0 < (first + last) / 2.0);
+        let early = slope_per_hour(&points[..mid])?;
+        let late = slope_per_hour(&points[mid..])?;
+        Some(slope.min(2.0 * early).min(2.0 * late))
     }
 }
 
@@ -477,6 +502,16 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn sample(unix: i64, editors: &[(u32, f64)]) -> Sample {
+        let editors: Vec<(u32, u64, f64)> = editors.iter().map(|&(pid, gb)| (pid, 0, gb)).collect();
+        sample_c(unix, &editors)
+    }
+
+    /// FILETIME for a unix time.
+    fn ft(unix: i64) -> u64 {
+        (unix + FILETIME_UNIX_DIFF_SECS) as u64 * 10_000_000
+    }
+
+    fn sample_c(unix: i64, editors: &[(u32, u64, f64)]) -> Sample {
         let day = unix.div_euclid(DAY_SECS);
         let secs = unix.rem_euclid(DAY_SECS);
         Sample {
@@ -487,7 +522,7 @@ mod tests {
             ram_free_gb: 12.5,
             commit_free_gb: 30.25,
             ue_committed_gb: 40.0,
-            editor_committed_gb: editors.iter().map(|e| e.1).sum::<f64>() + 0.0,
+            editor_committed_gb: editors.iter().map(|e| e.2).sum::<f64>() + 0.0,
             workers: 3,
             groups: vec![
                 GroupRam { name: "Browsers".into(), ram_gb: 2.5 },
@@ -524,28 +559,92 @@ mod tests {
             let hours = (i * 10) as f64 / 3600.0;
             h.push(sample(t, &[(7, 20.0 + 6.0 * hours), (9, 30.0)]));
         }
-        let g = h.editor_growth_gb_per_hour(7).unwrap();
+        let g = h.editor_growth_gb_per_hour(7, 0).unwrap();
         assert!((g - 6.0).abs() < 1e-6, "{}", g);
-        assert!(h.editor_growth_gb_per_hour(9).unwrap().abs() < 1e-9);
-        assert!(h.editor_growth_gb_per_hour(1234).is_none());
+        assert!(h.editor_growth_gb_per_hour(9, 0).unwrap().abs() < 1e-9);
+        assert!(h.editor_growth_gb_per_hour(1234, 0).is_none());
+        assert!(h.editor_growth_gb_per_hour(7, ft(T0)).is_none(), "a different creation time is another process");
     }
 
     #[test]
-    fn growth_needs_ten_minutes() {
+    fn growth_needs_twenty_minutes() {
         let mut h = History::in_memory();
-        for i in 0..=59 {
-            h.push(sample(T0 + i * 10, &[(7, 20.0 + i as f64)]));
+        for i in 0..=119 {
+            h.push(sample(T0 + i * 10, &[(7, 20.0 + i as f64 * 0.01)]));
         }
-        assert!(h.editor_growth_gb_per_hour(7).is_none()); // 590 s
-        h.push(sample(T0 + 600, &[(7, 80.0)]));
-        assert!(h.editor_growth_gb_per_hour(7).is_some());
+        assert!(h.editor_growth_gb_per_hour(7, 0).is_none()); // 1190 s
+        h.push(sample(T0 + 1200, &[(7, 21.2)]));
+        assert!(h.editor_growth_gb_per_hour(7, 0).is_some());
         // Only the last 30 minutes count: an old ramp followed by a flat hour is flat.
         let mut h = History::in_memory();
         for i in 0..360 {
             let gb = if i < 180 { i as f64 } else { 180.0 };
             h.push(sample(T0 + i * 20, &[(7, gb)]));
         }
-        assert!(h.editor_growth_gb_per_hour(7).unwrap().abs() < 1e-9);
+        assert!(h.editor_growth_gb_per_hour(7, 0).unwrap().abs() < 1e-9);
+    }
+
+    /// Like the history CSV of a real editor: loads ~2 -> 46 GB in 150 s, then stays flat.
+    #[test]
+    fn growth_ignores_load_ramp() {
+        let born = T0;
+        for created in [ft(born), 0] {
+            let mut h = History::in_memory();
+            let mut worst: f64 = 0.0;
+            for i in 0..=(60 * 6) {
+                let t = born + 5 + i * 10;
+                let age = (t - born) as f64;
+                let gb = if age < 150.0 { 2.0 + 44.0 * age / 150.0 } else { 46.0 + if i % 2 == 0 { 0.02 } else { -0.02 } };
+                h.push(sample_c(t, &[(7, created, gb)]));
+                if let Some(g) = h.editor_growth_gb_per_hour(7, created) {
+                    worst = worst.max(g);
+                }
+            }
+            assert!(worst < 1.0, "created {}: read {} GB/h from a load ramp", created, worst);
+        }
+    }
+
+    #[test]
+    fn growth_ignores_single_step() {
+        // A long-running editor, flat at 20 GB, takes one 2 GB step at minute 40.
+        let created = ft(T0 - 3600);
+        let mut h = History::in_memory();
+        let mut worst: f64 = 0.0;
+        for i in 0..=(90 * 6) {
+            let t = T0 + i * 10;
+            let gb = if i < 40 * 6 { 20.0 } else { 22.0 };
+            h.push(sample_c(t, &[(7, created, gb)]));
+            if let Some(g) = h.editor_growth_gb_per_hour(7, created) {
+                worst = worst.max(g);
+            }
+        }
+        assert!(worst < 3.0, "read {} GB/h from a single step", worst);
+        // Steady growth still reads as growth.
+        let mut h = History::in_memory();
+        for i in 0..=(30 * 6) {
+            let t = T0 + i * 10;
+            h.push(sample_c(t, &[(7, created, 20.0 + 12.0 * (i * 10) as f64 / 3600.0)]));
+        }
+        let g = h.editor_growth_gb_per_hour(7, created).unwrap();
+        assert!((g - 12.0).abs() < 1e-6, "{}", g);
+    }
+
+    #[test]
+    fn growth_series_per_process_not_per_pid() {
+        // Editor pid 7 sits at 40 GB for an hour and exits; a new editor gets pid 7 and
+        // grows 12 GB/h from 5 GB. The old samples must not bend the new slope.
+        let (old, new) = (ft(T0 - 7200), ft(T0 + 3600));
+        let mut h = History::in_memory();
+        for i in 0..(60 * 6) {
+            h.push(sample_c(T0 + i * 10, &[(7, old, 40.0)]));
+        }
+        for i in 0..=(40 * 6) {
+            let t = T0 + 3600 + i * 10;
+            h.push(sample_c(t, &[(7, new, 5.0 + 12.0 * (i * 10) as f64 / 3600.0)]));
+        }
+        let g = h.editor_growth_gb_per_hour(7, new).unwrap();
+        assert!((g - 12.0).abs() < 1e-6, "{}", g);
+        assert!(h.editor_growth_gb_per_hour(7, old).is_none());
     }
 
     #[test]

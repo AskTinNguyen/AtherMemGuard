@@ -112,6 +112,9 @@ pub struct UeProcess {
     pub committed_gb: f64,
     pub ram_gb: f64,
     pub uptime_min: u64,
+    /// Creation time as FILETIME, 0 if unknown. Tells a recycled pid apart.
+    #[serde(skip)]
+    pub created: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -281,6 +284,7 @@ pub fn analyze(cfg: &Config, snap: &Snapshot) -> Status {
                 committed_gb: gb(p.committed),
                 ram_gb: gb(p.ram),
                 uptime_min: if p.created > 0 && snap.now > p.created { (snap.now - p.created) / 600_000_000 } else { 0 },
+                created: p.created,
             });
         } else if lower == "unrealbuildtool" {
             act.build = true;
@@ -408,7 +412,7 @@ struct Hints {
 }
 
 impl Hints {
-    fn update(&mut self, cfg: &Config, st: &Status, growth: impl Fn(u32) -> Option<f64>) -> Vec<Event> {
+    fn update(&mut self, cfg: &Config, st: &Status, growth: impl Fn(&UeProcess) -> Option<f64>) -> Vec<Event> {
         let editors: Vec<&UeProcess> = st.ue.processes.iter().filter(|p| p.kind == "editor").collect();
         let alive: HashSet<u32> = editors.iter().map(|p| p.pid).collect();
         self.restart.retain(|pid| alive.contains(pid));
@@ -424,7 +428,7 @@ impl Hints {
             } else {
                 self.restart.remove(&p.pid);
             }
-            match growth(p.pid).filter(|_| alert > 0.0) {
+            match growth(p).filter(|_| alert > 0.0) {
                 Some(g) if g >= alert => {
                     if self.growing.insert(p.pid) {
                         out.push(Event::EditorGrowing {
@@ -623,7 +627,7 @@ impl Engine {
         let reason = auto_prime_reason(self.prev_activities, st.activities);
         self.prev_activities = Some(st.activities);
         let history = &self.history;
-        let hints = self.hints.update(&self.cfg, st, |pid| history.editor_growth_gb_per_hour(pid));
+        let hints = self.hints.update(&self.cfg, st, |p| history.editor_growth_gb_per_hour(p.pid, p.created));
         for e in hints {
             self.push_event(e);
         }
@@ -936,6 +940,9 @@ mod tests {
         assert_eq!(auto_prime_reason(Some(a(false, false, false)), a(false, true, true)), Some("build"));
     }
 
+    /// Creation time of the test editors: an hour before the history samples start.
+    const TEST_CREATED: u64 = (1_794_000_000 - 3600 + 11_644_473_600) * 10_000_000;
+
     fn status(level: Level, act: Activities, editors: &[(u32, f64)]) -> Status {
         Status {
             time: "2026-11-14 12:00:00".into(),
@@ -955,6 +962,7 @@ mod tests {
                         committed_gb: gb,
                         ram_gb: gb,
                         uptime_min: 60,
+                        created: TEST_CREATED,
                     })
                     .collect(),
                 ..Default::default()
@@ -1045,8 +1053,8 @@ mod tests {
         e.cfg.ue.editor_growth_alert_gb_per_hour = 6.0;
         let act = Activities { editor: true, ..Default::default() };
         let mut fired = Vec::new();
-        for i in 0..=120 {
-            let gb = 20.0 + 12.0 * (i * 10) as f64 / 3600.0; // 12 GB/h
+        for i in 0..=180 {
+            let gb = 20.0 + 12.0 * (i * 10) as f64 / 3600.0; // 12 GB/h for 30 minutes
             let mut s = crate::history::Sample::from_status(&status(Level::Normal, act, &[(10, gb)]), 1_794_000_000 + i * 10);
             s.time = "2026-11-14 12:00:00".into();
             e.history.push(s);

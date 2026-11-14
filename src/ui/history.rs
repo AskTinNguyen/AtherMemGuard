@@ -158,7 +158,7 @@ impl FakeHistory {
                 GroupRam { name: "Chat".into(), ram_gb: chat },
                 GroupRam { name: "Agents".into(), ram_gb: agents },
             ],
-            editors: if editor > 0.0 { vec![(pid, editor)] } else { vec![] },
+            editors: if editor > 0.0 { vec![(pid, 0, editor)] } else { vec![] },
         }
     }
 }

@@ -2296,8 +2296,8 @@ mod tests {
             inp.procs.push(proc(100 + i, 1, "git", 5));
         }
         inp.ue = vec![
-            UeProcess { pid: 1, name: "UnrealEditor".into(), kind: "editor", committed_gb: 50.0, ram_gb: 30.0, uptime_min: 125 },
-            UeProcess { pid: 2, name: "UnrealEditor".into(), kind: "editor", committed_gb: 10.0, ram_gb: 8.0, uptime_min: 5 },
+            UeProcess { pid: 1, name: "UnrealEditor".into(), kind: "editor", committed_gb: 50.0, ram_gb: 30.0, uptime_min: 125, created: 0 },
+            UeProcess { pid: 2, name: "UnrealEditor".into(), kind: "editor", committed_gb: 10.0, ram_gb: 8.0, uptime_min: 5, created: 0 },
         ];
         inp.sys.commit_limit = 70 * GIB; // < 1.4 x 64 GB RAM
         inp.sys.commit_used = 66 * GIB; // ~5.7% free
