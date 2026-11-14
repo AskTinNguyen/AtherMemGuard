@@ -86,5 +86,6 @@ pub fn sample_status() -> Status {
         ],
         advice: Vec::new(),
         worker_pids: Vec::new(),
+        disk: None,
     }
 }
