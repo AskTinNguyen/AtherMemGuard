@@ -1,9 +1,9 @@
 {
     "windows":  {
-                    "version":  "0.2.0",
-                    "url":  "https://github.com/AskTinNguyen/AtherMemGuard/releases/download/v0.2.0/AtherMemGuard-Setup-0.2.0.exe",
-                    "sha256":  "d65908b6788c379104c04f23fded8cb09cdf68012187d9b948232a8e8b449d82",
-                    "size":  5980160,
-                    "notes":  "Settings window, tray flyout, checkup, RAM and BIOS check, memory history and updates in the app."
+                    "version":  "0.2.2",
+                    "url":  "https://github.com/AskTinNguyen/AtherMemGuard/releases/download/v0.2.2/AtherMemGuard-Setup-0.2.2.exe",
+                    "sha256":  "7e37626b37c2d08791242ff5e22919bba867f94e24255fab0622c55bbb841478",
+                    "size":  6164480,
+                    "notes":  "The flyout shows where every GB of RAM goes, and can empty Windows\u0027 file cache. Also half the CPU in the background."
                 }
 }
