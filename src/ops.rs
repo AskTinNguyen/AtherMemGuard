@@ -152,6 +152,76 @@ pub fn prime(cfg: &Config, target: Option<&str>, kill_orphans: bool) -> PrimeRep
     }
 }
 
+// ---------------------------------------------------------------- Windows file cache
+
+/// How emptying Windows' file cache went.
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheFlushReport {
+    pub ok: bool,
+    /// The person said no to the Windows administrator prompt.
+    pub declined: bool,
+    /// What went wrong, in words.
+    pub error: Option<String>,
+    pub ram_free_before_gb: f64,
+    pub ram_free_after_gb: f64,
+    pub file_cache_before_gb: f64,
+    pub file_cache_after_gb: f64,
+}
+
+impl CacheFlushReport {
+    /// RAM that came back, never negative.
+    pub fn freed_gb(&self) -> f64 {
+        ((self.ram_free_after_gb - self.ram_free_before_gb) * 10.0).round().max(0.0) / 10.0
+    }
+}
+
+/// Empty the file cache, then write out the modified list, in this process. Needs
+/// administrator rights. The modified list is best effort: only the file cache failing is
+/// an error.
+pub fn flush_cache_here() -> Result<(), String> {
+    win::flush_file_cache()?;
+    if let Err(e) = win::flush_modified_list() {
+        crate::log::write(&format!("flush cache: modified list: {}", e));
+    }
+    Ok(())
+}
+
+/// Empty Windows' file cache and say what came back. When this process is elevated it does
+/// it itself; otherwise it starts `exe args` with administrator rights (Windows asks first),
+/// which must call `flush_cache_here` and exit 0 when that worked. Blocks until done.
+pub fn flush_cache(exe: &std::path::Path, args: &str) -> CacheFlushReport {
+    let gb = |b: u64| (b as f64 / GB * 10.0).round() / 10.0;
+    let before = win::sys_info();
+    let result = if win::is_elevated() {
+        flush_cache_here().map_err(|e| (false, e))
+    } else {
+        match win::run_elevated(exe, args, 120_000) {
+            Ok(0) => Ok(()),
+            Ok(code) => Err((false, format!("Windows didn't let it empty the cache (exit code {}; details in the log)", code))),
+            Err(win::ElevateError::Declined) => Err((true, "administrator permission was declined".to_string())),
+            Err(win::ElevateError::Failed(e)) => Err((false, e)),
+        }
+    };
+    // The cache's pages move to the standby list at once; give the counters a moment.
+    if result.is_ok() {
+        sleep(Duration::from_millis(500));
+    }
+    let after = win::sys_info();
+    let (declined, error) = match result {
+        Ok(()) => (false, None),
+        Err((d, e)) => (d, Some(e)),
+    };
+    CacheFlushReport {
+        ok: error.is_none(),
+        declined,
+        error,
+        ram_free_before_gb: gb(before.ram_avail),
+        ram_free_after_gb: gb(after.ram_avail),
+        file_cache_before_gb: gb(before.resident_system_cache),
+        file_cache_after_gb: gb(after.resident_system_cache),
+    }
+}
+
 // ---------------------------------------------------------------- wait
 
 #[derive(Debug, Serialize)]

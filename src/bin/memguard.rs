@@ -320,6 +320,12 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Empty Windows' file cache so its RAM is free again. Asks for administrator permission.
+    /// Exit code 0 = done, 1 = failed, 3 = permission declined
+    FlushCache {
+        #[arg(long)]
+        json: bool,
+    },
     /// Run the background engine in this console, without the tray icon
     Daemon,
     /// Install for this user, start at sign-in and start now
@@ -644,6 +650,27 @@ fn main() -> ExitCode {
                 }
             }
             ExitCode::SUCCESS
+        }
+
+        Cmd::FlushCache { json } => {
+            // Not elevated: start this same command elevated (hidden), which then does it here.
+            let exe = std::env::current_exe().unwrap_or_else(|_| "memguard.exe".into());
+            let r = ops::flush_cache(&exe, "flush-cache");
+            if win::is_elevated() && !r.ok {
+                // The elevated copy: its details go to the log for the copy that started it.
+                athermemguard::log::write(&format!("flush-cache: {}", r.error.as_deref().unwrap_or("failed")));
+            }
+            if json {
+                print_json(&r);
+            } else if r.ok {
+                println!(
+                    "Emptied Windows' file cache: {:.1} GB -> {:.1} GB. RAM free {:.1} GB -> {:.1} GB.",
+                    r.file_cache_before_gb, r.file_cache_after_gb, r.ram_free_before_gb, r.ram_free_after_gb
+                );
+            } else {
+                eprintln!("Windows' file cache wasn't emptied: {}.", r.error.as_deref().unwrap_or("unknown error"));
+            }
+            ExitCode::from(if r.ok { 0 } else if r.declined { 3 } else { 1 })
         }
 
         Cmd::WriteIcon { path } => match athermemguard::logo::write_ico(&path) {

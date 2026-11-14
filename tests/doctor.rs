@@ -357,7 +357,7 @@ fn settings_actions_edit_and_undo_the_temp_settings_file() {
     assert_eq!(ds.keep, vec!["DoctorTestMystery".to_string()]);
     doctor::validate_settings(&text).unwrap();
     let mut guard = doctor::Guard::from_settings();
-    let p = win::Proc { pid: 4242, ppid: 1, name: "DoctorTestGame".into(), ram: 0, committed: 0, created: 1, queryable: true };
+    let p = win::Proc { pid: 4242, ppid: 1, name: "DoctorTestGame".into(), ram: 0, private: 0, committed: 0, created: 1, queryable: true };
     assert_eq!(guard.on_tick(std::slice::from_ref(&p), true).len(), 1, "the guard picks up the new list");
 
     // Hold back a second time: nothing new to add.

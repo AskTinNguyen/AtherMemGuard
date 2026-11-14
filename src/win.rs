@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::mem::{size_of, zeroed};
+use std::mem::{size_of, size_of_val, zeroed};
 use std::ptr::{null, null_mut};
 use std::sync::Mutex;
 
@@ -43,6 +43,7 @@ extern "system" {
     fn NtResumeProcess(process: HANDLE) -> i32;
     fn NtQueryInformationProcess(process: HANDLE, class: u32, info: *mut c_void, len: u32, ret: *mut u32) -> i32;
     fn NtQuerySystemInformation(class: u32, info: *mut c_void, len: u32, ret: *mut u32) -> i32;
+    fn NtSetSystemInformation(class: u32, info: *mut c_void, len: u32) -> i32;
 }
 
 /// Owned kernel handle, closed on drop.
@@ -103,6 +104,16 @@ pub struct SysInfo {
     pub commit_limit: u64,
     pub file_cache: u64,
     pub nonpaged_pool: u64,
+    /// Kernel paged pool, bytes, wherever it is (part of it may be paged out).
+    pub paged_pool: u64,
+    /// Kernel memory that is in RAM right now, bytes, from SystemPerformanceInformation. All
+    /// zero when that call failed or its numbers didn't check out against
+    /// K32GetPerformanceInfo (an unexpected layout).
+    pub resident_paged_pool: u64,
+    pub resident_system_code: u64,
+    pub resident_drivers: u64,
+    /// The system file cache's working set (mapped file data in RAM, not the standby list).
+    pub resident_system_cache: u64,
 }
 
 impl SysInfo {
@@ -125,6 +136,44 @@ pub fn sys_info() -> SysInfo {
         commit_limit: pi.CommitLimit as u64 * page,
         file_cache: pi.SystemCache as u64 * page,
         nonpaged_pool: pi.KernelNonpaged as u64 * page,
+        paged_pool: pi.KernelPaged as u64 * page,
+        ..kernel_resident(&pi)
+    }
+}
+
+const SYSTEM_PERFORMANCE_INFORMATION_CLASS: u32 = 2;
+
+/// The resident_* fields of `SysInfo` from NtQuerySystemInformation(SystemPerformanceInformation).
+/// The struct isn't in the SDK, so it is read as an array of u32 at the offsets the NT headers
+/// give, and only trusted when its available and commit counts match `pi` (taken a moment
+/// earlier, so within a few percent).
+fn kernel_resident(pi: &PERFORMANCE_INFORMATION) -> SysInfo {
+    // In u32 units: four LARGE_INTEGERs, then ULONGs.
+    const AVAILABLE: usize = 11;
+    const COMMIT_LIMIT: usize = 13;
+    const RESIDENT_SYSTEM_CODE: usize = 35;
+    const RESIDENT_SYSTEM_CACHE: usize = 41;
+    const RESIDENT_PAGED_POOL: usize = 42;
+    const RESIDENT_SYSTEM_DRIVER: usize = 43;
+    let mut buf = [0u32; 1024];
+    let mut ret = 0u32;
+    let status = unsafe {
+        NtQuerySystemInformation(SYSTEM_PERFORMANCE_INFORMATION_CLASS, buf.as_mut_ptr() as *mut c_void, size_of_val(&buf) as u32, &mut ret)
+    };
+    if status < 0 || (ret as usize) < (RESIDENT_SYSTEM_DRIVER + 1) * 4 {
+        return SysInfo::default();
+    }
+    let near = |a: u64, b: u64| a.abs_diff(b) <= b / 20 + 4096;
+    if !near(buf[AVAILABLE] as u64, pi.PhysicalAvailable as u64) || buf[COMMIT_LIMIT] as u64 != pi.CommitLimit as u64 {
+        return SysInfo::default();
+    }
+    let page = pi.PageSize as u64;
+    SysInfo {
+        resident_paged_pool: buf[RESIDENT_PAGED_POOL] as u64 * page,
+        resident_system_code: buf[RESIDENT_SYSTEM_CODE] as u64 * page,
+        resident_drivers: buf[RESIDENT_SYSTEM_DRIVER] as u64 * page,
+        resident_system_cache: buf[RESIDENT_SYSTEM_CACHE] as u64 * page,
+        ..SysInfo::default()
     }
 }
 
@@ -136,8 +185,11 @@ pub struct Proc {
     pub ppid: u32,
     /// Executable name without `.exe`.
     pub name: String,
-    /// Physical RAM in use (working set), bytes.
+    /// Physical RAM in use (working set), bytes. Includes pages shared with other processes.
     pub ram: u64,
+    /// The part of `ram` only this process uses (private working set), bytes. Adding these
+    /// up across processes counts nothing twice. 0 where it isn't known (the Toolhelp list).
+    pub private: u64,
     /// Committed private memory, bytes.
     pub committed: u64,
     /// Creation time as FILETIME, 0 if unknown.
@@ -196,6 +248,7 @@ struct SpiEntry {
     ppid: u32,
     name: String,
     ram: u64,
+    private: u64,
     committed: u64,
     created: u64,
 }
@@ -235,6 +288,7 @@ fn parse_spi(buf: &[u8]) -> Vec<SpiEntry> {
             ppid: e.inherited_from_unique_process_id as u32,
             name,
             ram: e.working_set_size as u64,
+            private: e.working_set_private_size.max(0) as u64,
             committed: e.pagefile_usage as u64,
             created: e.create_time.max(0) as u64,
         });
@@ -293,7 +347,7 @@ pub fn list_processes() -> Vec<Proc> {
                 None => e.pid != 0 && open(e.pid, PROCESS_QUERY_LIMITED_INFORMATION).is_some(),
             };
             seen.insert(key, queryable);
-            Proc { pid: e.pid, ppid: e.ppid, name: e.name, ram: e.ram, committed: e.committed, created: e.created, queryable }
+            Proc { pid: e.pid, ppid: e.ppid, name: e.name, ram: e.ram, private: e.private, committed: e.committed, created: e.created, queryable }
         })
         .collect();
     state.queryable = seen;
@@ -325,6 +379,7 @@ pub fn list_processes_toolhelp() -> Vec<Proc> {
             ppid: e.th32ParentProcessID,
             name,
             ram: 0,
+            private: 0,
             committed: 0,
             created: 0,
             queryable: false,
@@ -481,6 +536,123 @@ pub fn terminate(pid: u32) -> bool {
     }
 }
 
+// ---------------------------------------------------------------- Windows' file cache (needs admin)
+
+/// Is this process running with administrator rights (elevated)?
+pub fn is_elevated() -> bool {
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token: HANDLE = null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return false;
+    }
+    let token = Handle(token);
+    let mut e = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut ret = 0u32;
+    let ok = unsafe {
+        GetTokenInformation(token.0, TokenElevation, &mut e as *mut _ as *mut c_void, size_of::<TOKEN_ELEVATION>() as u32, &mut ret)
+    };
+    ok != 0 && e.TokenIsElevated != 0
+}
+
+/// Turn on a privilege this process's token holds but has off ("SeIncreaseQuotaPrivilege").
+/// False when the token doesn't hold it (not elevated).
+fn enable_privilege(name: &str) -> bool {
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_NOT_ALL_ASSIGNED, LUID};
+    use windows_sys::Win32::Security::{
+        AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+        TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token: HANDLE = null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token) } == 0 {
+        return false;
+    }
+    let token = Handle(token);
+    let mut luid = LUID { LowPart: 0, HighPart: 0 };
+    if unsafe { LookupPrivilegeValueW(null(), wide(name).as_ptr(), &mut luid) } == 0 {
+        return false;
+    }
+    let tp = TOKEN_PRIVILEGES { PrivilegeCount: 1, Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }] };
+    let ok = unsafe { AdjustTokenPrivileges(token.0, 0, &tp, 0, null_mut(), null_mut()) };
+    ok != 0 && unsafe { GetLastError() } != ERROR_NOT_ALL_ASSIGNED
+}
+
+/// Empty Windows' file cache: its pages move to the standby list, which counts as available
+/// RAM, so nothing is lost: Windows reads the files again if they are needed. Needs
+/// administrator rights (SeIncreaseQuotaPrivilege).
+pub fn flush_file_cache() -> Result<(), String> {
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::System::Memory::SetSystemFileCacheSize;
+    if !enable_privilege("SeIncreaseQuotaPrivilege") {
+        return Err("needs administrator rights".into());
+    }
+    // (SIZE_T)-1 for both limits empties the cache's working set.
+    if unsafe { SetSystemFileCacheSize(usize::MAX, usize::MAX, 0) } == 0 {
+        return Err(format!("SetSystemFileCacheSize failed (error {})", unsafe { GetLastError() }));
+    }
+    Ok(())
+}
+
+/// Write changed file data waiting in RAM (the modified list) to disk, so it becomes standby
+/// memory too. Needs administrator rights (SeProfileSingleProcessPrivilege).
+pub fn flush_modified_list() -> Result<(), String> {
+    const SYSTEM_MEMORY_LIST_INFORMATION: u32 = 80;
+    const MEMORY_FLUSH_MODIFIED_LIST: u32 = 3;
+    if !enable_privilege("SeProfileSingleProcessPrivilege") {
+        return Err("needs administrator rights".into());
+    }
+    let mut cmd = MEMORY_FLUSH_MODIFIED_LIST;
+    let status = unsafe { NtSetSystemInformation(SYSTEM_MEMORY_LIST_INFORMATION, &mut cmd as *mut u32 as *mut c_void, 4) };
+    if status < 0 {
+        return Err(format!("flushing the modified list failed (status {:#x})", status as u32));
+    }
+    Ok(())
+}
+
+/// Why `run_elevated` didn't run the program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ElevateError {
+    /// The person said no to the Windows administrator prompt.
+    Declined,
+    Failed(String),
+}
+
+/// Start `exe args` with administrator rights (Windows asks the person first), hidden, and
+/// wait up to `timeout_ms` for it to finish. Returns its exit code.
+pub fn run_elevated(exe: &std::path::Path, args: &str, timeout_ms: u32) -> Result<u32, ElevateError> {
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_CANCELLED, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::GetExitCodeProcess;
+    use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+    let verb = wide("runas");
+    let file = wide(&exe.to_string_lossy());
+    let params = wide(args);
+    let mut info: SHELLEXECUTEINFOW = unsafe { zeroed() };
+    info.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    info.lpVerb = verb.as_ptr();
+    info.lpFile = file.as_ptr();
+    info.lpParameters = params.as_ptr();
+    info.nShow = SW_HIDE;
+    if unsafe { ShellExecuteExW(&mut info) } == 0 {
+        let e = unsafe { GetLastError() };
+        return Err(if e == ERROR_CANCELLED { ElevateError::Declined } else { ElevateError::Failed(format!("could not start it (error {})", e)) });
+    }
+    if info.hProcess.is_null() {
+        return Err(ElevateError::Failed("Windows gave no process to wait for".into()));
+    }
+    let process = Handle(info.hProcess);
+    if unsafe { WaitForSingleObject(process.0, timeout_ms) } == WAIT_TIMEOUT {
+        return Err(ElevateError::Failed("it didn't finish in time".into()));
+    }
+    let mut code = 0u32;
+    if unsafe { GetExitCodeProcess(process.0, &mut code) } == 0 {
+        return Err(ElevateError::Failed("could not read how it ended".into()));
+    }
+    Ok(code)
+}
+
 // ---------------------------------------------------------------- hard caps (Job Objects)
 
 pub struct Job(Handle);
@@ -617,6 +789,23 @@ pub fn null_handle() -> HANDLE {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flushing_the_cache_needs_admin() {
+        // Elevated, this would really empty the cache: only the refusal is tested.
+        if !is_elevated() {
+            assert_eq!(flush_file_cache(), Err("needs administrator rights".to_string()));
+            assert_eq!(flush_modified_list(), Err("needs administrator rights".to_string()));
+        }
+    }
+
+    #[test]
+    fn kernel_counters_check_out() {
+        let s = sys_info();
+        // The layout check passed, so the resident counters are filled and plausible.
+        assert!(s.resident_paged_pool > 0 && s.resident_paged_pool <= s.paged_pool + (64 << 20), "{:?}", s);
+        assert!(s.resident_system_cache < s.ram_total);
+    }
 
     const SPI: usize = size_of::<SystemProcessInformation>();
     const MB: u64 = 1024 * 1024;

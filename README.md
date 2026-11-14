@@ -55,10 +55,13 @@ to normal. Settings, history and the log stay in `%APPDATA%\AtherMemGuard` in ca
 The tray icon is the Ather mark: an amber dot when memory is tight, red when it's critical, faded while
 paused. Its tooltip says the Unreal mode, the pressure and RAM / commit free.
 
-- **Left-click** opens the flyout: memory is fine / tight / critical, RAM free and commit free, what Unreal is
-  doing ("UnrealEditor · 43.8 GB · growing 2.1 GB an hour"), each app group against its cap, and the buttons
+- **Left-click** opens the flyout: memory is fine / tight / critical and where every GB of RAM in use is.
+  Unreal (editor, compile workers), other apps with the biggest named, each app group, Windows' file cache,
+  Windows and drivers, and what Windows squeezed or can't attribute add up to the total. When memory is
+  critical it says which apps to close and what that gets back. When Windows' file cache holds 1 GB or more,
+  "Empty it now" frees it (Windows asks for administrator permission each time). Commit free sits at the bottom. Then the buttons
   **Free memory**, **Pause 30 min** (or **Resume**) and **Settings**. "Run a checkup" opens the checkup.
-- **Right-click** opens the menu: Free memory now, Pause for 30 minutes, Pause until I resume, Settings,
+- **Right-click** opens the menu: Free memory now, Empty Windows file cache, Pause for 30 minutes, Pause until I resume, Settings,
   Memory history, Run a checkup, Check for updates, Run at Windows startup, Quit.
 - **Double-click** opens Settings.
 - **Ctrl+Alt+M** (change it in Settings) frees memory from anywhere. If another app already uses that
@@ -224,6 +227,7 @@ memguard run --cap-gb 48 [--per-process-cap-gb N] [--priority low] [--cpu below]
                                   run a command (and its children) under a hard memory cap;
                                   the command's exit code is passed through
 memguard advise [--json]            suggested -MaxParallelActions for the memory available now
+memguard flush-cache [--json]       empty Windows' file cache (asks for admin permission; exit 3 = declined)
 memguard history [--hours 1] [--json]    memory history the background app recorded
 memguard doctor [--json] [--fix ...] [--undo]   the checkup; see Checkup (doctor)
 memguard ram [--json] [--html <file>]    is the RAM running at its rated speed, and the BIOS steps if not

@@ -702,6 +702,25 @@ pub mod catalog {
         )
     }
 
+    /// "Free Windows file cache" worked.
+    pub fn cache_flushed(cache_before_gb: f64, ram_before_gb: f64, ram_after_gb: f64) -> Toast {
+        toast(
+            ToastKind::Info,
+            "Emptied Windows' file cache".into(),
+            format!("It held {} GB. RAM free went from {} to {} GB.", gb(cache_before_gb), gb(ram_before_gb), gb(ram_after_gb)),
+        )
+    }
+
+    /// "Free Windows file cache" didn't run: administrator permission was declined.
+    pub fn cache_flush_declined() -> Toast {
+        toast(ToastKind::Info, "Windows' file cache is unchanged".into(), "Emptying it needs administrator permission, and that was declined.".into())
+    }
+
+    /// "Free Windows file cache" failed.
+    pub fn cache_flush_failed(why: &str) -> Toast {
+        toast(ToastKind::Error, "Couldn't empty Windows' file cache".into(), format!("{}.", why.trim_end_matches('.')))
+    }
+
     /// Editor restart hint.
     pub fn editor_restart(committed_gb: f64, uptime_min: u64) -> Toast {
         toast(
