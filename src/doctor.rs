@@ -1061,10 +1061,20 @@ pub fn doc_add_to_list(doc: &mut toml_edit::DocumentMut, key: &str, names: &[Str
     Ok(added)
 }
 
-/// Remove exact names (case-insensitive) from a `[doctor]` list.
+/// Remove exact names (case-insensitive) from a `[doctor]` list. A list left empty is
+/// removed, and so is a `[doctor]` table left empty, so undo leaves the file as it was.
 pub fn doc_remove_from_list(doc: &mut toml_edit::DocumentMut, key: &str, names: &[String]) {
-    if let Some(arr) = doc.get_mut("doctor").and_then(|t| t.get_mut(key)).and_then(|a| a.as_array_mut()) {
+    let Some(table) = doc.get_mut("doctor").and_then(|t| t.as_table_like_mut()) else { return };
+    let mut now_empty = false;
+    if let Some(arr) = table.get_mut(key).and_then(|a| a.as_array_mut()) {
         arr.retain(|v| !v.as_str().map_or(false, |s| names.iter().any(|n| n.eq_ignore_ascii_case(s))));
+        now_empty = arr.is_empty();
+    }
+    if now_empty {
+        table.remove(key);
+    }
+    if table.is_empty() {
+        doc.remove("doctor");
     }
 }
 
