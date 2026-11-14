@@ -30,7 +30,7 @@
   /* settings */
   .search { height: 60px; background: var(--surface); display: flex; align-items: center; gap: 12px; padding: 0 24px; color: var(--muted); border-bottom: 1px solid var(--border); }
   .search .caret { width: 2px; height: 20px; background: var(--accent); }
-  .settings-body { padding: 28px 32px 8px; max-height: 1500px; }
+  .settings-body { padding: 28px 32px 8px; }
   .hero { display: flex; gap: 18px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
   .now { margin-left: auto; display: grid; grid-template-columns: repeat(4, auto); gap: 6px 22px; text-align: right; }
   .now b { display: block; font: 600 20px var(--display); letter-spacing: .02em; }
@@ -118,7 +118,7 @@
   .setup .pad { padding: 34px 40px 30px; }
   .setup p { color: var(--dim); margin: 16px 0 22px; }
   .setup .opt { display: flex; align-items: center; gap: 14px; padding: 12px 0; border-top: 1px solid var(--border); }
-  .setup .opt div { flex: 1; } .setup .opt small { color: var(--muted); display: block; font-size: 12px; }
+  .setup .opt > div:first-child { flex: 1; } .setup .opt small { color: var(--muted); display: block; font-size: 12px; }
   .setup .go { margin-top: 22px; display: flex; align-items: center; gap: 18px; }
   .setup .go .btn { padding: 12px 34px; font: 600 16px var(--display); letter-spacing: .12em; }
   .setup .go a { color: var(--muted); font-size: 13px; text-decoration: underline; }
