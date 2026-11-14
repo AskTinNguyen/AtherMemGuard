@@ -126,6 +126,20 @@ pub fn write_all(dir: &Path) -> Result<Vec<PathBuf>, String> {
             d.confirm = Some(doctor::Confirm::End(i));
         }
         save("doctor-confirm", &doctor::render(&mut d, scale, 760, Some(720)))?;
+        // CLEAN UP with "End it" picked for iCUE and the Unreal leftovers checked: it asks first.
+        let mut d = DoctorWindow::new(Box::new(FakeDoctor::new()));
+        d.scan(None);
+        if let Some(m) = d.model.as_mut() {
+            let at = |m: &doctor::DoctorModel, id: &str| m.report.findings.iter().position(|f| f.id == id);
+            if let (Some(icue), Some(orphans)) = (at(m, "app:icue"), at(m, "ue:orphans")) {
+                let end_it = doctor::choices(&m.report.findings[icue]).iter().position(|c| c.label == "End it").unwrap_or(0);
+                m.toggle(icue);
+                m.set_choice(icue, end_it);
+                m.toggle(orphans);
+            }
+        }
+        d.clean_up(None);
+        save("doctor-confirm-end", &doctor::render(&mut d, scale, 760, Some(720)))?;
     }
     // The flyout, every sample state at both scales.
     out.extend(super::flyout::snapshots(dir)?);

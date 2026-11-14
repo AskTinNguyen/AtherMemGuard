@@ -337,6 +337,15 @@ impl DoctorModel {
         !self.picks().is_empty()
     }
 
+    /// Checked rows whose pick ends processes ("End it", "End them"). CLEAN UP asks before
+    /// running these: anything unsaved in them is lost.
+    pub fn ending_rows(&self) -> Vec<usize> {
+        (0..self.rows.len())
+            .filter(|&i| self.rows[i].checked && self.selectable(i))
+            .filter(|&i| self.chosen(i).is_some_and(|c| c.picks.contains(&ActionKind::End)))
+            .collect()
+    }
+
     /// Mark the checked rows as running and return their picks.
     pub fn begin_apply(&mut self) -> Vec<(String, ActionKind)> {
         let picks = self.picks();
@@ -477,7 +486,7 @@ impl FakeDoctor {
             f("app:epicgameslauncher", K::App, V::Close, "Epic Games Launcher", "Game launcher. Unreal doesn't need it running to open or build a project.", 4, 980, &[A::DisableStartup, A::Close], true),
             f("app:spotify", K::App, V::Close, "Spotify", "Music player. Not used by Unreal.", 5, 640, &[A::Close, A::BlockWhileUnreal], false),
             f("app:widgets", K::App, V::Close, "Widgets", "News and weather panel. It comes back when you open it.", 3, 410, &[A::Close], true),
-            f("app:icue", K::App, V::Close, "iCUE", "Lighting and fan software. Your devices keep their last settings.", 4, 560, &[A::Close, A::DisableStartup], false),
+            f("app:icue", K::App, V::Close, "iCUE", "Lighting and fan software. Your devices keep their last settings.", 4, 560, &[A::Close, A::DisableStartup, A::End], false),
             f("startup:hkcu:Steam", K::Startup, V::Close, "Steam", "", 0, 1270, &[A::DisableStartup], true),
             f("startup:hkcu:Spotify", K::Startup, V::Close, "Spotify", "", 0, 640, &[A::DisableStartup], true),
             f("startup:hklm:iCUE", K::Startup, V::Close, "iCUE", "", 0, 560, &[], false),
@@ -626,7 +635,33 @@ enum Job {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Confirm {
+    /// "End it anyway" on a row that stayed open.
     End(usize),
+    /// CLEAN UP with rows that end processes checked: these rows, before anything runs.
+    CleanUp(Vec<usize>),
+}
+
+/// "Spotify, iCUE and 3 leftover Unreal helpers"
+fn and_list(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {}", rest.join(", "), last),
+    }
+}
+
+/// The confirmation's words: (title, body, OK button). One app reads like "End it anyway";
+/// one row that covers several processes (Unreal leftovers) says "them".
+pub fn confirm_words(names: &[String], one_row_is_many: bool) -> (String, String, String) {
+    match names {
+        [one] if one_row_is_many => (format!("End {}?", one), "Anything unsaved in them is lost.".into(), "End them".into()),
+        [one] => (format!("End {}?", one), "Anything unsaved in it is lost.".into(), "End it".into()),
+        _ => (
+            format!("End {} apps?", names.len()),
+            format!("Anything unsaved in them is lost.\n{}.", and_list(names)),
+            "End them".into(),
+        ),
+    }
 }
 
 pub struct DoctorWindow {
@@ -726,9 +761,25 @@ impl DoctorWindow {
         self.run(|s| Job::Scanned(s.scan(), s.can_undo()), host);
     }
 
-    /// CLEAN UP: run every checked row's picks. `End` only appears on explicitly checked
-    /// leftover rows (never pre-checked), so asking for it is the person's confirmation.
+    /// CLEAN UP: run every checked row's picks. Ending processes always needs a second,
+    /// explicit confirmation (docs/DESIGN.md), so when a checked row's pick is "End it" or
+    /// "End them" this only opens the in-window confirmation listing them; its "End them"
+    /// runs everything (`confirm_ok`), Cancel runs nothing.
     pub fn clean_up(&mut self, host: Option<&mut Host>) {
+        let Some(m) = self.model.as_ref() else { return };
+        if self.working || !m.any_checked() {
+            return;
+        }
+        let ending = m.ending_rows();
+        if !ending.is_empty() {
+            self.confirm = Some(Confirm::CleanUp(ending));
+            return;
+        }
+        self.run_clean_up(host);
+    }
+
+    /// Run every checked row's picks now (after any confirmation).
+    fn run_clean_up(&mut self, host: Option<&mut Host>) {
         let Some(m) = self.model.as_mut() else { return };
         if self.working || !m.any_checked() {
             return;
@@ -1161,12 +1212,19 @@ impl DoctorWindow {
     }
 
     fn dialog(&self) -> Option<Dialog> {
-        let Confirm::End(i) = self.confirm.clone()?;
-        let app = self.model.as_ref()?.report.findings.get(i)?.title.clone();
+        let m = self.model.as_ref()?;
+        let (title, body, ok) = match self.confirm.as_ref()? {
+            Confirm::End(i) => confirm_words(&[m.report.findings.get(*i)?.title.clone()], false),
+            Confirm::CleanUp(rows) => {
+                let names: Vec<String> = rows.iter().filter_map(|&i| m.report.findings.get(i)).map(|f| f.title.clone()).collect();
+                let many = rows.len() == 1 && m.chosen(rows[0]).is_some_and(|c| c.label == "End them");
+                confirm_words(&names, many)
+            }
+        };
         Some(Dialog {
-            title: format!("End {}?", app),
-            body: "Anything unsaved in it is lost.".into(),
-            ok: Button::new("End it", ButtonStyle::Danger),
+            title,
+            body,
+            ok: Button::new(&ok, ButtonStyle::Danger),
             cancel: Button::new("Cancel", ButtonStyle::Normal),
         })
     }
@@ -1250,8 +1308,10 @@ impl DoctorWindow {
     }
 
     fn confirm_ok(&mut self, host: &mut Host) {
-        if let Some(Confirm::End(i)) = self.confirm.take() {
-            self.end_anyway(i, Some(host));
+        match self.confirm.take() {
+            Some(Confirm::End(i)) => self.end_anyway(i, Some(host)),
+            Some(Confirm::CleanUp(_)) => self.run_clean_up(Some(host)),
+            None => {}
         }
     }
 }
@@ -1571,6 +1631,119 @@ mod tests {
         w.activate(Act::Undo, &mut host);
         assert!(!w.can_undo);
         assert_eq!(w.model.as_ref().unwrap().rows.iter().filter(|r| !r.outcomes.is_empty()).count(), 0, "undo re-scans");
+    }
+
+    #[test]
+    fn ending_rows_need_a_pick_and_a_check() {
+        let mut m = model();
+        assert!(m.ending_rows().is_empty(), "nothing that ends processes starts checked");
+        let icue = idx(&m, "app:icue");
+        let orphans = idx(&m, "ue:orphans");
+        let end_it = choices(&m.report.findings[icue]).iter().position(|c| c.label == "End it").unwrap();
+        // Picked but not checked: nothing.
+        m.set_choice(icue, end_it);
+        assert!(m.ending_rows().is_empty());
+        m.toggle(icue);
+        assert_eq!(m.ending_rows(), vec![icue]);
+        m.toggle(orphans);
+        assert_eq!(m.ending_rows(), vec![icue, orphans], "leftover helpers count too");
+        // Back to "Close": only the helpers end.
+        m.set_choice(icue, 0);
+        assert_eq!(m.ending_rows(), vec![orphans]);
+    }
+
+    #[test]
+    fn confirmation_words() {
+        let n = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            confirm_words(&n(&["iCUE", "3 leftover Unreal helpers from a closed editor"]), false),
+            (
+                "End 2 apps?".to_string(),
+                "Anything unsaved in them is lost.\niCUE and 3 leftover Unreal helpers from a closed editor.".to_string(),
+                "End them".to_string()
+            )
+        );
+        assert_eq!(confirm_words(&n(&["A", "B", "C"]), false).1, "Anything unsaved in them is lost.\nA, B and C.");
+        assert_eq!(
+            confirm_words(&n(&["Spotify"]), false),
+            ("End Spotify?".to_string(), "Anything unsaved in it is lost.".to_string(), "End it".to_string())
+        );
+        assert_eq!(confirm_words(&n(&["3 leftover Unreal helpers"]), true).2, "End them");
+    }
+
+    #[test]
+    fn clean_up_asks_before_ending_anything() {
+        let mut w = DoctorWindow::new(Box::new(FakeDoctor::new()));
+        let mut host = Host::detached((760, 720), Scale(1.0));
+        w.scan(None);
+        let m = w.model.as_ref().unwrap();
+        let (icue, orphans, steam) = (idx(m, "app:icue"), idx(m, "ue:orphans"), idx(m, "app:steam"));
+        let end_it = choices(&m.report.findings[icue]).iter().position(|c| c.label == "End it").unwrap();
+        w.activate(Act::Check(icue), &mut host);
+        w.model.as_mut().unwrap().set_choice(icue, end_it);
+        w.activate(Act::Check(orphans), &mut host);
+
+        // CLEAN UP only asks: nothing runs, nothing changes.
+        w.activate(Act::CleanUp, &mut host);
+        assert_eq!(w.confirm, Some(Confirm::CleanUp(vec![icue, orphans])));
+        let d = w.dialog().unwrap();
+        assert_eq!(d.title, "End 2 apps?");
+        assert_eq!(d.body, "Anything unsaved in them is lost.\niCUE and 3 leftover Unreal helpers from a closed editor.");
+        assert_eq!((d.ok.label.as_str(), d.cancel.label.as_str()), ("End them", "Cancel"));
+        let m = w.model.as_ref().unwrap();
+        assert!(m.rows.iter().all(|r| r.outcomes.is_empty() && !r.busy), "nothing ran before the answer");
+        assert!(!w.can_undo);
+
+        // Cancel (Enter is Cancel, the focused default; Esc too): nothing ran, the picks stay.
+        w.event(Event::Key(VK_RETURN, Default::default()), &mut host);
+        assert_eq!(w.confirm, None);
+        let m = w.model.as_ref().unwrap();
+        assert!(m.rows.iter().all(|r| r.outcomes.is_empty()));
+        assert!(m.rows[icue].checked && m.rows[orphans].checked && m.rows[steam].checked);
+        w.activate(Act::CleanUp, &mut host);
+        w.event(Event::Key(VK_ESCAPE, Default::default()), &mut host);
+        assert_eq!(w.confirm, None);
+        assert!(w.model.as_ref().unwrap().rows.iter().all(|r| r.outcomes.is_empty()));
+
+        // "End them": everything checked runs, the ends included.
+        w.activate(Act::CleanUp, &mut host);
+        w.confirm_ok(&mut host);
+        assert_eq!(w.confirm, None);
+        let m = w.model.as_ref().unwrap();
+        assert_eq!(outcome_text(&m.rows[icue].outcomes).0, "Ended");
+        assert_eq!(outcome_text(&m.rows[orphans].outcomes).0, "Ended 3 helpers");
+        assert_eq!(outcome_text(&m.rows[steam].outcomes).0, "Closed");
+        assert!(w.can_undo);
+    }
+
+    #[test]
+    fn one_leftover_row_alone_still_asks() {
+        let mut w = DoctorWindow::new(Box::new(FakeDoctor::new()));
+        let mut host = Host::detached((760, 720), Scale(1.0));
+        w.scan(None);
+        let m = w.model.as_mut().unwrap();
+        for r in &mut m.rows {
+            r.checked = false;
+        }
+        let orphans = idx(m, "ue:orphans");
+        m.toggle(orphans);
+        w.activate(Act::CleanUp, &mut host);
+        assert_eq!(w.confirm, Some(Confirm::CleanUp(vec![orphans])));
+        let d = w.dialog().unwrap();
+        assert_eq!(d.title, "End 3 leftover Unreal helpers from a closed editor?");
+        assert_eq!(d.body, "Anything unsaved in them is lost.");
+        assert_eq!(d.ok.label, "End them");
+        // Clicking Cancel in the dialog.
+        let probe = Canvas::new(760, 720, Scale(1.0));
+        w.size = (760, 720);
+        let (_, ok, cancel) = d.layout(&probe, probe.bounds());
+        w.event(Event::MouseUp(Pt::new(cancel.cx(), cancel.cy()), MouseButton::Left), &mut host);
+        assert_eq!(w.confirm, None);
+        assert!(w.model.as_ref().unwrap().rows[orphans].outcomes.is_empty());
+        // Clicking "End them".
+        w.activate(Act::CleanUp, &mut host);
+        w.event(Event::MouseUp(Pt::new(ok.cx(), ok.cy()), MouseButton::Left), &mut host);
+        assert_eq!(outcome_text(&w.model.as_ref().unwrap().rows[orphans].outcomes).0, "Ended 3 helpers");
     }
 
     #[test]

@@ -304,6 +304,12 @@ downsampled to at most 1500 points).
   "Closed", "Still open — it may be asking you to save", "Switched off", "Added to
   Browsers". An app that stayed open gets a red link "End it anyway", which asks first:
   "End {app}? Anything unsaved in it is lost." buttons "End it" / "Cancel".
+- **Ending always asks.** When any checked row's pick ends processes ("End it" on a
+  background app, "End them" on Unreal leftovers), CLEAN UP first shows the in-window
+  confirmation listing them: "End {n} apps?" · "Anything unsaved in them is lost." and the
+  names · buttons "End them" / "Cancel" (Cancel is the focused default; Enter and Esc
+  cancel). Nothing runs until "End them"; Cancel leaves the picks as they were. A single
+  app reads "End {app}? Anything unsaved in it is lost." with "End it".
 - Nothing in this window changes anything without a visible checkbox and the CLEAN UP click.
 
 Toasts added to the catalogue:
@@ -314,8 +320,9 @@ Toasts added to the catalogue:
 | Cleanup finished | Info | Checkup done | Freed about {x} GB. {n} apps won't start with Windows any more. | Undo |
 | A `close_while_unreal` app was closed | Info | Closed {app} | It's on your list to stay closed while Unreal is running. | Allow this time |
 
-`Command` gains `OpenDoctor` and `UndoDoctor`. Snapshots: `doctor.png`, `doctor-clear.png`,
-`doctor-results.png`.
+`Command` gains `OpenDoctor` and `UndoDoctor` (and `ShowRamReport` for the RAM check).
+Snapshots: `doctor.png`, `doctor-clear.png`, `doctor-results.png`, `doctor-confirm.png`,
+`doctor-confirm-end.png`.
 
 ## Accessibility and robustness
 
