@@ -6,15 +6,20 @@
 //! - `ops`     one-shot operations for agents: prime, wait, run, advise
 //! - `install` per-user install, autostart, PATH
 //! - `mcp`     MCP server over stdio, so coding agents can call MemGuard as tools
+//! - `doctor`  checkup: what uses memory Unreal work doesn't need, and what to do about it
+//! - `startup` reading and switching "starts with Windows" entries (used by `doctor`)
 //! - `tray`    tray icon + background loop
 
 pub mod config;
+pub mod doctor;
+mod doctor_win;
 pub mod engine;
 pub mod install;
 pub mod logo;
 pub mod mcp;
 pub mod ops;
 pub mod paths;
+pub mod startup;
 pub mod tray;
 pub mod win;
 
