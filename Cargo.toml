@@ -1,6 +1,6 @@
 [package]
 name = "athermemguard"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Memory manager that keeps a Windows PC primed for agentic Unreal Engine work"
 build = "build.rs"
