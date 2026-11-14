@@ -12,6 +12,8 @@ use super::status_source::FakeStatus;
 use super::theme::Scale;
 use super::toast;
 use super::setup::{self, FakeBackend, Input, SetupMode, SetupWindow};
+use super::history::{self, FakeHistory, HistoryWindow, Range};
+use super::geom::Pt;
 use super::window::Surface;
 
 /// A settings window over the mockup's data.
@@ -83,6 +85,25 @@ pub fn write_all(dir: &Path) -> Result<Vec<PathBuf>, String> {
         }
         for (name, mut w) in sample_setups() {
             save(name, &setup::render(&mut w, scale))?;
+        }
+        for (name, range, empty, hover) in [
+            ("history-1h", Range::H1, false, false),
+            ("history-6h", Range::H6, false, false),
+            ("history-24h", Range::H24, false, false),
+            ("history-7d", Range::D7, false, false),
+            ("history-empty", Range::H6, true, false),
+            ("history-hover", Range::H6, false, true),
+        ] {
+            let src = if empty { FakeHistory::empty() } else { FakeHistory::mockup() };
+            let mut w = HistoryWindow::new(Box::new(src));
+            w.set_range(range);
+            if hover {
+                // Over the tight spell, 72% across the plot.
+                let probe = Canvas::new(scale.s(960.0), scale.s(600.0), scale);
+                let plot = w.layout(&probe).plot;
+                w.set_mouse(Some(Pt::new(plot.x + plot.w * 72 / 100, plot.y + plot.h / 2)));
+            }
+            save(name, &history::render(&mut w, scale, 960, 600))?;
         }
     }
     Ok(out)
