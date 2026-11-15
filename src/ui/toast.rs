@@ -865,12 +865,12 @@ pub mod catalog {
     }
 
     /// A watched drive changed level (`disk::level_change_words` gives the words). Getting
-    /// fuller offers the checkup; one toast per drive at a time.
+    /// fuller offers the checkup's Disk space tab; one toast per drive at a time.
     /// One toast per drive: two drives changing level in the same poll each get theirs.
     pub fn disk_level(title: &str, body: &str, worse: bool, volume: &str) -> Toast {
         let key = disk_key(volume);
         if worse {
-            keyed(with(toast(ToastKind::Warning, title.to_string(), body.to_string()), "Open the checkup", Command::OpenDoctor), key)
+            keyed(with(toast(ToastKind::Warning, title.to_string(), body.to_string()), "Free up disk space", Command::OpenDoctorDisk), key)
         } else {
             keyed(toast(ToastKind::Info, title.to_string(), body.to_string()), key)
         }
@@ -1274,5 +1274,6 @@ mod disk_toast_tests {
         let d = disk_level("D: is almost full", "body", true, "D:");
         let c = disk_level("C: is low on space", "body", true, "C:");
         assert_ne!(d.key, c.key, "two drives in one poll must not replace each other");
+        assert_eq!(d.actions, vec![("Free up disk space".to_string(), crate::ui::Command::OpenDoctorDisk)], "opens the Disk space tab");
     }
 }

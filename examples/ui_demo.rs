@@ -65,7 +65,7 @@ fn main() {
     CAPTURE.with(|c| *c.borrow_mut() = arg("--capture").map(PathBuf::from));
 
     // Part E2 windows, each on its fake (nothing here installs, reads history or touches a process):
-    //   --setup [--installed <ver>] [--uninstall] [--fail]   --history [--empty]   --doctor [--clear]
+    //   --setup [--installed <ver>] [--uninstall] [--fail]   --history [--empty]   --doctor [--clear] [--disk] [--no-disk-checkup]
     let has = |name: &str| args.iter().any(|a| a == name);
     if has("--setup") {
         use athermemguard::ui::setup::{run_setup_with_version, FakeBackend, SetupMode};
@@ -87,9 +87,16 @@ fn main() {
         return;
     }
     if has("--doctor") {
-        use athermemguard::ui::doctor::{open_doctor, FakeDoctor};
-        let src = if has("--clear") { FakeDoctor::all_clear() } else { FakeDoctor::new() };
-        let hwnd = open_doctor(Box::new(src.with_delay(std::time::Duration::from_millis(1200))), Box::new(|cmd| println!("command: {:?}", cmd)));
+        use athermemguard::ui::doctor::{open_doctor, FakeDoctor, Tab};
+        let src = if has("--clear") {
+            FakeDoctor::all_clear()
+        } else if has("--no-disk-checkup") {
+            FakeDoctor::without_disk_checkup()
+        } else {
+            FakeDoctor::new()
+        };
+        let tab = if has("--disk") { Some(Tab::Disk) } else { None };
+        let hwnd = open_doctor(Box::new(src.with_delay(std::time::Duration::from_millis(1200))), Box::new(|cmd| println!("command: {:?}", cmd)), tab);
         close_later(hwnd, arg("--close-after"));
         window::run_until_closed(hwnd);
         return;

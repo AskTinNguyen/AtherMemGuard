@@ -140,6 +140,20 @@ pub fn write_all(dir: &Path) -> Result<Vec<PathBuf>, String> {
         }
         d.clean_up(None);
         save("doctor-confirm-end", &doctor::render(&mut d, scale, 760, Some(720)))?;
+        // The Disk space tab: drive rows by drive with two checked, and before any disk checkup.
+        let mut d = DoctorWindow::new(Box::new(FakeDoctor::new())).with_tab(doctor::Tab::Disk);
+        d.scan(None);
+        if let Some(m) = d.model.as_mut() {
+            for id in ["disk:d1", "disk:d3"] {
+                if let Some(i) = m.report.findings.iter().position(|f| f.id == id) {
+                    m.toggle(i);
+                }
+            }
+        }
+        save("doctor-disk", &doctor::render(&mut d, scale, 760, None))?;
+        let mut d = DoctorWindow::new(Box::new(FakeDoctor::without_disk_checkup())).with_tab(doctor::Tab::Disk);
+        d.scan(None);
+        save("doctor-disk-none", &doctor::render(&mut d, scale, 760, Some(720)))?;
     }
     // The flyout, every sample state at both scales.
     out.extend(super::flyout::snapshots(dir)?);

@@ -224,6 +224,8 @@ Pause until I resume                           (both replaced by "Resume" while 
 ────────
 Settings
 Memory history
+Free up memory…                                (the checkup on its Memory tab)
+Free up disk space…                            (the checkup on its Disk space tab)
 ────────
 Update to version {v}…                         (or "Check for updates…")
 ✓ Run at Windows startup
@@ -335,16 +337,38 @@ downsampled to at most 1500 points).
 
 ## 6. Checkup window, the doctor (`src/ui/doctor.rs`) — Part E
 
-760 x 720, resizable. Title "Ather MemGuard — Checkup". Opened from the tray menu
-("Run a checkup", between "Memory history" and the update item), the flyout (a link
-"Run a checkup" under the group bars) and the checkup toast. Data and actions come from
-`doctor::scan`, `doctor::apply` and `doctor::undo` (docs/DESIGN.md, Part F).
+760 x 720, resizable. Title "Ather MemGuard — Checkup". Two tabs that never mix: **Memory**
+(what closing apps frees in RAM) and **Disk space** (what can go from the drives). Opened
+from the tray menu ("Free up memory…" opens the Memory tab, `Command::OpenDoctor`; "Free up
+disk space…" the Disk space tab, `Command::OpenDoctorDisk`; both between "Memory history"
+and the update item), the flyout (a link "Run a checkup" under the group bars: Memory), the
+checkup toast (Memory) and the low-disk toast ("Your Dev Drive is almost full", "Free up
+disk space": Disk space). An open window comes to the front and switches to the asked tab.
+Opened without a tab, it shows the one it showed last (ui-state.toml `[doctor] tab`). Data
+and actions come from `doctor::scan`, `doctor::apply` and `doctor::undo` (docs/DESIGN.md,
+Part F) for Memory, and from the last disk checkup and `memguard disk clean` / `memguard
+disk undo` for Disk space.
 
-- **Hero**: eyebrow "ATHER MEMGUARD", headline "CHECKUP". On the right the result in one
-  number: "{x} GB" over the caption "COULD BE FREED" (lime), or "ALL CLEAR" when nothing is
-  proposed. A link "Check again" re-scans.
-- **Sections**, in this order, each a lime header with the memory it covers on the right;
-  empty sections are hidden:
+- **Header** (fixed; the tab's content scrolls under it): eyebrow "ATHER MEMGUARD", headline
+  "CHECKUP". On the right the showing tab's result: Memory "{x} GB" over the caption "COULD
+  BE FREED" (lime), or "ALL CLEAR" when nothing is proposed; Disk space "{n} ITEMS" over
+  "COULD GO FROM YOUR DRIVES", "ALL CLEAR", or nothing before any disk checkup. A link
+  "Check again" re-scans the showing tab only (the other tab keeps its checks and results).
+- **Tabs** under the hero: "Memory" and "Disk space", each with a badge counting its rows
+  (hidden at 0). The showing one is TEXT with a lime underline and a lime badge, the other
+  MUTED (TEXT_DIM and a SELECTED fill on hover). Tab focuses them first; Enter / Space
+  shows the focused one, Left / Right on a focused tab switch, Ctrl+Tab switches from
+  anywhere. Each tab keeps its own scroll position. Switching cancels an open confirmation
+  (nothing has run).
+- **Which tab a finding goes to** is decided by where it came from, never by its words
+  (`ui::doctor::tab_of`): drive items of the disk checkup (`FindingKind::Disk`) and THIS PC
+  notices from the drive side of the checkup (`doctor::is_drive_finding`: `disk:low:<drive>`
+  from `doctor::disk_findings` and the Dev Drive health findings `dev:*` — Dev Drive full,
+  Defender's performance mode, antivirus filters, caches on C:, VHD host low, another
+  antivirus) are on Disk space; everything else (apps, startup entries, Unreal leftovers,
+  page file, driver memory, the RAM check) is on Memory.
+- **Memory sections**, in this order, each a lime header with the memory it covers on the
+  right; empty sections are hidden:
 
 | Section | Findings | Row |
 |---|---|---|
@@ -354,24 +378,51 @@ downsampled to at most 1500 points).
 | WORTH A LOOK | verdict `review` | Unchecked · app name, company, "X GB" · pill: "Close" / "Hold back" / "Leave it" (Leave it adds it to `[doctor] keep`) |
 | HELD BACK, NOT CLOSED | `hold_back` apps not yet in a group | Checked · "Hold back" (adds the app to the matching group) |
 | UNREAL | leftovers | "3 leftover Unreal helpers from a closed editor · 1.2 GB" · "End them" |
-| ON YOUR DRIVES | items of the last disk checkup that offer an action | Never pre-checked · title · "D: · frees 16.4 GB (predicted)" · path · pill: "Delete it" / "Move to the bin" / "Clean with npm" (the default first: delete for rebuilt items, the bin for logs, cooked output and shared caches). CLEAN UP with drive rows checked first shows "Clean up N items on your drives?" listing each item under what happens to it with its predicted frees, and that deletes can't be undone; rows turn into "Deleted · frees X GB (predicted); measured later" or "Moved to the bin · frees nothing until it's emptied". "Undo last cleanup" puts bin moves back. The cleanup runs `memguard disk clean` in a hidden child |
-| THIS PC | system | Text rows, each with a link: "The page file is small for this much RAM." → "How to fix". The RAM check's rows (`sys:ram`: the report's headline over its summary, and `sys:ram:<what>` for each problem such as old Intel microcode; only with `general.check_ram_speed` on) → "Show me how", which writes `ram-report.html` to the data folder and opens it in the browser (`Command::ShowRamReport`) |
+| THIS PC | system, memory side | Text rows, each with a link: "The page file is small for this much RAM." → "How to fix". The RAM check's rows (`sys:ram`: the report's headline over its summary, and `sys:ram:<what>` for each problem such as old Intel microcode; only with `general.check_ram_speed` on) → "Show me how", which writes `ram-report.html` to the data folder and opens it in the browser (`Command::ShowRamReport`) |
 
-- Rows whose finding is `recommended` start checked. The footer shows the running total of
-  what is checked, "Selected: frees about {x} GB", on the left; on the right the primary
-  button "CLEAN UP" (disabled with nothing checked) and a link "Undo last cleanup" when
-  there is one to undo.
-- **Clean up** runs the picks on a worker thread; each row turns into its result in place:
-  "Closed", "Still open — it may be asking you to save", "Switched off", "Added to
+- **Disk space sections**: first a muted line "From the disk checkup of {time}." with a link
+  "Count again" (runs the disk checkup again), then:
+
+| Section | Findings | Row |
+|---|---|---|
+| ON D: (one per drive, in letter order) | items of the last disk checkup on that drive that offer an action | Never pre-checked · title · "frees 16.4 GB (predicted)" · path · pill: "Delete it" / "Move to the bin" / "Clean with npm" (the default first: delete for rebuilt items, the bin for logs, cooked output and shared caches) |
+| THIS PC | system, drive side | Text rows: "Your Dev Drive is almost full", "Defender's performance mode is off" (with the exact administrator command), "About 200 GB of caches are on C:" |
+
+- **No disk checkup yet**: the Disk space tab says "No disk checkup yet. It finds build files,
+  caches and logs on your drives and what removing each would really free. It counts in the
+  background for up to a minute and deletes nothing." with a button "Run the disk checkup"
+  (`memguard disk checkup --refresh --json` in a hidden child; the tab shows "Counting what's
+  on your drives… (up to a minute)" meanwhile, and the drive rows after). The drive notices
+  show under it anyway. A checkup that didn't run says why in red. A checkup that found
+  nothing says "Nothing on your drives needs your attention: the last disk checkup found
+  nothing that can go."
+- **Footer, per tab.** Selection, totals, the button and Undo belong to the showing tab; the
+  other tab's checks stay as they are and never run with it.
+  - Memory: "Selected: frees about {x} GB of RAM" (checked rows that close or end something
+    now) · primary button "FREE MEMORY" (disabled with nothing checked) · link "Undo last
+    cleanup" when the last memory cleanup can be undone (the memory checkup's undo log only).
+  - Disk space: "Selected: frees about 16.4 GB on D: (predicted)", per drive when several
+    ("… about 3.1 GB on C: and about 16.4 GB on D: (predicted)"; "at least" when some item
+    wasn't measured), "· 1 item to the bin" for bin moves, which free nothing until the bin
+    is emptied ("Selected: 2 items to the bin (frees nothing until it's emptied)"), or
+    "Selected: nothing yet" · primary button "FREE DISK SPACE" · link "Undo last cleanup"
+    when the drive cleanup's bin moves can be put back (`memguard disk undo` only).
+- **Free memory** runs the Memory picks on a worker thread; each row turns into its result
+  in place: "Closed", "Still open — it may be asking you to save", "Switched off", "Added to
   Browsers". An app that stayed open gets a red link "End it anyway", which asks first:
   "End {app}? Anything unsaved in it is lost." buttons "End it" / "Cancel".
 - **Ending always asks.** When any checked row's pick ends processes ("End it" on a
-  background app, "End them" on Unreal leftovers), CLEAN UP first shows the in-window
+  background app, "End them" on Unreal leftovers), FREE MEMORY first shows the in-window
   confirmation listing them: "End {n} apps?" · "Anything unsaved in them is lost." and the
   names · buttons "End them" / "Cancel" (Cancel is the focused default; Enter and Esc
   cancel). Nothing runs until "End them"; Cancel leaves the picks as they were. A single
   app reads "End {app}? Anything unsaved in it is lost." with "End it".
-- Nothing in this window changes anything without a visible checkbox and the CLEAN UP click.
+- **Free disk space always asks**: "Clean up N items on your drives?" listing each item under
+  what happens to it with its predicted frees, and that deletes can't be undone; rows turn
+  into "Deleted · frees X GB (predicted); measured later" or "Moved to the bin · frees
+  nothing until it's emptied". The cleanup runs `memguard disk clean` in a hidden child with
+  the checkup's id and each item's fingerprint.
+- Nothing in this window changes anything without a visible checkbox and the tab's button.
 
 Toasts added to the catalogue:
 
@@ -381,9 +432,11 @@ Toasts added to the catalogue:
 | Cleanup finished | Info | Checkup done | Freed about {x} GB. {n} apps won't start with Windows any more. | Undo |
 | A `close_while_unreal` app was closed | Info | Closed {app} | It's on your list to stay closed while Unreal is running. | Allow this time |
 
-`Command` gains `OpenDoctor` and `UndoDoctor` (and `ShowRamReport` for the RAM check).
+`Command` gains `OpenDoctor` (Memory tab), `OpenDoctorDisk` (Disk space tab) and
+`UndoDoctor` (and `ShowRamReport` for the RAM check). The "Checkup done" toast's Undo
+reverses the last memory cleanup.
 Snapshots: `doctor.png`, `doctor-clear.png`, `doctor-results.png`, `doctor-confirm.png`,
-`doctor-confirm-end.png`.
+`doctor-confirm-end.png`, `doctor-disk.png`, `doctor-disk-none.png`.
 
 ## Accessibility and robustness
 

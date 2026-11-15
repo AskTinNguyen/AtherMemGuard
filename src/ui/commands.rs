@@ -19,7 +19,7 @@ pub enum Command {
     OpenReleasesPage,
     /// Not in docs/UI.md's list: the "Settings problem" toast's "Open file" button.
     OpenSettingsFile,
-    /// docs/UI.md section 6: the checkup window.
+    /// docs/UI.md section 6: the checkup window, on its Memory tab ("Free up memory…").
     OpenDoctor,
     /// docs/UI.md section 6: undo the last cleanup.
     UndoDoctor,
@@ -40,6 +40,9 @@ pub enum Command {
     /// "Empty the bin" on the toast that asks when a drive is critical: empty Ather MemGuard's
     /// bin on that drive (the tray remembers which one).
     EmptyDiskBin,
+    /// docs/UI.md section 6: the checkup window on its Disk space tab ("Free up disk
+    /// space…", the low-disk toast).
+    OpenDoctorDisk,
 }
 
 /// What a flyout row menu asks for. Most are plain commands; the rest name the group or app
@@ -57,7 +60,7 @@ pub enum UiAction {
 
 impl Command {
     /// Every command, in a fixed order (their ids).
-    pub const ALL: [Command; 21] = [
+    pub const ALL: [Command; 22] = [
         Command::FreeMemory,
         Command::Pause30,
         Command::PauseUntilResumed,
@@ -79,6 +82,7 @@ impl Command {
         Command::ShowDriverReport,
         Command::EndUnrealLeftovers,
         Command::EmptyDiskBin,
+        Command::OpenDoctorDisk,
     ];
 
     /// A small non-zero number for menu item ids and window messages.
@@ -105,6 +109,7 @@ impl Command {
             Command::ShowDriverReport => 19,
             Command::EndUnrealLeftovers => 20,
             Command::EmptyDiskBin => 21,
+            Command::OpenDoctorDisk => 22,
         }
     }
 
@@ -125,7 +130,9 @@ mod tests {
             assert_eq!(Command::from_id(c.id()), Some(c));
             seen.insert(c.id());
         }
-        assert_eq!(seen.len(), 21, "every variant has its own id");
+        assert_eq!(seen.len(), 22, "every variant has its own id");
+        assert_eq!(Command::OpenDoctor.id(), 14, "the Memory tab keeps the old id");
+        assert_eq!(Command::from_id(22), Some(Command::OpenDoctorDisk));
         assert_eq!(Command::from_id(0), None);
         assert_eq!(Command::from_id(99), None);
     }

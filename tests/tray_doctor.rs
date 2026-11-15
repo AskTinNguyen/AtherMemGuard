@@ -83,7 +83,7 @@ fn leave_it_from_the_window_writes_keep_and_undo_removes_it() {
         finding("app:traytestgame", "TrayTestGame", Verdict::Close, &[ActionKind::Close, ActionKind::BlockWhileUnreal]),
     ]);
     let d = RealDoctor::with_report(r);
-    assert!(!d.can_undo());
+    assert!(!d.can_undo(vm::Tab::Memory));
 
     // The window's "Leave it" is Keep; "Close whenever Unreal is running" sends BlockWhileUnreal
     // (with Close, which finds no process to close here); End without force is refused.
@@ -107,16 +107,19 @@ fn leave_it_from_the_window_writes_keep_and_undo_removes_it() {
     let ds = doctor::DoctorSettings::load();
     assert_eq!(ds.keep, vec!["TrayTestMystery".to_string()]);
     assert_eq!(ds.close_while_unreal, vec!["TrayTestGame".to_string()]);
-    assert!(d.can_undo());
+    assert!(d.can_undo(vm::Tab::Memory));
+    assert!(!d.can_undo(vm::Tab::Disk), "a memory cleanup is not the Disk space tab's to undo");
+    assert!(d.undo_last(vm::Tab::Disk).is_empty(), "Undo on Disk space leaves the memory cleanup alone");
+    assert!(d.can_undo(vm::Tab::Memory));
 
-    let undone = d.undo_last();
+    let undone = d.undo_last(vm::Tab::Memory);
     assert_eq!(undone.len(), 2, "{:?}", undone);
     assert!(undone.iter().all(|o| o.status == vm::OutcomeStatus::Done), "{:?}", undone);
     let ds = doctor::DoctorSettings::load();
     assert!(ds.keep.is_empty() && ds.close_while_unreal.is_empty());
-    assert!(!d.can_undo());
+    assert!(!d.can_undo(vm::Tab::Memory));
     // Nothing left to undo: nothing mapped onto a row.
-    assert!(d.undo_last().is_empty());
+    assert!(d.undo_last(vm::Tab::Memory).is_empty());
 }
 
 #[test]

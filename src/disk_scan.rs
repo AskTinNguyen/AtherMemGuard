@@ -455,6 +455,9 @@ pub struct ItemResult {
     pub shared_with: Vec<(usize, u64)>,
     pub anomalies: bool,
     pub dropped_paths: Vec<String>,
+    /// The time ran out before the walk got to it: nothing about it is known, not even its size.
+    #[serde(default)]
+    pub not_reached: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -641,29 +644,40 @@ pub fn run_job(job: &ScanJob, progress: Progress) -> ScanOutput {
         });
         vol_scans.push((g.clone(), vs, facts));
     }
-    // Level 1 everywhere first: logical and allocated sizes are cheap and complete.
-    for (g, vs, _) in &vol_scans {
-        for &i in &by_vol[g] {
-            let (st, _) = disk_win::walk_item(vs, i, &roots[i], &skips[i]);
-            out.items[i].level1 = st;
-            tick(&files, progress);
+    // Both levels go through the items in the job's order (class first, so a project's build
+    // files before a 100 GB shared cache), across all volumes: one big volume can't use up the
+    // time before another volume's items are reached.
+    let order: Vec<(usize, usize)> = (0..n)
+        .filter_map(|i| out.items[i].volume.as_ref().and_then(|g| vol_scans.iter().position(|(vg, _, _)| vg == g)).filter(|_| !roots[i].is_empty()).map(|v| (i, v)))
+        .collect();
+    let out_of_time = || stop.load(Ordering::Relaxed) || Instant::now() > deadline;
+    // Level 1 everywhere first: logical and allocated sizes are cheap.
+    for &(i, v) in &order {
+        if out_of_time() {
+            out.items[i].not_reached = true;
+            out.items[i].level1.cut_short = true;
+            continue;
         }
+        let (st, _) = disk_win::walk_item(&vol_scans[v].1, i, &roots[i], &skips[i]);
+        out.items[i].not_reached = st.cut_short && st.files == 0 && st.dirs == 0;
+        out.items[i].level1 = st;
+        tick(&files, progress);
     }
-    // Level 2 per volume, in the job's order (class first, then larger items first), then sweep.
-    for (g, mut vs, _) in vol_scans {
+    // Level 2 (cluster by cluster) in the same order, then a sweep per volume.
+    for (_, vs, _) in vol_scans.iter_mut() {
         vs.level2 = true;
-        let mut order = by_vol[&g].clone();
-        order.sort_by_key(|&i| i); // job order: the job is sorted by class
-        let mut exts: Vec<ItemExtents> = vec![ItemExtents::default(); n];
-        for &i in &order {
-            if stop.load(Ordering::Relaxed) || Instant::now() > deadline {
-                break;
-            }
-            let (st, ex) = disk_win::walk_item(&vs, i, &roots[i], &skips[i]);
-            out.items[i].level2 = Some(st);
-            exts[i] = ex;
-            tick(&files, progress);
+    }
+    let mut exts: Vec<ItemExtents> = vec![ItemExtents::default(); n];
+    for &(i, v) in &order {
+        if out_of_time() || out.items[i].not_reached {
+            continue;
         }
+        let (st, ex) = disk_win::walk_item(&vol_scans[v].1, i, &roots[i], &skips[i]);
+        out.items[i].level2 = Some(st);
+        exts[i] = ex;
+        tick(&files, progress);
+    }
+    for (g, vs, _) in vol_scans {
         let multi = std::mem::take(&mut *vs.multi.lock().unwrap());
         disk_win::attribute_multilinks(multi, &mut exts, vs.block_cloning);
         let ids: Vec<usize> = by_vol[&g].clone();
@@ -682,7 +696,15 @@ pub fn run_job(job: &ScanJob, progress: Progress) -> ScanOutput {
         for (si, set) in job.sets.iter().enumerate() {
             let local_set: Vec<usize> = set.iter().filter_map(|i| ids.iter().position(|x| x == i)).collect();
             if !local_set.is_empty() {
-                out.sets.push(SetResult { set: si, items: local_set.iter().map(|k| ids[*k]).collect(), volume: g.clone(), frees_together: sw.frees_together(&local_set) * c });
+                // Members that were only sized have no clusters in the sweep. Where files can't
+                // share clusters (no block cloning) they free what they allocate, so add that;
+                // on a Dev Drive they add nothing to the lower bound.
+                let sized_only: u64 = if vs.block_cloning {
+                    0
+                } else {
+                    local_set.iter().map(|k| &out.items[ids[*k]]).filter(|r| r.level2.is_none() && !r.not_reached && r.unmeasurable.is_none()).map(|r| r.level1.allocated).sum()
+                };
+                out.sets.push(SetResult { set: si, items: local_set.iter().map(|k| ids[*k]).collect(), volume: g.clone(), frees_together: sw.frees_together(&local_set) * c + sized_only });
             }
         }
         for grp in sw.sharing_groups(1 << 30).into_iter().take(12) {
@@ -1041,7 +1063,7 @@ fn judge(r: &ItemResult, block_cloning: bool, in_use: bool, stale: bool) -> Judg
     let l1 = &r.level1;
     let in_flux = in_use || l2.map_or(l1.written_during_scan, |l| l.written_during_scan) > 0;
     let facts = ScanFacts {
-        unmeasurable: r.unmeasurable.is_some(),
+        unmeasurable: r.unmeasurable.is_some() || r.not_reached,
         block_cloning,
         files_without_refcount: l2.map_or(0, |l| l.files_without_refcount),
         partial: l2.map_or(true, |l| l.cut_short) || l1.cut_short,
@@ -1050,7 +1072,13 @@ fn judge(r: &ItemResult, block_cloning: bool, in_use: bool, stale: bool) -> Judg
         anomalies: r.anomalies,
         stale,
     };
-    let conf = disk_space::confidence(&facts);
+    let mut conf = disk_space::confidence(&facts);
+    if l2.is_none() && block_cloning && conf == Confidence::Estimate {
+        // Only sized on a Dev Drive: nothing is known about sharing, so it's a lower bound (of
+        // nothing) with its size as the ceiling, even while it changes. "About 0 GB" would say
+        // there is nothing to free.
+        conf = Confidence::LowerBound;
+    }
     let scanned_pct = match l2 {
         Some(l) if l1.files > 0 => ((l.files as f64 / l1.files as f64 * 100.0).min(100.0) * 10.0).round() / 10.0,
         Some(_) => 100.0,
@@ -1058,6 +1086,13 @@ fn judge(r: &ItemResult, block_cloning: bool, in_use: bool, stale: bool) -> Judg
     };
     let (frees, frees_max) = if conf == Confidence::Unknown {
         (None, None)
+    } else if l2.is_none() && !block_cloning {
+        // Only sized, but on a volume where files can't share clusters (no block cloning): an
+        // item frees what it allocates, less hard links to files outside it, which only the
+        // cluster count would find. So: about its size, or at least its size so far.
+        let conf = if l1.cut_short { Confidence::LowerBound } else { Confidence::Estimate };
+        let frees = Some(l1.allocated);
+        return Judged { conf, frees, frees_max: if l1.cut_short { None } else { frees }, scanned_pct, in_flux };
     } else {
         let proven_shared = r.footprint - r.frees_alone;
         let ceiling = if facts.partial { l1.allocated.saturating_sub(proven_shared).max(r.frees_alone) } else { r.frees_alone };
@@ -1088,7 +1123,9 @@ fn notes_for(r: &ItemResult, in_use: bool) -> Vec<String> {
     if in_use {
         v.push("Unreal is working in this project".into());
     }
-    if r.level2.is_none() && r.unmeasurable.is_none() {
+    if r.not_reached {
+        v.push("Not counted: the time ran out before it was reached. Count again, or give the checkup more time".into());
+    } else if r.level2.is_none() && r.unmeasurable.is_none() {
         v.push("Only sized, not counted cluster by cluster: the time ran out first".into());
     } else if r.level2.as_ref().is_some_and(|l| l.cut_short) {
         v.push("Counting stopped before the end".into());
@@ -1214,6 +1251,17 @@ pub fn build_checkup(items: &[CatItem], out: &ScanOutput, set_names: &[(String, 
     }
 }
 
+/// Whether an old result's frees number turns into "about": exact and lower-bound numbers do,
+/// except a lower bound of about nothing (only sized on a Dev Drive), which stays a lower
+/// bound so it reads "up to X" (its ceiling) or "at least 0", never "about 0 GB".
+pub fn ages_to_estimate(it: &Value, frees_key: &str) -> bool {
+    match it["frees_confidence"].as_str() {
+        Some("exact") => true,
+        Some("lower_bound") => it[frees_key].as_f64().is_some_and(|g| g >= 0.05),
+        _ => false,
+    }
+}
+
 pub fn scope_key(path: Option<&str>) -> String {
     path.map(norm).unwrap_or_else(|| "*".into())
 }
@@ -1239,12 +1287,12 @@ pub fn checkup(cfg: &Config, path: Option<&str>, refresh: bool, budget_sec: Opti
                 rep.scan["from_cache"] = json!(true);
                 if age > s.fresh_sec {
                     for it in &mut rep.items {
-                        if matches!(it["frees_confidence"].as_str(), Some("exact") | Some("lower_bound")) {
+                        if ages_to_estimate(it, "frees_alone_gb") {
                             it["frees_confidence"] = json!("estimate");
                         }
                     }
                     for t in &mut rep.totals {
-                        if matches!(t["frees_confidence"].as_str(), Some("exact") | Some("lower_bound")) {
+                        if ages_to_estimate(t, "frees_together_gb") {
                             t["frees_confidence"] = json!("estimate");
                         }
                     }
@@ -1464,6 +1512,7 @@ fn class_heading(class: &str) -> &'static str {
 
 fn qualified(v: &Value, conf: &str) -> String {
     match v.as_f64() {
+        None if conf == "unknown" => "not counted".into(),
         None => "not measured".into(),
         Some(g) => {
             let q = match conf {
@@ -1474,6 +1523,16 @@ fn qualified(v: &Value, conf: &str) -> String {
             };
             format!("{}{:.1} GB", q, g)
         }
+    }
+}
+
+/// An item's frees: like `qualified`, but "up to X GB" where the lower bound is about nothing
+/// because the clusters weren't counted in time (a Dev Drive item that was only sized).
+fn qualified_item(it: &Value, conf: &str) -> String {
+    let lo = it["frees_alone_gb"].as_f64();
+    match (lo, it["frees_max_gb"].as_f64()) {
+        (Some(l), Some(m)) if conf == "lower_bound" && l < 0.05 && m >= 0.05 => format!("up to {:.1} GB", m),
+        _ => qualified(&it["frees_alone_gb"], conf),
     }
 }
 
@@ -1508,7 +1567,7 @@ pub fn render_checkup(c: &Checkup) -> String {
         }
         let conf = it["frees_confidence"].as_str().unwrap_or("");
         let title: String = it["title"].as_str().unwrap_or("").chars().take(38).collect();
-        let mut line = format!("  {:<4}{:<38} {:>8.1} GB   {} ({})", it["id"].as_str().unwrap_or(""), title, it["logical_gb"].as_f64().unwrap_or(0.0), qualified(&it["frees_alone_gb"], conf), conf);
+        let mut line = format!("  {:<4}{:<38} {:>8.1} GB   {} ({})", it["id"].as_str().unwrap_or(""), title, it["logical_gb"].as_f64().unwrap_or(0.0), qualified_item(it, conf), conf);
         if let Some(stays) = it["stays_shared_gb"].as_f64().filter(|g| *g >= 0.1) {
             line.push_str(&format!("   {:.1} GB stays: other trees use it", stays));
         }
@@ -1715,5 +1774,55 @@ mod tests {
         let sets = checkup_sets(&items);
         assert_eq!(sets[0], ("regenerable".to_string(), vec![1]));
         assert_eq!(sets[1], ("Lane a with everything in it".to_string(), vec![0, 1]));
+    }
+}
+
+#[cfg(test)]
+mod judge_tests {
+    use super::*;
+    const G: u64 = 1 << 30;
+    fn sized(alloc: u64, cut: bool) -> ItemResult {
+        let mut r = ItemResult::default();
+        r.level1 = disk_win::WalkStats { files: 10, dirs: 2, allocated: alloc, logical: alloc, cut_short: cut, ..Default::default() };
+        r
+    }
+
+    #[test]
+    fn an_item_the_time_never_reached_is_not_counted_never_zero() {
+        let mut r = ItemResult::default();
+        r.not_reached = true;
+        r.level1.cut_short = true;
+        let j = judge(&r, false, false, false);
+        assert_eq!(j.conf, Confidence::Unknown);
+        assert_eq!(j.frees, None);
+        assert!(notes_for(&r, false)[0].starts_with("Not counted: the time ran out before it was reached"));
+    }
+
+    #[test]
+    fn sized_only_without_block_cloning_frees_about_its_size() {
+        let j = judge(&sized(3 * G, false), false, false, false);
+        assert_eq!(j.conf, Confidence::Estimate);
+        assert_eq!(j.frees, Some(3 * G));
+        let j = judge(&sized(3 * G, true), false, false, false);
+        assert_eq!(j.conf, Confidence::LowerBound);
+        assert_eq!(j.frees, Some(3 * G));
+    }
+
+    #[test]
+    fn sized_only_on_a_dev_drive_is_a_lower_bound_with_its_size_as_the_ceiling() {
+        let j = judge(&sized(24 * G, false), true, false, false);
+        assert_eq!(j.conf, Confidence::LowerBound);
+        assert_eq!(j.frees, Some(0));
+        assert_eq!(j.frees_max, Some(24 * G));
+        let it = json!({ "frees_alone_gb": 0.0, "frees_max_gb": 24.0 });
+        assert_eq!(qualified_item(&it, "lower_bound"), "up to 24.0 GB");
+        assert_eq!(qualified(&Value::Null, "unknown"), "not counted");
+        // Even while it is being written (in flux): never "about 0 GB".
+        assert!(!ages_to_estimate(&json!({ "frees_confidence": "lower_bound", "frees_alone_gb": 0.0, "frees_max_gb": 24.0 }), "frees_alone_gb"));
+        assert!(ages_to_estimate(&json!({ "frees_confidence": "lower_bound", "frees_alone_gb": 5.0 }), "frees_alone_gb"));
+        assert!(ages_to_estimate(&json!({ "frees_confidence": "exact", "frees_alone_gb": 0.0 }), "frees_alone_gb"));
+        let j = judge(&sized(24 * G, false), true, true, false);
+        assert_eq!(j.conf, Confidence::LowerBound);
+        assert_eq!(j.frees_max, Some(24 * G));
     }
 }

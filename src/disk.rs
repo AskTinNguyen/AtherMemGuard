@@ -1087,6 +1087,23 @@ mod tests {
     }
 
     #[test]
+    fn the_checkups_drive_rows_are_marked_as_drive_findings() {
+        // Every THIS PC row the drive side adds goes to the checkup window's Disk space tab.
+        let st = s();
+        let ctx = ctx_for("C", &["D"]);
+        let c = volume_from(&facts("C", "NTFS", 1903, 298, false), &ctx, &st, None);
+        let d = volume_from(&facts("D", "ReFS", 1907, 20, true), &ctx, &st, None);
+        let caches = CachesOnSystem { gb: 200.0, measured: String::new() };
+        let f = crate::doctor::disk_findings(&[c, d], Some(&dev_state("off", "antivirus_allowed")), Some(&caches), &crate::config::Config::builtin());
+        let ids: Vec<&str> = f.iter().map(|f| f.id.as_str()).collect();
+        assert!(ids.iter().any(|i| i.starts_with("disk:low:")) && ids.contains(&"dev:perf_mode_off"), "{:?}", ids);
+        assert!(ids.iter().all(|i| crate::doctor::is_drive_finding(i)), "{:?}", ids);
+        for id in ["sys:pagefile", "sys:ram", "sys:ram:microcode", "sys:nonpaged", "sys:memguard", "app:steam", "ue:orphans", "startup:hkcu:Steam"] {
+            assert!(!crate::doctor::is_drive_finding(id), "{}", id);
+        }
+    }
+
+    #[test]
     fn gate_checks_each_volume_once() {
         let d = ("D".to_string(), "D:".to_string(), 120 * G);
         let c = ("C".to_string(), "C:".to_string(), 298 * G);

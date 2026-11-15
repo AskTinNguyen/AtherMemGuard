@@ -456,8 +456,11 @@ belongs to the deepest item.
 `frees_confidence`: `exact` (quote as is), `lower_bound` (at least; `frees_max_gb` is the ceiling),
 `estimate` (about: from a saved result older than `[disk] fresh_sec`, the tree changed during the count,
 or Unreal is working in it), `upper_bound` (at most; never use it to decide there is enough), `unknown`
-(could not be measured; the number is null). A total's confidence is its weakest member's; a set with an
-`upper_bound` or `unknown` member has no total.
+(could not be measured, or the checkup's time ran out before it reached the item; the number is null,
+never 0). When time runs out after an item was only sized: on a drive without block cloning (NTFS) it is
+`estimate` with its size, on a Dev Drive `lower_bound` with `frees_alone_gb` near 0 and its size as
+`frees_max_gb` (say "up to X GB", and call `memguard_disk_plan` for a real number). A total's confidence
+is its weakest member's; a set with an `upper_bound` or `unknown` member has no total.
 
 ### `memguard_disk_plan`
 
