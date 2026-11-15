@@ -89,8 +89,8 @@ fn i64_at(b: &[u8], o: usize) -> i64 {
     i64::from_le_bytes(b[o..o + 8].try_into().unwrap())
 }
 
-/// Open a file or folder without following a reparse point. `access` is attributes-only or
-/// list-directory: nothing here can read or change file contents.
+/// Open a file or folder without following a reparse point. `access` is attributes-only,
+/// list-directory or read-the-owner: nothing here can read or change file contents.
 fn open(path: &str, access: u32) -> Result<Handle, u32> {
     let p = wide(&long(path));
     // SAFETY: `p` is NUL-terminated and outlives the call.
@@ -345,6 +345,40 @@ pub fn current_user_sid() -> Result<String, String> {
     let out = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(s, n) });
     unsafe { LocalFree(s as *mut c_void) };
     Ok(out)
+}
+
+/// Is `path` (not followed if it is a link) owned by the current user? `None` when the owner
+/// can't be read.
+pub fn owned_by_current_user(path: &str) -> Option<bool> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
+    const READ_CONTROL: u32 = 0x0002_0000;
+    let me = current_user_sid().ok()?;
+    let h = open(path, READ_CONTROL).ok()?;
+    let mut owner: *mut c_void = null_mut();
+    let mut sd: *mut c_void = null_mut();
+    // SAFETY: `h` is an open handle; `owner` points into `sd`, which the call LocalAllocs.
+    if unsafe { GetSecurityInfo(h.0, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &mut owner, null_mut(), null_mut(), null_mut(), &mut sd) } != 0 {
+        return None;
+    }
+    let mut s: *mut u16 = null_mut();
+    // SAFETY: `owner` is valid while `sd` lives; `s` receives a LocalAlloc'd string.
+    let ok = !owner.is_null() && unsafe { ConvertSidToStringSidW(owner, &mut s) } != 0 && !s.is_null();
+    let mut out = None;
+    if ok {
+        let mut n = 0;
+        // SAFETY: `s` is NUL-terminated.
+        while unsafe { *s.add(n) } != 0 {
+            n += 1;
+        }
+        // SAFETY: `s` holds `n` units; freed once, after copying.
+        out = Some(String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(s, n) }).eq_ignore_ascii_case(&me));
+        unsafe { LocalFree(s as *mut c_void) };
+    }
+    // SAFETY: freed once.
+    unsafe { LocalFree(sd) };
+    out
 }
 
 /// Make the folder `path` (its parent must exist) with an ACL of its own: full control for

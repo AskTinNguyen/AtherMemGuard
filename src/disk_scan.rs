@@ -869,24 +869,59 @@ fn busy_projects() -> Vec<String> {
     busy_state().0
 }
 
-/// Project folders an Unreal editor, build or cook is working in (normalised), and whether
-/// some Unreal process's command line couldn't be read (then nobody can say which project).
-pub fn busy_state() -> (Vec<String>, bool) {
+/// Project folders an Unreal editor, build or cook is working in (normalised), and, when
+/// some Unreal work can't be tied to a project, the words that say why every cleanup waits.
+pub fn busy_state() -> (Vec<String>, Option<String>) {
     let mut out = Vec::new();
-    let mut unknown = false;
+    let mut unknown: Option<&'static str> = None;
+    // Who this is, read once and only when some command line can't be read.
+    let mut me: Option<(Option<Vec<u8>>, Option<u32>)> = None;
     for p in crate::win::list_processes() {
         if !unreal_candidate(&p.name) {
             continue;
         }
-        match unreal_use(&p.name, crate::win::command_line(p.pid).as_deref()) {
-            UnrealUse::NotUnreal => {}
+        let u = unreal_use(&p.name, crate::win::command_line(p.pid).as_deref());
+        let own = if u == UnrealUse::Unreadable {
+            let (sid, session) = me.get_or_insert_with(|| (crate::doctor_win::current_user_sid(), crate::doctor_win::current_session()));
+            crate::doctor_win::ownership(p.pid, sid.as_deref(), *session)
+        } else {
+            crate::doctor_win::Ownership::default()
+        };
+        match u {
             UnrealUse::Projects(dirs) => out.extend(dirs),
-            UnrealUse::Unknown => unknown = true,
+            other => {
+                if let Some(w) = unknown_words(&p.name, &other, own) {
+                    // "Unreal is running" (known) wins over "can't read".
+                    if unknown.is_none() || w == UNREAL_UNKNOWN {
+                        unknown = Some(w);
+                    }
+                }
+            }
         }
     }
     out.sort();
     out.dedup();
-    (out, unknown)
+    (out, unknown.map(str::to_string))
+}
+
+/// Unreal work whose command line names no project.
+pub const UNREAL_UNKNOWN: &str = "Unreal is running and Ather MemGuard can't tell which project it works in, so it waits.";
+/// A build tool (dotnet, UnrealBuildTool, a cook) whose command line can't be read.
+pub const BUILD_TOOL_UNREADABLE: &str = "A build tool is running and Ather MemGuard can't read which project it works in, so it waits.";
+/// An Unreal editor whose command line can't be read.
+pub const EDITOR_UNREADABLE: &str = "An Unreal editor is running and Ather MemGuard can't read which project it works in, so it waits.";
+
+/// Why one process makes every cleanup wait, or `None` when it doesn't. A process whose
+/// command line can't be read counts only when it runs in this person's session and as this
+/// person (`own`); anything else (a SYSTEM service, another user's build) isn't their Unreal
+/// work. An owner or session that can't be read counts as not theirs.
+pub fn unknown_words(name: &str, u: &UnrealUse, own: crate::doctor_win::Ownership) -> Option<&'static str> {
+    match u {
+        UnrealUse::NotUnreal | UnrealUse::Projects(_) => None,
+        UnrealUse::Unknown => Some(UNREAL_UNKNOWN),
+        UnrealUse::Unreadable if !(own.owned && own.same_session) => None,
+        UnrealUse::Unreadable => Some(if name.to_ascii_lowercase().starts_with("unrealeditor") { EDITOR_UNREADABLE } else { BUILD_TOOL_UNREADABLE }),
+    }
 }
 
 /// What one process means for cleanups.
@@ -895,9 +930,12 @@ pub enum UnrealUse {
     NotUnreal,
     /// Unreal work in these project folders (normalised).
     Projects(Vec<String>),
-    /// Unreal work, but its command line couldn't be read or names no project: every cleanup
-    /// waits ("busy, unknown project").
+    /// Unreal work whose command line names no project: every cleanup waits ("busy, unknown
+    /// project").
     Unknown,
+    /// Could be Unreal work, but its command line couldn't be read: every cleanup waits only
+    /// when it is this person's own process (`unknown_words`).
+    Unreadable,
 }
 
 /// Could this process name be Unreal work (an editor, a build, a cook, a shader compile, a
@@ -922,7 +960,7 @@ pub fn unreal_use(name: &str, cmd: Option<&str>) -> UnrealUse {
     }
     let n = name.to_ascii_lowercase();
     let dotnet = n.strip_suffix(".exe").unwrap_or(&n) == "dotnet";
-    let Some(cmd) = cmd else { return UnrealUse::Unknown };
+    let Some(cmd) = cmd else { return UnrealUse::Unreadable };
     if dotnet {
         let l = cmd.to_ascii_lowercase();
         if !(l.contains("unrealbuildtool.dll") || l.contains("automationtool.dll")) {
@@ -1599,12 +1637,33 @@ mod tests {
         assert_eq!(unreal_use("UnrealPak", Some(r#"UnrealPak.exe D:\out\pak.pak -create=list.txt"#)), Unknown);
         assert_eq!(unreal_use("dotnet", Some(r#"dotnet UnrealBuildTool.dll -Mode=GenerateClangDatabase"#)), Unknown);
         assert_eq!(unreal_use("UnrealEditor", Some(r#""C:\UE\UnrealEditor.exe""#)), Unknown);
-        assert_eq!(unreal_use("UnrealBuildTool", None), Unknown, "command line unreadable");
-        assert_eq!(unreal_use("dotnet", None), Unknown, "an unreadable dotnet could be a build");
+        assert_eq!(unreal_use("UnrealBuildTool", None), Unreadable, "command line unreadable");
+        assert_eq!(unreal_use("dotnet", None), Unreadable, "an unreadable dotnet could be a build");
         // Other dotnet work and other programs are not Unreal work.
         assert_eq!(unreal_use("dotnet", Some(r#"dotnet "C:\Users\me\.vscode\extensions\csharp\Microsoft.CodeAnalysis.LanguageServer.dll""#)), NotUnreal);
         assert_eq!(unreal_use("devenv", Some("devenv.exe D:\\s2\\S2.sln")), NotUnreal);
         assert!(unreal_candidate("ShaderCompileWorker.exe") && unreal_candidate("UnrealPak") && !unreal_candidate("node"));
+    }
+
+    /// Found in review: an unreadable dotnet (a SYSTEM service, say) made every cleanup say
+    /// "Unreal is running". Only this person's own process in their session counts, and the
+    /// words say only what is known.
+    #[test]
+    fn unreadable_process_counts_only_when_its_mine() {
+        use crate::doctor_win::Ownership;
+        let mine = Ownership { owned: true, same_session: true };
+        let u = UnrealUse::Unreadable;
+        assert_eq!(unknown_words("dotnet.exe", &u, mine), Some(BUILD_TOOL_UNREADABLE));
+        assert_eq!(unknown_words("UnrealBuildTool", &u, mine), Some(BUILD_TOOL_UNREADABLE));
+        assert_eq!(unknown_words("UnrealEditor", &u, mine), Some(EDITOR_UNREADABLE));
+        // A SYSTEM service (session 0, another owner), another user in this session, this user elsewhere.
+        assert_eq!(unknown_words("dotnet.exe", &u, Ownership { owned: false, same_session: false }), None);
+        assert_eq!(unknown_words("dotnet.exe", &u, Ownership { owned: false, same_session: true }), None);
+        assert_eq!(unknown_words("dotnet.exe", &u, Ownership { owned: true, same_session: false }), None);
+        // Readable but naming no project: waits whoever owns it; not Unreal work never waits.
+        assert_eq!(unknown_words("UnrealEditor", &UnrealUse::Unknown, Ownership::default()), Some(UNREAL_UNKNOWN));
+        assert_eq!(unknown_words("dotnet", &UnrealUse::NotUnreal, mine), None);
+        assert!(!BUILD_TOOL_UNREADABLE.contains("Unreal is running"));
     }
 
     /// A small tree on this PC's temp drive, scanned in-process: files, nested items and the

@@ -544,10 +544,10 @@ pub struct ItemCheck {
     pub now_last_write: Option<u64>,
     pub now_ft: u64,
     pub min_age_hours: f64,
-    /// Project folders Unreal is working in (normalised), and whether some Unreal process's
-    /// command line couldn't be read.
+    /// Project folders Unreal is working in (normalised), and, when some Unreal work can't be
+    /// tied to a project, the words that say why every cleanup waits.
     pub busy: Vec<String>,
-    pub busy_unknown: bool,
+    pub busy_unknown: Option<String>,
     /// `[disk] keep` (normalised), read again at clean time: an item inside a kept folder, or
     /// holding one, is never cleaned.
     pub keep: Vec<String>,
@@ -581,8 +581,8 @@ pub fn refusal(item: &ItemCheck, paths: &[PathFacts]) -> Option<String> {
     if item.planned_last_write > 0 && now_lw > item.planned_last_write {
         return Some("Something in it was written after the plan was made. Make a new plan first.".into());
     }
-    if item.busy_unknown {
-        return Some("Unreal is running and Ather MemGuard can't tell which project it works in, so it waits.".into());
+    if let Some(why) = &item.busy_unknown {
+        return Some(why.clone());
     }
     for p in paths {
         let root = p.recognised_root.as_deref().map(norm);
@@ -944,6 +944,12 @@ pub struct DeleteReport {
     pub bytes: u64,
     /// Junctions and symbolic links removed as links (their targets untouched).
     pub links: u64,
+    /// Read-only files also linked from outside the folder (hard links), left as they are on
+    /// purpose, and their size. Removing such a name frees nothing.
+    #[serde(default)]
+    pub linked: u64,
+    #[serde(default)]
+    pub linked_bytes: u64,
     /// Up to 20 paths that couldn't be removed, with the reason.
     pub failed: Vec<(String, String)>,
     pub failed_count: u64,
@@ -977,7 +983,43 @@ impl DeleteReport {
                 self.failed.first().map(|(p, e)| format!(", for example {} ({})", p, e)).unwrap_or_default()
             ));
         }
+        if self.linked > 0 {
+            s.push_str(&format!(
+                ". {} also linked from outside this folder, so {} left as {}",
+                if self.linked == 1 { "1 file is".to_string() } else { format!("{} are", plural(self.linked, "file")) },
+                if self.linked == 1 { "it was" } else { "they were" },
+                if self.linked == 1 { "it is" } else { "they are" }
+            ));
+        }
         s
+    }
+
+    /// Everything that could go went: what is left is only files linked from outside, kept on
+    /// purpose (the folders holding them stay too).
+    pub fn only_linked_left(&self) -> bool {
+        self.failed_count == 0 && self.linked > 0
+    }
+
+    /// "done", "partial" or "failed".
+    pub fn result(&self) -> &'static str {
+        if !self.remains || self.only_linked_left() {
+            "done"
+        } else if self.files > 0 || self.dirs > 0 {
+            "partial"
+        } else {
+            "failed"
+        }
+    }
+
+    /// The prediction after this delete: the item's own number when everything that could go
+    /// went (it never counted files linked from outside: those free nothing), else scaled by
+    /// what went of what it counted (`left`, the bytes still there, less the linked files).
+    pub fn prediction(&self, frees_alone: Option<u64>, left: u64) -> u64 {
+        match self.result() {
+            "failed" => 0,
+            "done" => frees_alone.unwrap_or(0),
+            _ => scaled_prediction(frees_alone, self.bytes, left.saturating_sub(self.linked_bytes)),
+        }
     }
 }
 
@@ -1007,6 +1049,32 @@ pub fn thousands(n: u64) -> String {
         out.push(c);
     }
     out
+}
+
+/// Why `root` mustn't be deleted now, read immediately before the delete: `now` is its file id
+/// and attributes as read this moment (`None`: it couldn't be read), `planned` the file id the
+/// plan saw. A folder swapped in since the checks (another id) or turned into a link is refused.
+pub fn pre_delete_refusal(path: &str, now: Option<(u128, u32)>, planned: Option<u128>) -> Option<String> {
+    let Some((id, attrs)) = now else {
+        return Some(format!("Ather MemGuard couldn't read {} again just before deleting it, so it was left alone.", path));
+    };
+    if attrs & disk_win::A_REPARSE != 0 {
+        return Some(format!("{} became a link to somewhere else just before deleting it, so it was left alone.", path));
+    }
+    if planned.is_some_and(|p| p != id) {
+        return Some(format!("{} was replaced just before deleting it (its file id changed), so it was left alone. Make a new plan first.", path));
+    }
+    None
+}
+
+/// `delete_tree`, after reading the root's file id and attributes again right then
+/// (`pre_delete_refusal`): `Err` with the reason, and nothing deleted, on a mismatch.
+pub fn delete_tree_checked(root: &Path, planned: Option<u128>) -> Result<DeleteReport, String> {
+    let s = root.display().to_string();
+    if let Some(why) = pre_delete_refusal(&s, disk_win::identity(&s).map(|(_, id, a)| (id, a)), planned) {
+        return Err(why);
+    }
+    Ok(delete_tree(root))
 }
 
 /// Delete `root` and everything in it, never following a reparse point: a junction or
@@ -1071,7 +1139,8 @@ fn delete_dir(dir: &Path, r: &mut DeleteReport) {
                     // Read-only is a property of the file, not of the name: clearing it on a file
                     // with another name outside the item would change that file too.
                     if m.permissions().readonly() && disk_win::link_count(&p.display().to_string()).is_none_or(|n| n > 1) {
-                        r.fail_why(&p, "it is read-only and hard-linked to a file elsewhere, so it was left alone");
+                        r.linked += 1;
+                        r.linked_bytes += m.len();
                         continue;
                     }
                     clear_readonly(&p, &m);
@@ -1110,26 +1179,56 @@ pub fn bin_root(volume_root: &str) -> PathBuf {
 }
 
 /// Make the bin folder if it is missing: only this user, SYSTEM and Administrators may open it
-/// (its own ACL, nothing inherited from the drive's root, where other users can read).
+/// (its own ACL, nothing inherited from the drive's root, where other users can read). An
+/// existing one is used only when it is a real folder this user owns.
 pub fn ensure_bin(bin: &Path) -> Result<(), String> {
-    if bin.is_dir() {
-        return Ok(());
-    }
-    disk_win::create_private_dir(&bin.display().to_string())
+    ensure_private_dir(bin)
 }
 
-/// Can the bin be made on this volume? Creates the bin folder if it is missing (it is ours).
-pub fn bin_writable(volume_root: &str) -> bool {
-    if cfg!(test) {
-        return true;
+/// `path` as a folder of the bin: made private when missing, else checked (`existing_bin_refusal`).
+fn ensure_private_dir(path: &Path) -> Result<(), String> {
+    use std::os::windows::fs::MetadataExt;
+    let s = path.display().to_string();
+    match std::fs::symlink_metadata(path) {
+        Ok(m) => match existing_bin_refusal(&s, m.file_attributes(), disk_win::owned_by_current_user(&s)) {
+            Some(why) => Err(why),
+            None => Ok(()),
+        },
+        Err(_) => disk_win::create_private_dir(&s),
     }
-    ensure_bin(&bin_root(volume_root)).is_ok()
+}
+
+/// Why an existing bin folder (`.AtherMemGuard-bin` or a run folder in it) mustn't be used,
+/// from its attributes and whether this user owns it (`None`: the owner couldn't be read).
+/// Something else could have put a link or another user's folder there before the bin was made.
+pub fn existing_bin_refusal(path: &str, attrs: u32, owned: Option<bool>) -> Option<String> {
+    if attrs & disk_win::A_REPARSE != 0 {
+        Some(format!("{} is a link to somewhere else, not Ather MemGuard's bin, so it isn't used", path))
+    } else if attrs & disk_win::A_DIR == 0 {
+        Some(format!("{} is a file, not Ather MemGuard's bin, so it isn't used", path))
+    } else if owned == Some(false) {
+        Some(format!("{} belongs to another user, not to you, so Ather MemGuard doesn't use it as its bin", path))
+    } else if owned.is_none() {
+        Some(format!("Ather MemGuard can't tell who owns {}, so it doesn't use it as its bin", path))
+    } else {
+        None
+    }
+}
+
+/// Why the bin can't be used on this volume, or `None`. Creates the bin folder if it is
+/// missing (it is ours).
+pub fn bin_problem(volume_root: &str) -> Option<String> {
+    if cfg!(test) {
+        return None;
+    }
+    ensure_bin(&bin_root(volume_root)).err()
 }
 
 /// Move `src` into `<bin>\<run>\<n>\<name>` on the same volume. Never copies: a move across
 /// volumes fails instead.
 pub fn move_to_bin(src: &Path, bin: &Path, run: &str, slot: &str) -> Result<PathBuf, String> {
-    ensure_bin(bin).map_err(|e| format!("couldn't make the bin: {}; nothing was moved", e))?;
+    ensure_bin(bin).map_err(|e| format!("couldn't use the bin: {}; nothing was moved", e))?;
+    ensure_private_dir(&bin.join(run)).map_err(|e| format!("couldn't use the bin: {}; nothing was moved", e))?;
     let dir = bin.join(run).join(slot);
     std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't make the bin folder {}: {}", dir.display(), e))?;
     let name = src.file_name().ok_or("the folder has no name")?;
@@ -1836,6 +1935,9 @@ fn minutes_words(sec: u64) -> String {
     }
 }
 
+/// Below this a measured rise reads as 0.0 GB, so it is said as "didn't rise".
+pub const MIN_RISE_GB: f64 = 0.05;
+
 /// The toast and log words for a measured result: (title, body). They state only what was
 /// observed (free space rose on the drive), never that this cleanup caused it: other activity
 /// on the drive, or ReFS returning earlier deletes late and in bulk, can add to it or hide it.
@@ -1862,12 +1964,13 @@ pub fn measured_words(volume: &str, predicted: u64, m: &Measured, refs: bool) ->
             ),
         );
     }
-    let rose = if m.measured_freed > 0 { format!("rose by {:.1} GB", got) } else { "didn't rise".to_string() };
+    let risen = got >= MIN_RISE_GB;
+    let rose = if risen { format!("rose by {:.1} GB", got) } else { "didn't rise".to_string() };
     let mut body = format!("Free space on {} {} in {} after the cleanup {}. Predicted {:.1} GB.", volume, rose, when, hedge, pred);
     if m.other_activity {
         body.push_str(&busy);
     }
-    if m.appeared_after_sec.is_some() {
+    if m.appeared_after_sec.is_some() && risen {
         (format!("Free space rose on {}", volume), body)
     } else {
         if refs {
@@ -2019,7 +2122,7 @@ pub struct CleanOpts {
     /// PATH for finding a tool (tests).
     pub tool_path: Option<String>,
     /// Facts about Unreal processes; `None` reads them now.
-    pub busy: Option<(Vec<String>, bool)>,
+    pub busy: Option<(Vec<String>, Option<String>)>,
     /// Check git (off only in tests that don't need it).
     pub skip_git: bool,
 }
@@ -2076,7 +2179,7 @@ impl CleanResult {
 }
 
 /// The rule facts for one planned item (catalogue, relocation record, settings, now).
-pub fn item_check(p: &PlannedItem, s: &crate::config::DiskSettings, files: &DiskFiles, busy: &(Vec<String>, bool)) -> ItemCheck {
+pub fn item_check(p: &PlannedItem, s: &crate::config::DiskSettings, files: &DiskFiles, busy: &(Vec<String>, Option<String>)) -> ItemCheck {
     let info = crate::disk_scan::catalog_info(&p.key);
     let mut c = ItemCheck {
         key: p.key.clone(),
@@ -2086,7 +2189,7 @@ pub fn item_check(p: &PlannedItem, s: &crate::config::DiskSettings, files: &Disk
         now_ft: crate::win::now_filetime(),
         min_age_hours: s.min_age_hours,
         busy: busy.0.clone(),
-        busy_unknown: busy.1,
+        busy_unknown: busy.1.clone(),
         keep: s.keep.iter().filter(|k| !k.trim().is_empty()).map(|k| norm(k)).collect(),
         ..Default::default()
     };
@@ -2111,7 +2214,9 @@ pub fn item_check(p: &PlannedItem, s: &crate::config::DiskSettings, files: &Disk
         None if p.key == "cache:old" => {
             c.global = true;
             if let Some(r) = files.relocate_record().filter(|r| !r.undone) {
-                c.allowed_paths = r.entries.iter().map(|e| norm(&e.old_location)).collect();
+                // Only a variable's own default place (a hand-edited record can't add others).
+                let vars = crate::disk_relocate::cache_vars();
+                c.allowed_paths = r.entries.iter().filter(|e| crate::disk_relocate::old_location_known(&e.name, &e.old_location, &vars)).map(|e| norm(&e.old_location)).collect();
             }
         }
         None => {}
@@ -2172,9 +2277,15 @@ pub fn clean(cfg: &crate::config::Config, files: &DiskFiles, plan: &PlanRecord, 
             outcomes.push(refuse(&item.title, action, format!("\"{}\" isn't offered for this item.", action.name())));
             continue;
         }
-        if action == CleanAction::Bin && !opts.dry_run && !item.volume_root.as_deref().is_some_and(bin_writable) {
-            outcomes.push(refuse(&item.title, action, "The bin can't be made on that drive (its top folder isn't writable), so it can only be deleted.".into()));
-            continue;
+        if action == CleanAction::Bin && !opts.dry_run {
+            let problem = match item.volume_root.as_deref() {
+                Some(root) => bin_problem(root),
+                None => Some("the drive isn't known".into()),
+            };
+            if let Some(why) = problem {
+                outcomes.push(refuse(&item.title, action, format!("The bin can't be used on that drive ({}), so it can only be deleted.", why)));
+                continue;
+            }
         }
         if opts.agent && (item.class != "regenerable" || action != CleanAction::Now) {
             outcomes.push(refuse(&item.title, action, "Agents may only delete regenerable build output and caches (action now). Ask the person to do the rest.".into()));
@@ -2230,30 +2341,45 @@ pub fn clean(cfg: &crate::config::Config, files: &DiskFiles, plan: &PlanRecord, 
         match action {
             CleanAction::Now => {
                 let mut total = DeleteReport::default();
-                for p in &item.paths {
-                    let r = delete_tree(Path::new(p));
+                let mut refused = None;
+                for (j, p) in item.paths.iter().enumerate() {
+                    // The root is read again right before its delete: a folder swapped in since
+                    // the checks, or turned into a link, is left alone.
+                    let r = match delete_tree_checked(Path::new(p), item.path_ids.get(j).copied().flatten()) {
+                        Ok(r) => r,
+                        Err(why) if j == 0 => {
+                            refused = Some(why);
+                            break;
+                        }
+                        Err(why) => {
+                            total.fail_why(Path::new(p), &why);
+                            total.remains = true;
+                            continue;
+                        }
+                    };
                     total.files += r.files;
                     total.dirs += r.dirs;
                     total.bytes += r.bytes;
                     total.links += r.links;
+                    total.linked += r.linked;
+                    total.linked_bytes += r.linked_bytes;
                     total.failed_count += r.failed_count;
                     total.failed.extend(r.failed.into_iter().take(20usize.saturating_sub(total.failed.len())));
                     total.remains |= r.remains;
                 }
-                o.result = if total.remains { if total.files > 0 || total.dirs > 0 { "partial" } else { "failed" } } else { "done" }.into();
-                o.message = if total.remains { total.words() } else { format!("Deleted for good. {}.", total.words()) };
-                // A partial delete frees only part of the prediction: scale it to what went (an
-                // estimate), so the watch never waits for space that was never deleted.
-                o.predicted_now = if o.result == "failed" {
-                    0
-                } else if total.remains {
-                    let left: u64 = item.paths.iter().map(|p| dir_size(Path::new(p))).sum();
-                    scaled_prediction(item.frees_alone, total.bytes, left)
+                if let Some(why) = refused {
+                    o.result = "refused".into();
+                    o.message = why;
                 } else {
-                    item.frees_alone.unwrap_or(0)
-                };
-                o.deleted = Some(total);
-                entries.push(UndoEntry { id: entry_id, finding_id: item.id.clone(), title: item.title.clone(), action: *action, step: UndoStep::Nothing, undone: false });
+                    o.result = total.result().into();
+                    o.message = if o.result == "done" { format!("Deleted for good. {}.", total.words()) } else { total.words() };
+                    // A partial delete frees only part of the prediction: scale it to what went (an
+                    // estimate), so the watch never waits for space that was never deleted.
+                    let left: u64 = if o.result == "partial" { item.paths.iter().map(|p| dir_size(Path::new(p))).sum() } else { 0 };
+                    o.predicted_now = total.prediction(item.frees_alone, left);
+                    o.deleted = Some(total);
+                    entries.push(UndoEntry { id: entry_id, finding_id: item.id.clone(), title: item.title.clone(), action: *action, step: UndoStep::Nothing, undone: false });
+                }
             }
             CleanAction::Bin => {
                 let root = item.volume_root.clone().unwrap_or_default();
@@ -2675,8 +2801,8 @@ mod tests {
         assert!(refusal(&it, &[proj_facts("Intermediate")]).unwrap().contains("editor, build or cook"));
         it.busy = vec![norm(r"D:\other")];
         assert_eq!(refusal(&it, &[proj_facts("Intermediate")]), None);
-        it.busy_unknown = true;
-        assert!(refusal(&it, &[proj_facts("Intermediate")]).unwrap().contains("can't tell"));
+        it.busy_unknown = Some(crate::disk_scan::BUILD_TOOL_UNREADABLE.into());
+        assert_eq!(refusal(&it, &[proj_facts("Intermediate")]).as_deref(), Some(crate::disk_scan::BUILD_TOOL_UNREADABLE));
     }
 
     #[test]
@@ -2994,14 +3120,27 @@ mod tests {
         std::fs::write(item.join("plain.obj"), b"x").unwrap();
         assert_eq!(disk_win::link_count(&outside.display().to_string()), Some(2));
         let rep = delete_tree(&item);
-        assert!(rep.remains && rep.failed_count == 1, "{:?}", rep);
-        assert!(rep.failed[0].1.contains("hard-linked"), "{:?}", rep.failed);
+        assert!(rep.remains && rep.failed_count == 0, "{:?}", rep);
+        assert_eq!((rep.linked, rep.linked_bytes), (1, 8), "{:?}", rep);
         assert!(std::fs::metadata(&outside).unwrap().permissions().readonly(), "the outside file keeps read-only");
         assert_eq!(std::fs::read(&outside).unwrap(), b"precious");
         assert!(!item.join("plain.obj").exists());
-        assert!(rep.words().contains("1 file or folder could not be removed and is still there"), "{}", rep.words());
+        // Found in review: this reported "partial" on every run. Everything that could go went,
+        // and the outcome says why the rest stays, once.
+        assert_eq!(rep.result(), "done");
+        let w = rep.words();
+        assert!(w.contains("1 file is also linked from outside this folder, so it was left as it is"), "{}", w);
+        assert_eq!(w.matches("linked").count(), 1, "{}", w);
+        assert!(!w.contains("could not be removed"), "{}", w);
+        // The prediction never counts the linked files' bytes (they free nothing).
+        assert_eq!(rep.prediction(Some(1000), 8), 1000);
+        let both = DeleteReport { files: 1, bytes: 100, linked: 2, linked_bytes: 300, failed_count: 1, remains: true, ..Default::default() };
+        assert_eq!(both.result(), "partial");
+        assert_eq!(both.prediction(Some(1000), 400), scaled_prediction(Some(1000), 100, 100), "only the 100 bytes it counted are left");
+        assert!(both.words().contains("2 files are also linked from outside this folder, so they were left as they are"), "{}", both.words());
         let three = DeleteReport { failed_count: 3, ..Default::default() };
         assert!(three.words().contains("3 files or folders could not be removed and are still there"), "{}", three.words());
+        assert_eq!(DeleteReport { remains: true, ..Default::default() }.result(), "failed");
         // Clean up the test's own read-only files.
         for f in [&outside, &item.join("shared.uasset")] {
             if let Ok(m) = std::fs::metadata(f) {
@@ -3034,6 +3173,81 @@ mod tests {
         }
         assert!(text.contains("NT AUTHORITY\\SYSTEM:(OI)(CI)(F)"), "{}", text);
         assert!(disk_win::create_private_dir(&bin.display().to_string()).is_err(), "never over an existing folder");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Found in review: an existing `.AtherMemGuard-bin` (or run folder) was used whatever it
+    /// was. A link or another user's folder is refused, in plain words.
+    #[test]
+    fn an_existing_bin_must_be_a_folder_of_mine() {
+        let d = disk_win::A_DIR;
+        assert_eq!(existing_bin_refusal(r"D:\.AtherMemGuard-bin", d, Some(true)), None);
+        let link = existing_bin_refusal(r"D:\.AtherMemGuard-bin", d | disk_win::A_REPARSE, Some(true)).unwrap();
+        assert!(link.contains("is a link to somewhere else"), "{}", link);
+        let other = existing_bin_refusal(r"D:\.AtherMemGuard-bin", d, Some(false)).unwrap();
+        assert!(other.contains("belongs to another user"), "{}", other);
+        assert!(existing_bin_refusal(r"D:\.AtherMemGuard-bin", d, None).unwrap().contains("can't tell who owns"));
+        assert!(existing_bin_refusal(r"D:\.AtherMemGuard-bin", 0x20, Some(true)).unwrap().contains("is a file"));
+
+        // In a temp folder: the bin made here is ours; a junction in its place is refused and
+        // nothing is moved through it.
+        let root = std::env::temp_dir().join(format!("amg-clean-binown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        let bin = root.join(BIN_DIR);
+        ensure_bin(&bin).unwrap();
+        assert_eq!(disk_win::owned_by_current_user(&bin.display().to_string()), Some(true));
+        assert_eq!(ensure_bin(&bin), Ok(()), "an existing bin of mine is used");
+        std::fs::remove_dir(&bin).unwrap();
+        let ok = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&bin).arg(root.join("elsewhere")).output().map(|o| o.status.success()).unwrap_or(false);
+        if ok {
+            let e = move_to_bin(&root.join("a"), &bin, "run", "1-0").unwrap_err();
+            assert!(e.contains("is a link to somewhere else") && e.contains("nothing was moved"), "{}", e);
+            assert!(root.join("a").is_dir());
+            assert_eq!(std::fs::read_dir(root.join("elsewhere")).unwrap().count(), 0, "nothing went through the link");
+            std::fs::remove_dir(&bin).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Found in review: the root's file id was checked well before the delete. It is read
+    /// again right before: a folder swapped in since, or a link, is left alone.
+    #[test]
+    fn a_folder_swapped_in_just_before_the_delete_is_left_alone() {
+        assert_eq!(pre_delete_refusal("X", Some((7, disk_win::A_DIR)), Some(7)), None);
+        assert!(pre_delete_refusal("X", Some((8, disk_win::A_DIR)), Some(7)).unwrap().contains("file id changed"));
+        assert!(pre_delete_refusal("X", Some((7, disk_win::A_DIR | disk_win::A_REPARSE)), Some(7)).unwrap().contains("became a link"));
+        assert!(pre_delete_refusal("X", None, Some(7)).unwrap().contains("couldn't read"));
+
+        let root = std::env::temp_dir().join(format!("amg-clean-swap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let item = root.join("Intermediate");
+        std::fs::create_dir_all(&item).unwrap();
+        std::fs::create_dir_all(root.join("Other")).unwrap();
+        std::fs::write(root.join(r"Other\keep.txt"), b"keep").unwrap();
+        let planned = disk_win::identity(&item.display().to_string()).map(|(_, id, _)| id);
+        assert!(planned.is_some());
+        // Swap: the planned folder moves away and another takes its name.
+        std::fs::rename(&item, root.join("Intermediate-old")).unwrap();
+        std::fs::rename(root.join("Other"), &item).unwrap();
+        let e = delete_tree_checked(&item, planned).unwrap_err();
+        assert!(e.contains("file id changed"), "{}", e);
+        assert_eq!(std::fs::read(item.join("keep.txt")).unwrap(), b"keep", "the swapped-in folder is untouched");
+        // The folder the plan saw, at its own name and id: deleted.
+        std::fs::rename(&item, root.join("Other")).unwrap();
+        std::fs::rename(root.join("Intermediate-old"), &item).unwrap();
+        let rep = delete_tree_checked(&item, planned).unwrap();
+        assert!(!rep.remains && !item.exists(), "{:?}", rep);
+        // A junction in its place: refused, its target untouched.
+        let ok = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&item).arg(root.join("Other")).output().map(|o| o.status.success()).unwrap_or(false);
+        if ok {
+            let id = disk_win::identity(&item.display().to_string()).map(|(_, id, _)| id);
+            let e = delete_tree_checked(&item, id).unwrap_err();
+            assert!(e.contains("became a link"), "{}", e);
+            assert!(root.join(r"Other\keep.txt").is_file());
+            std::fs::remove_dir(&item).unwrap();
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3250,7 +3464,7 @@ mod tests {
     }
 
     pub(crate) fn test_opts() -> CleanOpts {
-        CleanOpts { presample_secs: 1, start_watcher: false, busy: Some((vec![], false)), skip_git: true, ..Default::default() }
+        CleanOpts { presample_secs: 1, start_watcher: false, busy: Some((vec![], None)), skip_git: true, ..Default::default() }
     }
 
     /// Found in review: a locked 2 MB file stayed, 1 KB was removed, and the watch still
@@ -3497,6 +3711,14 @@ mod tests {
         assert!(b.starts_with("Free space on D: rose by 4.0 GB in the 4 minutes after the cleanup"), "{}", b);
         let (_, b) = measured_words("D:", 4 * G, &m(-(G as i64), WATCH_MAX_SEC, false), false);
         assert!(b.starts_with("Free space on D: didn't rise in the 30 minutes after the cleanup"), "{}", b);
+        // Found in review: a rise under 0.05 GB read "rose by 0.0 GB".
+        for tiny in [1i64, 40 << 20, (G as i64) / 25] {
+            let (t, b) = measured_words("D:", 4 * G, &m(tiny, 200, true), false);
+            assert!(b.starts_with("Free space on D: didn't rise in the 4 minutes"), "{}", b);
+            assert!(!b.contains("0.0 GB") && !t.contains("rose"), "{} / {}", t, b);
+        }
+        let (t, b) = measured_words("D:", 4 * G, &m((G as i64) / 10, 200, true), false);
+        assert!(b.starts_with("Free space on D: rose by 0.1 GB") && t == "Free space rose on D:", "{} / {}", t, b);
         // A large overshoot still says it can't be told apart.
         let (t, b) = measured_words("D:", G, &m(50 * G as i64, 320, true), true);
         assert_eq!(t, "Free space jumped on D:");

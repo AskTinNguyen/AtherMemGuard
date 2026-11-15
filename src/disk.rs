@@ -701,30 +701,36 @@ pub fn render_text(r: &DiskReport) -> String {
     if !r.recent_cleanups.is_empty() {
         s.push_str("\nRecent cleanups:\n");
         for c in &r.recent_cleanups {
-            let other = c["other_activity"] == true;
-            let measured = match c["measured_free_space_rise_gb"].as_f64() {
-                Some(m) if m > 0.0 => format!(
-                    "free space rose by {}{:.1} GB in the {} min after it (measured; other activity on the drive can add to or hide this){}",
-                    if other { "about " } else { "" },
-                    m,
-                    c["measured_watched_sec"].as_u64().unwrap_or(0).div_ceil(60).max(1),
-                    if other { ", other writes made it unclear" } else { "" }
-                ),
-                Some(_) => "free space didn't rise while it was watched (measured)".to_string(),
-                None if c["state"] == "couldnt_measure" => "couldn't measure the free space".to_string(),
-                None if c["state"] == "watching" => "being measured".to_string(),
-                None => "not measured".to_string(),
-            };
-            s.push_str(&format!(
-                "  {} {}: predicted {:.1} GB, {}\n",
-                c["time"].as_str().unwrap_or(""),
-                c["volume"].as_str().unwrap_or(""),
-                c["predicted_freed_gb"].as_f64().unwrap_or(0.0),
-                measured
-            ));
+            s.push_str(&recent_cleanup_line(c));
         }
     }
     s
+}
+
+/// One line of "Recent cleanups". The volume is already "C:", so no colon follows it. A rise
+/// under 0.05 GB (it would print as 0.0 GB) is "didn't rise".
+pub fn recent_cleanup_line(c: &serde_json::Value) -> String {
+    let other = c["other_activity"] == true;
+    let measured = match c["measured_free_space_rise_gb"].as_f64() {
+        Some(m) if m >= crate::disk_clean::MIN_RISE_GB => format!(
+            "free space rose by {}{:.1} GB in the {} min after it (measured; other activity on the drive can add to or hide this){}",
+            if other { "about " } else { "" },
+            m,
+            c["measured_watched_sec"].as_u64().unwrap_or(0).div_ceil(60).max(1),
+            if other { ", other writes made it unclear" } else { "" }
+        ),
+        Some(_) => "free space didn't rise while it was watched (measured)".to_string(),
+        None if c["state"] == "couldnt_measure" => "couldn't measure the free space".to_string(),
+        None if c["state"] == "watching" => "being measured".to_string(),
+        None => "not measured".to_string(),
+    };
+    format!(
+        "  {} on {}, predicted {:.1} GB; {}\n",
+        c["time"].as_str().unwrap_or(""),
+        c["volume"].as_str().unwrap_or("").trim_end_matches('\\'),
+        c["predicted_freed_gb"].as_f64().unwrap_or(0.0),
+        measured
+    )
 }
 
 /// The small `disk` block of `memguard_status`.
@@ -863,6 +869,24 @@ mod tests {
     use super::*;
 
     const G: u64 = 1 << 30;
+
+    /// Found in review: `memguard disk` printed "C::" (the volume already ends in ':') and
+    /// "rose by 0.0 GB" for a rise under 0.05 GB.
+    #[test]
+    fn recent_cleanup_lines_read_plainly() {
+        let c = |rise: serde_json::Value| serde_json::json!({ "time": "2026-11-15 10:00", "volume": "C:", "predicted_freed_gb": 16.4, "measured_free_space_rise_gb": rise, "measured_watched_sec": 120 });
+        let l = recent_cleanup_line(&c(serde_json::json!(16.2)));
+        assert_eq!(l, "  2026-11-15 10:00 on C:, predicted 16.4 GB; free space rose by 16.2 GB in the 2 min after it (measured; other activity on the drive can add to or hide this)\n");
+        assert!(!l.contains("::"));
+        for tiny in [0.0, 0.01, 0.04] {
+            let l = recent_cleanup_line(&c(serde_json::json!(tiny)));
+            assert!(l.contains("free space didn't rise while it was watched") && !l.contains("0.0 GB") && !l.contains("rose by"), "{}", l);
+        }
+        assert!(recent_cleanup_line(&c(serde_json::json!(0.05))).contains("rose by 0.1 GB"));
+        let r = DiskReport { level: Level::Normal, volumes: vec![], dev_drive: dev_state("on", "antivirus_allowed"), findings: vec![], advice: vec![], recent_cleanups: vec![c(serde_json::json!(1.0))] };
+        let text = render_text(&r);
+        assert!(text.contains("on C:, predicted") && !text.contains("C::"), "{}", text);
+    }
 
     fn s() -> DiskSettings {
         DiskSettings::default()

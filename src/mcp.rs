@@ -1051,7 +1051,7 @@ mod tests {
         let files = DiskFiles::in_dir(root.join("data"));
         let srv = server()
             .with_disk(Box::new(|job, p| Ok(crate::disk_scan::run_job(job, p))), Box::new(move || Some(cached.clone())))
-            .with_clean(files.clone(), CleanOpts { presample_secs: 1, start_watcher: false, busy: Some((vec![], false)), ..Default::default() });
+            .with_clean(files.clone(), CleanOpts { presample_secs: 1, start_watcher: false, busy: Some((vec![], None)), ..Default::default() });
         let run = |id: u32, name: &str, args: Value| -> Value {
             let mut o = Vec::new();
             srv.serve(call(id, name, args).as_bytes(), &mut o).unwrap();

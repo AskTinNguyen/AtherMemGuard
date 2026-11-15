@@ -500,8 +500,26 @@ pub fn undo(store: &dyn EnvStore, files: &crate::disk_clean::DiskFiles) -> Resul
     Ok(said)
 }
 
+/// Is `old` the place variable `name` keeps its cache when unset (one of `vars`' defaults,
+/// compared normalised)? Only that place is ever offered as an old cache: a relocation record
+/// edited by hand could otherwise name any folder in the profile.
+pub fn old_location_known(name: &str, old: &str, vars: &[CacheVar]) -> bool {
+    let old = norm(old);
+    !old.is_empty()
+        && vars
+            .iter()
+            .filter(|v| v.name.eq_ignore_ascii_case(name))
+            .filter_map(|v| v.default.as_ref())
+            .any(|d| norm(&d.display().to_string()) == old)
+}
+
 /// Old caches no longer used: the new folder exists and was written after the relocation.
 pub fn old_caches(rec: &RelocateRecord) -> Vec<(String, String)> {
+    old_caches_with(rec, &cache_vars())
+}
+
+/// `old_caches`, with the variables (and their defaults) given.
+pub fn old_caches_with(rec: &RelocateRecord, vars: &[CacheVar]) -> Vec<(String, String)> {
     if rec.undone {
         return Vec::new();
     }
@@ -513,6 +531,7 @@ pub fn old_caches(rec: &RelocateRecord) -> Vec<(String, String)> {
     };
     rec.entries
         .iter()
+        .filter(|e| old_location_known(&e.name, &e.old_location, vars))
         .filter(|e| Path::new(&e.old_location).is_dir() && norm(&e.old_location) != norm(&e.new_value) && after(Path::new(&e.new_value)))
         .map(|e| (e.name.clone(), e.old_location.clone()))
         .collect()
@@ -761,13 +780,52 @@ mod tests {
             entries: vec![RecordEntry { name: "PIP_CACHE_DIR".into(), previous: None, new_value: dir.join("new").display().to_string(), old_location: dir.join("old").display().to_string() }],
             undone: false,
         };
-        assert!(old_caches(&rec).is_empty(), "empty new folder: not written to yet");
+        // The test's own folder stands in for pip's default cache.
+        let vars = vec![CacheVar { name: "PIP_CACHE_DIR", what: "pip cache", default: Some(dir.join("old")), sub: r"pip\cache" }];
+        assert!(old_caches_with(&rec, &vars).is_empty(), "empty new folder: not written to yet");
         std::fs::write(dir.join(r"new\wheel.bin"), b"x").unwrap();
-        assert_eq!(old_caches(&rec), vec![("PIP_CACHE_DIR".to_string(), dir.join("old").display().to_string())]);
+        assert_eq!(old_caches_with(&rec, &vars), vec![("PIP_CACHE_DIR".to_string(), dir.join("old").display().to_string())]);
         let mut undone = rec.clone();
         undone.undone = true;
-        assert!(old_caches(&undone).is_empty());
+        assert!(old_caches_with(&undone, &vars).is_empty());
+        // A forged record naming another folder (here one that exists, with a written new
+        // place) isn't offered as an old cache.
+        std::fs::create_dir_all(dir.join("Documents")).unwrap();
+        let mut forged = rec.clone();
+        forged.entries[0].old_location = dir.join("Documents").display().to_string();
+        assert!(old_caches_with(&forged, &vars).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Found in review: a forged disk-relocate.json could list any profile folder as "Old
+    /// cache, no longer used". Only the variable's own default place counts.
+    #[test]
+    fn old_location_must_be_the_variables_default() {
+        let vars = vec![
+            CacheVar { name: "PIP_CACHE_DIR", what: "pip cache", default: Some(PathBuf::from(r"C:\Users\me\AppData\Local\pip\cache")), sub: r"pip\cache" },
+            CacheVar { name: "npm_config_cache", what: "npm cache", default: Some(PathBuf::from(r"C:\Users\me\AppData\Local\npm-cache")), sub: "npm-cache" },
+            CacheVar { name: "NUGET_PACKAGES", what: "NuGet packages", default: None, sub: r"NuGet\packages" },
+        ];
+        assert!(old_location_known("PIP_CACHE_DIR", r"C:\Users\me\AppData\Local\pip\cache", &vars));
+        // After normalisation: case, slashes, a trailing separator.
+        assert!(old_location_known("pip_cache_dir", r"c:/users/ME/appdata/local/pip/cache\", &vars));
+        assert!(old_location_known("PIP_CACHE_DIR", r"\\?\C:\Users\me\AppData\Local\pip\cache", &vars));
+        // Another folder, a folder inside or above the default, another variable's default.
+        assert!(!old_location_known("PIP_CACHE_DIR", r"C:\Users\me\Documents", &vars));
+        assert!(!old_location_known("PIP_CACHE_DIR", r"C:\Users\me\AppData\Local\pip", &vars));
+        assert!(!old_location_known("PIP_CACHE_DIR", r"C:\Users\me\AppData\Local\pip\cache\wheels", &vars));
+        assert!(!old_location_known("PIP_CACHE_DIR", r"C:\Users\me\AppData\Local\npm-cache", &vars));
+        // No default known, an unknown variable, nothing at all.
+        assert!(!old_location_known("NUGET_PACKAGES", r"C:\Users\me\.nuget\packages", &vars));
+        assert!(!old_location_known("CARGO_HOME", r"C:\Users\me\.cargo", &vars));
+        assert!(!old_location_known("PIP_CACHE_DIR", "", &vars));
+        // The real defaults relocation uses are the ones checked.
+        let real = cache_vars();
+        for v in &real {
+            if let Some(d) = &v.default {
+                assert!(old_location_known(v.name, &d.display().to_string(), &real), "{}", v.name);
+            }
+        }
     }
 
     #[test]
