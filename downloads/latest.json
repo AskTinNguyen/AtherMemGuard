@@ -1,9 +1,9 @@
 {
     "windows":  {
-                    "version":  "0.2.3",
-                    "url":  "https://github.com/AskTinNguyen/AtherMemGuard/releases/download/v0.2.3/AtherMemGuard-Setup-0.2.3.exe",
-                    "sha256":  "ceb9884c8adf0ca3e227e11bea3f19785b65de77baa2146961657c9ce2870b32",
-                    "size":  7363584,
-                    "notes":  "Disk space and Dev Drive alerts, a disk checkup that counts shared space once, and actions on each RAM row in the flyout."
+                    "version":  "0.2.4",
+                    "url":  "https://github.com/AskTinNguyen/AtherMemGuard/releases/download/v0.2.4/AtherMemGuard-Setup-0.2.4.exe",
+                    "sha256":  "c3b8c9ccc849c4532098558ccf0df55a22f7ce8c18b6d0cf1b4478f4dd65adec",
+                    "size":  8367104,
+                    "notes":  "Clean what the disk checkup found, with undo and measured results; move caches off C:; agents can clean regenerable build output."
                 }
 }
