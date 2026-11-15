@@ -1,26 +1,26 @@
-# Ather MemGuard 0.2.3 (Windows)
+# Ather MemGuard 0.2.4 (Windows)
 
-**Get it:** if you have 0.2.x, it updates itself within a day (or right away from the tray menu: **Check for updates**). New to it? Download `AtherMemGuard-Setup-0.2.3.exe` below and run it. It installs for you only, in a few seconds, with no admin rights, and starts in the tray.
+**Get it:** if you have 0.2.x, it updates itself within a day (or right away from the tray menu: **Check for updates**). New to it? Download `AtherMemGuard-Setup-0.2.4.exe` below and run it. It installs for you only, in a few seconds, with no admin rights, and starts in the tray.
 - **SmartScreen:** the exe isn't code-signed yet, so SmartScreen asks once: **More info › Run anyway**.
-- **Portable:** `AtherMemGuard-0.2.3-portable.zip` runs from any folder without installing.
+- **Portable:** `AtherMemGuard-0.2.4-portable.zip` runs from any folder without installing.
 
 ## What's new
 
-### Disk space and your Dev Drive
-- **Watches free space** on your Dev Drive, the system drive and every drive that holds a project, the Unreal cache (DDC, Zen) or TEMP, once a minute. The flyout shows one line, "D: Dev Drive · 446 GB free", in amber or red when a drive gets low, and counts any other low drive.
-- **A toast when a drive gets low**, one per drive and once per change: "Your Dev Drive is almost full. D: has 38 GB free, and a cook usually needs 100 GB." When C: is low it also says why it matters for memory: Windows may not be able to grow the page file.
-- **Dev Drive health** in the checkup and `memguard disk`: whether the drive is trusted, whether Defender's performance mode is on, and whether your Unreal and toolchain caches sit on C:. Fixes that need an administrator are shown as the exact command to run; MemGuard changes none of these itself.
-- **Disk checkup:** `memguard disk checkup --path D:\lanes\my-lane` tells you what a project, lane or cache holds and how much deleting it would free. On a Dev Drive many files share space through block cloning, so a 659 GB lane can free 91 GB: MemGuard counts shared and hard-linked data once and says how sure each number is. It only reports; it never deletes or moves anything.
-- **Builds and cooks wait for disk space too:** `memguard wait --for cook` also checks free space on the project's drive (100 GB for a cook, 50 for a build, 20 for the editor by default; change it with `disk_gb` under `[prime]`). Disk space doesn't free itself, so a shortfall answers at once instead of waiting.
-- **For agents:** `memguard_disk`, `memguard_disk_checkup` and `memguard_disk_plan` are new read-only MCP tools, and `memguard_wait` and `memguard_status` include disk. See `docs/AI-AGENTS.md`.
-- **Good to know:** on a Dev Drive, space from deleted files can take a long time to show up as free, and can come back in bulk later. "Frees" numbers are predictions, and MemGuard labels them that way.
+### Free disk space, with undo
+- **Clean what the disk checkup found:** `memguard disk clean <id>` (or the checkup rows in the Doctor window). Regenerable build output and caches (Unreal Intermediate and DDC, crash and shader-debug files, npm, pip, uv, NuGet and GPU shader caches) are deleted after you say yes; anything you might want back goes to Ather MemGuard's bin on the same drive instead, so it costs no copy and no time.
+- **Undo:** `memguard disk undo` puts back what the last cleanup moved to the bin. `memguard disk bin` shows what's in it and `--empty` empties it for good.
+- **What it frees, measured:** after a cleanup MemGuard watches the drive's free space for up to 30 minutes and tells you how much it actually rose, next to the prediction. On a Dev Drive the space can take a while to come back.
+- **Safe by default:** it never touches a folder in `[disk] keep`, a folder git tracks files in, a project an editor, build or cook is using, or anything that changed since the checkup. Links are never followed, and what's shown is exactly what goes.
 
-### Act on what holds your RAM
-- **Click a row in the flyout** for what can be done about it: end leftover Unreal helpers, free one app group now, close an app or hold it back with a group (with Undo), or empty Windows' caches. Results come back as toasts.
-- **Which drivers use it?** `memguard drivers` and a new report page break "Windows and drivers" into kernel pools, driver code and Windows processes, with the drivers that likely own the biggest pool tags. No admin rights needed.
+### Move caches off C:
+- `memguard disk relocate` shows where your Unreal DDC, NuGet, npm, pip and vcpkg caches live and how much they hold, and suggests a drive with room. `--apply` points their future writes there with user environment variables (no admin), and `--undo` points them back. Nothing is copied: the old folders stay until you clean them. Restart terminals and the editor afterwards.
+
+### For agents
+- **`memguard_disk_clean`** deletes regenerable items from a plan the same MCP server just made with `memguard_disk_plan`, and nothing else. Moving to the bin, relocating and anything to review stay with the person. `memguard_disk` lists recent cleanups with their measured results. See `docs/AI-AGENTS.md`.
 
 ### Fixes
-- The flyout's advice line wraps to four lines instead of being cut off.
+- A folder too large to count in time (a 113 GB DDC) shows as "at least" instead of a much smaller number.
+- Low-disk toasts for different drives no longer replace each other.
 
 ## Checksums
 
