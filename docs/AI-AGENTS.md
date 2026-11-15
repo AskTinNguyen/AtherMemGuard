@@ -516,11 +516,15 @@ What it refuses, item by item (the whole item, never half of it):
 
 `result` is `done`, `partial` (some files were in use: the message says how many are still there),
 `refused` (the message says which rule) or `failed`. The **measured** result comes later: Ather MemGuard
-reads the drive's free space for up to 30 minutes and records what came back. Read it from
-`memguard_disk`'s `recent_cleanups` (`state`: `watching`, then `measured`, with `measured_freed_gb`,
+reads the drive's free space for up to 30 minutes and records how much it rose. Read it from
+`memguard_disk`'s `recent_cleanups` (`state`: `watching`, then `measured` or `couldnt_measure`, with
+`measured_free_space_rise_gb`, `measured_watched_sec`, `measured_meaning`, `words`,
 `settled`, `other_activity`, `appeared_after_sec`). Report it as measured only then; while it says
 `watching`, say the space hasn't been measured yet. `other_activity: true` means other programs moved the
-free space too: say "about".
+free space too: say "about". The measured number is an observation of the drive, not proof of what the
+cleanup freed: say "free space on D: rose by X GB in the N minutes after the cleanup (measured)", never
+"the cleanup freed X GB". `couldnt_measure` means the free space couldn't be read: say it wasn't measured,
+never 0. After a partial delete, the prediction covers only what was removed and is an `estimate`.
 
 
 ### Quoting disk numbers

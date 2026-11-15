@@ -504,6 +504,13 @@ proposal section 4 E/F with the product owner's decisions, which override it whe
   watcher (`--wait` watches in-process instead); the tray restarts one whose process is gone, shows
   each result once as a toast, and the watcher writes the log line. `memguard_disk` and
   `memguard disk` list the last five (`recent_cleanups`). No disk history CSV or chart (out of scope).
+  The words state only the observation, never a cause: "Free space on D: rose by X GB in the N minutes
+  after the cleanup (measured; other activity on the drive can add to or hide this)", since a late bulk
+  ReFS return of earlier deletes looks the same; a rise far past the prediction says it "can't be told
+  apart". A free-space read that fails is "couldn't measure" (`unreadable`, `state: couldnt_measure`),
+  never 0. The JSON says `free_space_rise` / `measured_free_space_rise_gb`, not "freed". After a partial
+  delete (or a tool clean that left files), the prediction is scaled to the bytes actually removed and
+  marked `estimate`, so the watch never waits for space that was never deleted.
 - **The tray never walks or deletes:** the checkup window's drive rows come from the cached checkup,
   and CLEAN UP on them runs `memguard disk clean --yes --json --checkup <id> --expect dN=<fingerprint>
   --fix ...` in a hidden child. Ids like `d3` are positions in a replaceable cache, so every clean

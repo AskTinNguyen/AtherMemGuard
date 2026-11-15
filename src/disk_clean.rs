@@ -14,7 +14,8 @@
 //! Every safety rule is a pure function over `ItemCheck` and `PathFacts` (unit-tested one by
 //! one) and is checked again at apply time against facts read at that moment. After acting,
 //! the prediction is reported at once, labelled predicted; a watcher then reads the volume's
-//! free space for up to 30 minutes and reports what actually came back, labelled measured
+//! free space for up to 30 minutes and reports how much it rose, labelled measured and never
+//! claimed as caused by the cleanup
 //! (`Measure`, also pure). Undo is `disk-undo.json`, the same shape as `doctor-undo.json`.
 //!
 //! No `unsafe` here: deletes and moves use `std::fs`, which never follows a junction when it
@@ -1443,14 +1444,12 @@ pub fn empty_bins(files: &DiskFiles, runs: &[BinRun], presample_secs: u32, start
     let mut roots: Vec<String> = runs.iter().map(|r| r.volume_root.clone()).collect();
     roots.sort();
     roots.dedup();
-    let before: Vec<(String, u64, u64)> = roots.iter().map(|r| {
-        let (f, m) = presample(r, presample_secs.max(1));
-        (r.clone(), f, m)
-    }).collect();
+    let before: Vec<(String, Option<(u64, u64)>)> = roots.iter().map(|r| (r.clone(), presample(r, presample_secs.max(1)))).collect();
     let done = empty_runs(files, runs);
     let run = run_id();
     let mut watches = Vec::new();
-    for (root, free_before, motion) in before {
+    for (root, read) in before {
+        let (free_before, motion) = read.unwrap_or((0, 0));
         let mine: Vec<&(BinRun, DeleteReport)> = done.iter().filter(|(r, _)| r.volume_root.eq_ignore_ascii_case(&root)).collect();
         let predicted: u64 = mine.iter().map(|(r, _)| r.frees_alone).sum();
         if predicted == 0 {
@@ -1472,7 +1471,7 @@ pub fn empty_bins(files: &DiskFiles, runs: &[BinRun], presample_secs: u32, start
             predicted_confidence: "lower_bound".into(),
             titles: vec![format!("Ather MemGuard's bin on {}", root.trim_end_matches('\\'))],
             watcher_pid: 0,
-            measured: None,
+            measured: unmeasurable_watch(&read),
             toasted: false,
         };
         let mut all = files.watches();
@@ -1499,11 +1498,19 @@ pub fn recent_cleanups(files: &DiskFiles, n: usize) -> Vec<Value> {
             json!({
                 "run_id": w.run_id, "time": w.time, "volume": w.volume_root.trim_end_matches('\\'), "items": w.titles,
                 "predicted_freed_gb": gb2(w.predicted), "predicted_confidence": w.predicted_confidence,
-                "measured_freed_gb": w.measured.as_ref().map(|m| (m.measured_freed as f64 / (1u64 << 30) as f64 * 100.0).round() / 100.0),
-                "measured": w.measured.is_some(), "settled": w.measured.as_ref().map(|m| m.settled),
+                "measured_free_space_rise_gb": w.measured.as_ref().filter(|m| !m.unreadable).map(|m| (m.measured_freed as f64 / (1u64 << 30) as f64 * 100.0).round() / 100.0),
+                "measured_watched_sec": w.measured.as_ref().filter(|m| !m.unreadable).map(|m| m.watched_sec),
+                "measured_meaning": MEASURED_MEANING,
+                "measured": w.measured.as_ref().is_some_and(|m| !m.unreadable), "settled": w.measured.as_ref().map(|m| m.settled),
                 "other_activity": w.measured.as_ref().map(|m| m.other_activity),
                 "appeared_after_sec": w.measured.as_ref().and_then(|m| m.appeared_after_sec),
-                "state": if w.measured.is_some() { "measured" } else if unix_now().saturating_sub(w.started_unix) > WATCH_MAX_SEC + 120 { "not_watched" } else { "watching" },
+                "words": w.measured.as_ref().map(|m| measured_words(w.volume_root.trim_end_matches('\\'), w.predicted, m, w.fs.eq_ignore_ascii_case("ReFS")).1),
+                "state": match &w.measured {
+                    Some(m) if m.unreadable => "couldnt_measure",
+                    Some(_) => "measured",
+                    None if unix_now().saturating_sub(w.started_unix) > WATCH_MAX_SEC + 120 => "not_watched",
+                    None => "watching",
+                },
             })
         })
         .collect()
@@ -1600,8 +1607,15 @@ pub fn run_cli_json(args: &[&str], timeout: Duration) -> Result<Value, String> {
 /// What came back after acting, as read from the volume's free space.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Measured {
-    /// Free space now minus free space just before acting (bytes; can be negative).
+    /// Free space now minus free space just before acting (bytes; can be negative). This is an
+    /// observation of the drive, not proof of what this cleanup freed: other activity on the
+    /// drive (or a late ReFS return of earlier deletes) can add to it or hide it.
+    #[serde(rename = "free_space_rise", alias = "measured_freed")]
     pub measured_freed: i64,
+    /// The free space could not be read (before acting, or at any point after): nothing was
+    /// measured, and no number is reported.
+    #[serde(default)]
+    pub unreadable: bool,
     /// The free space stopped moving after reaching the prediction.
     pub settled: bool,
     /// Free space was moving for other reasons too (before acting, or the wrong way after).
@@ -1655,6 +1669,12 @@ impl Measure {
         (self.appeared.is_some() && quiet) || (self.predicted == 0 && quiet && sec >= 30)
     }
 
+    /// A moment with no reading (the free space couldn't be read). True when the watch can stop.
+    pub fn skip(&mut self, sec: u64) -> bool {
+        self.sec = sec;
+        sec >= WATCH_MAX_SEC
+    }
+
     fn agree(&self) -> bool {
         self.last.len() == 3 && {
             let lo = self.last.iter().map(|x| x.1).min().unwrap_or(0);
@@ -1669,6 +1689,7 @@ impl Measure {
         let overshoot = d > p + (p / 10).max(256 << 20);
         Measured {
             measured_freed: d,
+            unreadable: self.last.is_empty(),
             settled: self.agree() && (self.appeared.is_some() || self.predicted == 0),
             other_activity: self.pre_motion as i64 > NOISE || self.low < -NOISE || self.drop_after_rise || overshoot,
             appeared_after_sec: self.appeared,
@@ -1683,35 +1704,54 @@ impl Measure {
     }
 }
 
-/// The toast and log words for a measured result: (title, body).
+/// What `measured_free_space_rise_gb` means, for agents.
+pub const MEASURED_MEANING: &str = "How much the drive's free space rose in the minutes Ather MemGuard watched after the cleanup. It is an observation, \
+not proof of what the cleanup freed: other activity on the drive can add to or hide it. Quote it as \"free space rose by X GB (measured)\", never as \"freed\".";
+
+/// "the minute", "the 4 minutes": how long the watch ran, for the measured words.
+fn minutes_words(sec: u64) -> String {
+    let mins = sec.div_ceil(60).max(1);
+    if mins == 1 {
+        "the minute".into()
+    } else {
+        format!("the {} minutes", mins)
+    }
+}
+
+/// The toast and log words for a measured result: (title, body). They state only what was
+/// observed (free space rose on the drive), never that this cleanup caused it: other activity
+/// on the drive, or ReFS returning earlier deletes late and in bulk, can add to it or hide it.
 pub fn measured_words(volume: &str, predicted: u64, m: &Measured, refs: bool) -> (String, String) {
-    let got = gb2(m.measured_freed.max(0) as u64);
     let pred = gb2(predicted);
+    if m.unreadable {
+        return (
+            format!("Couldn't measure the free space on {}", volume),
+            format!("Ather MemGuard couldn't read the free space on {} around the cleanup, so nothing was measured. Predicted {:.1} GB.", volume, pred),
+        );
+    }
+    let got = gb2(m.measured_freed.max(0) as u64);
+    let when = minutes_words(m.watched_sec);
+    let hedge = "(measured; other activity on the drive can add to or hide this)";
     let busy = format!(" Other programs were writing to {} at the same time, so the number isn't exact.", volume);
-    // Far more than predicted came back: something else freed space too (on ReFS, possibly an
-    // earlier delete arriving in bulk). Say so instead of claiming the number for this cleanup.
+    // Far more than predicted: something else freed space too (on ReFS, possibly an earlier
+    // delete arriving in bulk). Say so instead of claiming the number for this cleanup.
     if m.measured_freed > 0 && m.measured_freed as u64 > predicted.saturating_mul(2) + (1u64 << 30) {
         return (
             format!("Free space jumped on {}", volume),
             format!(
-                "Free space on {} rose by {:.1} GB (measured), far more than this cleanup's predicted {:.1} GB, so something else freed space at the same time. How much of the {:.1} GB came back can't be told apart.",
-                volume, got, pred, pred
+                "Free space on {} rose by {:.1} GB in {} after the cleanup (measured), far more than this cleanup's predicted {:.1} GB, so something else freed space at the same time. How much of the {:.1} GB came back can't be told apart.",
+                volume, got, when, pred, pred
             ),
         );
     }
+    let rose = if m.measured_freed > 0 { format!("rose by {:.1} GB", got) } else { "didn't rise".to_string() };
+    let mut body = format!("Free space on {} {} in {} after the cleanup {}. Predicted {:.1} GB.", volume, rose, when, hedge, pred);
+    if m.other_activity {
+        body.push_str(&busy);
+    }
     if m.appeared_after_sec.is_some() {
-        let mut body = if m.other_activity { format!("About {:.1} GB came back on {} (measured).", got, volume) } else { format!("Freed {:.1} GB on {} (measured).", got, volume) };
-        body.push_str(&format!(" Predicted {:.1} GB.", pred));
-        if m.other_activity {
-            body.push_str(&busy);
-        }
-        (format!("Space is back on {}", volume), body)
+        (format!("Free space rose on {}", volume), body)
     } else {
-        let mins = (m.watched_sec + 30) / 60;
-        let mut body = format!("After {} minute{}, about {:.1} GB has come back on {} (measured). Predicted {:.1} GB.", mins, if mins == 1 { "" } else { "s" }, got, volume, pred);
-        if m.other_activity {
-            body.push_str(&busy);
-        }
         if refs {
             body.push_str(" This drive can return deleted space much later; memguard disk shows the free space now.");
         }
@@ -1760,11 +1800,14 @@ pub fn watch(files: &DiskFiles, id: &str, say: &mut dyn FnMut(&str)) -> Option<M
     let mut m = Measure::new(rec.free_before, rec.predicted, rec.pre_motion);
     loop {
         let sec = unix_now().saturating_sub(rec.started_unix);
-        let avail = disk_win::free_space(&rec.volume_root).map(|x| x.0).unwrap_or(rec.free_before);
-        let done = m.push(sec.min(WATCH_MAX_SEC), avail);
+        // A failed read is no reading (never "no change"); with none at all it is "couldn't measure".
+        let done = match disk_win::free_space(&rec.volume_root) {
+            Some(x) => m.push(sec.min(WATCH_MAX_SEC), x.0),
+            None => m.skip(sec.min(WATCH_MAX_SEC)),
+        };
         let r = m.result();
         if r.appeared_after_sec == Some(sec) {
-            say(&format!("{}: {:.1} GB has come back after {} s", rec.volume_root, gb2(r.measured_freed.max(0) as u64), sec));
+            say(&format!("{}: free space has risen by {:.1} GB after {} s (measured)", rec.volume_root, gb2(r.measured_freed.max(0) as u64), sec));
         }
         if done {
             break;
@@ -1820,8 +1863,9 @@ pub fn spawn_watcher(id: &str) -> Option<u32> {
         .map(|c| c.id())
 }
 
-/// Free space on `root` read `n` times a second apart: (last reading, max - min).
-pub fn presample(root: &str, n: u32) -> (u64, u64) {
+/// Free space on `root` read `n` times a second apart: (last reading, max - min). `None` when
+/// a reading failed: the cleanup then reports "couldn't measure", never a number from a 0.
+pub fn presample(root: &str, n: u32) -> Option<(u64, u64)> {
     let mut lo = u64::MAX;
     let mut hi = 0;
     let mut last = 0;
@@ -1829,11 +1873,16 @@ pub fn presample(root: &str, n: u32) -> (u64, u64) {
         if k > 0 {
             std::thread::sleep(Duration::from_secs(1));
         }
-        last = disk_win::free_space(root).map(|x| x.0).unwrap_or(0);
+        last = disk_win::free_space(root)?.0;
         lo = lo.min(last);
         hi = hi.max(last);
     }
-    (last, hi.saturating_sub(lo))
+    Some((last, hi.saturating_sub(lo)))
+}
+
+/// The measured result of a watch whose starting free space couldn't be read.
+fn unmeasurable_watch(read: &Option<(u64, u64)>) -> Option<Measured> {
+    read.is_none().then(|| Measured { unreadable: true, ..Default::default() })
 }
 
 // ---------------------------------------------------------------- acting on a plan
@@ -1899,7 +1948,7 @@ impl CleanResult {
                 "predicted_freed_gb": gb2(v.predicted_freed), "frees_confidence": v.confidence, "basis": "predicted",
                 "free_before_gb": gb2(v.free_before), "measured": if v.watch_id.is_some() { json!("later") } else { Value::Null },
             })).collect::<Vec<_>>(),
-            "measured_note": "The space is predicted, not yet measured. Ather MemGuard watches the drive for up to 30 minutes and reports what actually came back \
+            "measured_note": "The space is predicted, not yet measured. Ather MemGuard watches the drive for up to 30 minutes and reports how much its free space rose \
 (a notification, the log, and memguard_disk's recent_cleanups). On ReFS, deleted space can take a long time to show up.",
             "bin_note": if self.outcomes.iter().any(|o| o.action == CleanAction::Bin && o.result == "done") {
                 json!("Moving to the bin frees nothing until the bin is emptied (after 24 hours, or memguard disk bin --empty). Undo with memguard disk undo.")
@@ -2037,15 +2086,14 @@ pub fn clean(cfg: &crate::config::Config, files: &DiskFiles, plan: &PlanRecord, 
     }
 
     // Free space just before acting, on every volume that should get space back.
-    let mut before: Vec<(String, u64, u64)> = Vec::new();
+    let mut before: Vec<(String, Option<(u64, u64)>)> = Vec::new();
     for (_, item, action) in &ready {
         if *action == CleanAction::Bin {
             continue;
         }
         if let Some(root) = &item.volume_root {
-            if !before.iter().any(|(r, _, _)| r.eq_ignore_ascii_case(root)) {
-                let (free, motion) = presample(root, opts.presample_secs.max(1));
-                before.push((root.clone(), free, motion));
+            if !before.iter().any(|(r, _)| r.eq_ignore_ascii_case(root)) {
+                before.push((root.clone(), presample(root, opts.presample_secs.max(1))));
             }
         }
     }
@@ -2072,7 +2120,16 @@ pub fn clean(cfg: &crate::config::Config, files: &DiskFiles, plan: &PlanRecord, 
                 }
                 o.result = if total.remains { if total.files > 0 || total.dirs > 0 { "partial" } else { "failed" } } else { "done" }.into();
                 o.message = if total.remains { total.words() } else { format!("Deleted for good. {}.", total.words()) };
-                o.predicted_now = if o.result == "failed" { 0 } else { item.frees_alone.unwrap_or(0) };
+                // A partial delete frees only part of the prediction: scale it to what went (an
+                // estimate), so the watch never waits for space that was never deleted.
+                o.predicted_now = if o.result == "failed" {
+                    0
+                } else if total.remains {
+                    let left: u64 = item.paths.iter().map(|p| dir_size(Path::new(p))).sum();
+                    scaled_prediction(item.frees_alone, total.bytes, left)
+                } else {
+                    item.frees_alone.unwrap_or(0)
+                };
                 o.deleted = Some(total);
                 entries.push(UndoEntry { id: entry_id, finding_id: item.id.clone(), title: item.title.clone(), action: *action, step: UndoStep::Nothing, undone: false });
             }
@@ -2157,7 +2214,8 @@ pub fn clean(cfg: &crate::config::Config, files: &DiskFiles, plan: &PlanRecord, 
     // The prediction per volume: the plan's set total when exactly that set went, else the
     // sum of the items' own numbers, which can only be lower (an "at least").
     let mut volumes: Vec<VolumePrediction> = Vec::new();
-    for (root, free_before, motion) in &before {
+    for (root, read) in &before {
+        let (free_before, motion) = &read.unwrap_or((0, 0));
         let done: Vec<&(usize, PlannedItem, CleanAction)> = ready
             .iter()
             .filter(|(k, it, a)| {
@@ -2169,7 +2227,7 @@ pub fn clean(cfg: &crate::config::Config, files: &DiskFiles, plan: &PlanRecord, 
         }
         let ids: Vec<String> = done.iter().map(|(_, it, _)| it.id.clone()).collect();
         let partial = done.iter().any(|(k, _, _)| outcomes[*k].result != "done");
-        let pv = plan.volumes.iter().find(|v| v.root.eq_ignore_ascii_case(root));
+        let pv = plan.volumes.iter().find(|v| v.root.eq_ignore_ascii_case(root)).filter(|_| !partial);
         let same_set = pv.is_some_and(|v| {
             let mut a: Vec<String> = v.item_ids.iter().map(|x| x.to_ascii_lowercase()).collect();
             let mut b: Vec<String> = ids.iter().map(|x| x.to_ascii_lowercase()).collect();
@@ -2180,7 +2238,8 @@ pub fn clean(cfg: &crate::config::Config, files: &DiskFiles, plan: &PlanRecord, 
         let (bytes, mut conf) = match pv.filter(|_| same_set).and_then(|v| v.frees_together.map(|t| (t, v.confidence.clone()))) {
             Some(x) => x,
             None => {
-                let sum: u64 = done.iter().map(|(_, it, _)| it.frees_alone.unwrap_or(0)).sum();
+                // Each item's number as acted on: its own prediction, scaled down after a partial delete.
+                let sum: u64 = done.iter().map(|(k, _, _)| outcomes[*k].predicted_now).sum();
                 let weakest = if done.iter().any(|(_, it, _)| it.frees_alone.is_none() || it.confidence == "unknown" || it.confidence == "upper_bound") {
                     "unknown"
                 } else if done.iter().any(|(_, it, _)| it.confidence == "estimate") {
@@ -2215,7 +2274,7 @@ pub fn clean(cfg: &crate::config::Config, files: &DiskFiles, plan: &PlanRecord, 
                 predicted_confidence: conf,
                 titles: done.iter().map(|(_, it, _)| it.title.clone()).collect(),
                 watcher_pid: 0,
-                measured: None,
+                measured: unmeasurable_watch(read),
                 toasted: false,
             };
             let mut all = files.watches();
@@ -2239,6 +2298,17 @@ pub fn clean(cfg: &crate::config::Config, files: &DiskFiles, plan: &PlanRecord, 
         volumes.push(vp);
     }
     CleanResult { run_id: run, plan_id: plan.id.clone(), dry_run: false, outcomes, volumes }
+}
+
+/// The prediction for an item after only part of it went: its own number scaled by the share of
+/// its bytes that was removed (`removed` of `removed + left`). An estimate, never the whole.
+pub fn scaled_prediction(frees_alone: Option<u64>, removed: u64, left: u64) -> u64 {
+    let Some(f) = frees_alone else { return 0 };
+    let all = removed as u128 + left as u128;
+    if all == 0 {
+        return 0;
+    }
+    ((f as u128 * removed as u128) / all).min(f as u128) as u64
 }
 
 /// "16.4 GB", "at least 16.4 GB", "about 16.4 GB", or "an unknown amount".
@@ -2280,7 +2350,7 @@ pub fn render_clean(r: &CleanResult) -> String {
         ));
     }
     if r.volumes.iter().any(|v| v.watch_id.is_some()) {
-        s.push_str("Ather MemGuard watches the free space for up to 30 minutes and reports what actually came back (measured) in a notification and the log.\n");
+        s.push_str("Ather MemGuard watches the free space for up to 30 minutes and reports how much it rose (measured; other activity on the drive can add to or hide this) in a notification and the log.\n");
     }
     if r.outcomes.iter().any(|o| o.action == CleanAction::Bin && o.result == "done") {
         s.push_str("Moving to the bin frees nothing until the bin is emptied (after 24 hours, or memguard disk bin --empty). Undo with memguard disk undo.\n");
@@ -2790,6 +2860,92 @@ mod tests {
         assert!(plan_for_agent(&plans, "p1", &["d1".into(), "d3".into()], 1000).unwrap_err().contains("d3 is not in plan"));
     }
 
+    pub(crate) const REAL_UPROJECT: &[u8] = br#"{ "FileVersion": 3, "EngineAssociation": "5.4", "Category": "", "Modules": [] }"#;
+
+    /// Set every file and folder under `root` to `secs` ago.
+    pub(crate) fn age_tree(root: &Path, secs: u64) {
+        use std::os::windows::fs::OpenOptionsExt;
+        let when = std::time::SystemTime::now() - Duration::from_secs(secs);
+        fn walk(p: &Path, when: std::time::SystemTime) {
+            if let Ok(rd) = std::fs::read_dir(p) {
+                for e in rd.flatten() {
+                    walk(&e.path(), when);
+                }
+            }
+            if let Ok(f) = std::fs::OpenOptions::new().access_mode(0x100).custom_flags(0x0200_0000).open(p) {
+                let _ = f.set_modified(when);
+            }
+        }
+        walk(root, when);
+    }
+
+    /// A plan for one item of a tree a test made, measured now (file ids, newest write).
+    pub(crate) fn plan_one(key: &str, title: &str, paths: &[PathBuf], frees: u64) -> PlanRecord {
+        let ps: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+        let (root, guid) = disk_win::volume_of(&ps[0]).unwrap();
+        let (class, tool) = catalog_class(key).unwrap();
+        let item = PlannedItem {
+            id: "d1".into(),
+            key: key.into(),
+            class,
+            title: title.into(),
+            path_ids: ps.iter().map(|p| disk_win::identity(p).map(|x| x.1)).collect(),
+            last_write: newest_write(&ps, Duration::from_secs(30)).unwrap(),
+            paths: ps,
+            volume: Some(guid.clone()),
+            volume_root: Some(root.clone()),
+            frees_alone: Some(frees),
+            confidence: "exact".into(),
+            tool,
+            unmeasurable: None,
+        };
+        PlanRecord { id: "ptest".into(), unix: unix_now(), time: String::new(), items: vec![item], volumes: vec![PlannedVolume { volume: guid, root, fs: String::new(), item_ids: vec!["d1".into()], frees_together: Some(frees), confidence: "exact".into() }] }
+    }
+
+    pub(crate) fn test_opts() -> CleanOpts {
+        CleanOpts { presample_secs: 1, start_watcher: false, busy: Some((vec![], false)), skip_git: true, ..Default::default() }
+    }
+
+    /// Found in review: a locked 2 MB file stayed, 1 KB was removed, and the watch still
+    /// waited for the whole 2,007,040 bytes (and would have blamed the drive for them).
+    #[test]
+    fn a_partial_delete_predicts_only_what_went() {
+        let root = std::env::temp_dir().join(format!("amg-clean-partial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let game = root.join("Game");
+        let item = game.join("Intermediate");
+        std::fs::create_dir_all(&item).unwrap();
+        std::fs::write(game.join("Game.uproject"), REAL_UPROJECT).unwrap();
+        std::fs::write(item.join("held.bin"), vec![7u8; 2_000_000]).unwrap();
+        std::fs::write(item.join("small.bin"), vec![1u8; 1024]).unwrap();
+        age_tree(&root, 3 * 3600);
+        let plan = plan_one("ue:intermediate", "Build files", std::slice::from_ref(&item), 2_007_040);
+        let held = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new().read(true).share_mode(1).open(item.join("held.bin")).unwrap()
+        };
+        let files = DiskFiles::in_dir(root.join("data"));
+        let r = clean(&crate::config::Config::builtin(), &files, &plan, &[("d1".into(), Some(CleanAction::Now))], &test_opts());
+        drop(held);
+        let o = &r.outcomes[0];
+        assert_eq!(o.result, "partial", "{:?}", o);
+        let want = scaled_prediction(Some(2_007_040), 1024, 2_000_000);
+        assert!(want > 0 && want < 4096, "{}", want);
+        assert_eq!(o.predicted_now, want);
+        assert_eq!(r.volumes.len(), 1);
+        assert_eq!(r.volumes[0].predicted_freed, want, "not the plan's 2,007,040");
+        assert_eq!(r.volumes[0].confidence, "estimate");
+        let w = files.watches();
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].predicted, want);
+        assert_eq!(w[0].predicted_confidence, "estimate");
+        assert!(item.join("held.bin").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(scaled_prediction(None, 5, 5), 0);
+        assert_eq!(scaled_prediction(Some(100), 0, 0), 0);
+        assert_eq!(scaled_prediction(Some(100), 50, 50), 50);
+    }
+
     pub(crate) fn snapshot(id: &str, items: &[(&str, &str, u128)]) -> crate::disk_scan::CachedCheckup {
         crate::disk_scan::CachedCheckup {
             id: id.into(),
@@ -2867,8 +3023,8 @@ mod tests {
         assert!(r.settled && !r.other_activity);
         assert_eq!(r.appeared_after_sec, Some(1));
         let (t, b) = measured_words("C:", 16 * G, &r, false);
-        assert_eq!(t, "Space is back on C:");
-        assert_eq!(b, "Freed 16.0 GB on C: (measured). Predicted 16.0 GB.");
+        assert_eq!(t, "Free space rose on C:");
+        assert_eq!(b, "Free space on C: rose by 16.0 GB in the minute after the cleanup (measured; other activity on the drive can add to or hide this). Predicted 16.0 GB.");
     }
 
     #[test]
@@ -2898,7 +3054,7 @@ mod tests {
         assert!(!r.settled && r.appeared_after_sec.is_none());
         let (t, b) = measured_words("D:", 16 * G, &r, true);
         assert_eq!(t, "Space hasn't come back yet on D:");
-        assert!(b.starts_with("After 30 minutes, about 0.2 GB has come back on D: (measured). Predicted 16.0 GB."), "{}", b);
+        assert!(b.starts_with("Free space on D: rose by 0.2 GB in the 30 minutes after the cleanup (measured; other activity on the drive can add to or hide this). Predicted 16.0 GB."), "{}", b);
         assert!(b.contains("much later"));
         assert!(m.mismatch());
     }
@@ -2914,7 +3070,7 @@ mod tests {
         let r = m.result();
         assert!(r.other_activity);
         let (_, b) = measured_words("D:", 4 * G, &r, true);
-        assert!(b.starts_with("About 4.0 GB came back on D: (measured).") && b.contains("isn't exact"), "{}", b);
+        assert!(b.starts_with("Free space on D: rose by 4.0 GB in the minute after the cleanup (measured;") && b.contains("isn't exact"), "{}", b);
         // A build wrote 2 GB while we watched: the space went down after coming back.
         let mut m = Measure::new(before, 4 * G, 0);
         m.push(1, before + 4 * G);
@@ -2941,7 +3097,55 @@ mod tests {
         assert!(r.other_activity);
         let (t, b) = measured_words("D:", 2 * G + G / 2, &r, true);
         assert_eq!(t, "Free space jumped on D:");
-        assert!(b.contains("rose by 105.0 GB (measured)") && b.contains("can't be told apart"), "{}", b);
+        assert!(b.contains("rose by 105.0 GB in the 6 minutes after the cleanup (measured)") && b.contains("can't be told apart"), "{}", b);
+    }
+
+    /// The measured words state the observation only: a late bulk ReFS return of earlier deletes
+    /// rises near the prediction too, so "Freed X GB" would claim a cause nobody measured.
+    #[test]
+    fn measured_words_state_only_what_was_observed() {
+        let m = |d: i64, watched: u64, appeared: bool| Measured { measured_freed: d, watched_sec: watched, appeared_after_sec: appeared.then_some(watched), settled: appeared, ..Default::default() };
+        for (meas, pred) in [(m(4 * G as i64, 200, true), 4 * G), (m(G as i64 / 5, WATCH_MAX_SEC, false), 4 * G)] {
+            let (t, b) = measured_words("D:", pred, &meas, true);
+            assert!(!t.contains("Freed") && !b.contains("Freed") && !b.contains("freed"), "{} / {}", t, b);
+            assert!(b.contains("(measured; other activity on the drive can add to or hide this)"), "{}", b);
+        }
+        let (_, b) = measured_words("D:", 4 * G, &m(4 * G as i64, 200, true), false);
+        assert!(b.starts_with("Free space on D: rose by 4.0 GB in the 4 minutes after the cleanup"), "{}", b);
+        let (_, b) = measured_words("D:", 4 * G, &m(-(G as i64), WATCH_MAX_SEC, false), false);
+        assert!(b.starts_with("Free space on D: didn't rise in the 30 minutes after the cleanup"), "{}", b);
+        // A large overshoot still says it can't be told apart.
+        let (t, b) = measured_words("D:", G, &m(50 * G as i64, 320, true), true);
+        assert_eq!(t, "Free space jumped on D:");
+        assert!(b.contains("can't be told apart") && b.contains("in the 6 minutes after the cleanup"), "{}", b);
+        // A failed read is "couldn't measure", never 0.
+        let u = Measured { unreadable: true, ..Default::default() };
+        let (t, b) = measured_words("D:", 4 * G, &u, true);
+        assert_eq!(t, "Couldn't measure the free space on D:");
+        assert!(!b.contains("0.0 GB") && b.contains("nothing was measured"), "{}", b);
+        let mut w = Measure::new(100 * G, 4 * G, 0);
+        assert!(!w.skip(5));
+        assert!(w.skip(WATCH_MAX_SEC));
+        assert!(w.result().unreadable, "no reading at all");
+        w.push(WATCH_MAX_SEC, 100 * G);
+        assert!(!w.result().unreadable);
+        // The JSON field says rise, not freed, and an old record still reads.
+        let j = serde_json::to_value(Measured { measured_freed: 5, ..Default::default() }).unwrap();
+        assert_eq!(j["free_space_rise"], 5);
+        assert!(j.get("measured_freed").is_none());
+        let old: Measured = serde_json::from_str(r#"{"measured_freed":7,"settled":true,"other_activity":false,"appeared_after_sec":null,"watched_sec":3}"#).unwrap();
+        assert_eq!(old.measured_freed, 7);
+        // recent_cleanups: couldnt_measure, never a number.
+        let dir = std::env::temp_dir().join(format!("amg-clean-recent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let files = DiskFiles::in_dir(&dir);
+        let rec = WatchRecord { id: "w".into(), run_id: "r".into(), volume: String::new(), volume_root: "D:\\".into(), fs: "ReFS".into(), started_unix: unix_now(), time: String::new(),
+            free_before: 0, pre_motion: 0, predicted: G, predicted_confidence: "exact".into(), titles: vec![], watcher_pid: 0, measured: unmeasurable_watch(&None), toasted: false };
+        files.save_watches(&[rec]).unwrap();
+        let r = recent_cleanups(&files, 5);
+        assert_eq!(r[0]["state"], "couldnt_measure");
+        assert!(r[0]["measured_free_space_rise_gb"].is_null() && r[0].get("measured_freed_gb").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

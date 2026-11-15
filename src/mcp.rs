@@ -52,7 +52,9 @@ To check that a set frees enough, call memguard_disk_plan and use free_after_gb,
 memguard_disk_clean is the only tool that deletes: prefer it only for regenerable build output and caches (Intermediate, \
 DerivedDataCache, crash and shader debug files, tool caches), only on ids from a memguard_disk_plan you made in this session \
 less than 10 minutes before, always passing its plan_id (required), and always tell the person what you deleted (titles and paths) and the predicted frees. Its measured \
-result comes later, in memguard_disk recent_cleanups: report that as measured, never earlier. Moves to the bin, tool \
+result comes later, in memguard_disk recent_cleanups: report it as measured, never earlier, and only as what was \
+observed (\"free space on D: rose by X GB in the N minutes after the cleanup\"), never as freed by it; couldnt_measure \
+is not 0. Moves to the bin, tool \
 cleans, logs, cooked output and the shared caches are the person's call (memguard disk clean --fix); lanes and worktrees \
 are never deleted by Ather MemGuard. Mention dev:* findings from memguard_disk once and never claim to have fixed them.";
 

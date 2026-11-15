@@ -176,8 +176,10 @@ anything twice, and cleans up what you pick, with undo where it can. It needs no
   stops if a build or cook starts.
 - **"Frees" is predicted.** It comes from the drive's reference counts. After a cleanup the prediction is
   shown at once, labelled predicted; then Ather MemGuard watches the drive's free space for up to 30
-  minutes and tells you what actually came back, labelled measured (a notification and a log line, and
-  `memguard disk` lists it). It never says space is free before it shows up. On ReFS (Dev Drives),
+  minutes and tells you how much the free space rose, labelled measured ("Free space on D: rose by X GB
+  in the N minutes after the cleanup (measured; other activity on the drive can add to or hide this)";
+  a notification and a log line, and `memguard disk` lists it). A free-space read that fails is "couldn't
+  measure", never 0. It never says space is free before it shows up. On ReFS (Dev Drives),
   deleted space has been seen to come back much later, and in bulk: **deleting on this drive may take a
   long time to show up as free space.** When other programs write to the drive at the same time, the
   measured number says "about" and that it isn't exact.

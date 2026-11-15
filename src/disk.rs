@@ -702,8 +702,16 @@ pub fn render_text(r: &DiskReport) -> String {
         s.push_str("\nRecent cleanups:\n");
         for c in &r.recent_cleanups {
             let other = c["other_activity"] == true;
-            let measured = match c["measured_freed_gb"].as_f64() {
-                Some(m) => format!("{}{:.1} GB came back (measured){}", if other { "about " } else { "" }, m.max(0.0), if other { ", other writes made it unclear" } else { "" }),
+            let measured = match c["measured_free_space_rise_gb"].as_f64() {
+                Some(m) if m > 0.0 => format!(
+                    "free space rose by {}{:.1} GB in the {} min after it (measured; other activity on the drive can add to or hide this){}",
+                    if other { "about " } else { "" },
+                    m,
+                    c["measured_watched_sec"].as_u64().unwrap_or(0).div_ceil(60).max(1),
+                    if other { ", other writes made it unclear" } else { "" }
+                ),
+                Some(_) => "free space didn't rise while it was watched (measured)".to_string(),
+                None if c["state"] == "couldnt_measure" => "couldn't measure the free space".to_string(),
                 None if c["state"] == "watching" => "being measured".to_string(),
                 None => "not measured".to_string(),
             };

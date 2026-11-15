@@ -876,11 +876,11 @@ pub mod catalog {
         }
     }
 
-    /// After a disk cleanup: what actually came back, from the drive's free space (the words
-    /// come from `disk_clean::measured_words`, labelled measured). Never shown before the space
-    /// shows up or the 30-minute watch ends.
+    /// After a disk cleanup: how far the drive's free space rose while it was watched (the words
+    /// come from `disk_clean::measured_words`, labelled measured, and never claim the cleanup
+    /// caused it). Never shown before the space shows up or the 30-minute watch ends.
     pub fn disk_measured(title: &str, body: &str) -> Toast {
-        let kind = if title.starts_with("Space is back") { ToastKind::Info } else { ToastKind::Warning };
+        let kind = if title.starts_with("Free space rose") { ToastKind::Info } else { ToastKind::Warning };
         toast(kind, title.to_string(), body.to_string())
     }
 
@@ -1082,12 +1082,18 @@ pub mod catalog {
             ("guard-closed", guard_closed("Steam")),
             ("checkup-undone", checkup_undone(&[])),
             ("ram-speed", ram_below_rated(4800, 6000, "EXPO")),
-            ("disk-measured", disk_measured("Space is back on D:", "Freed 16.4 GB on D: (measured). Predicted 16.4 GB.")),
+            (
+                "disk-measured",
+                disk_measured(
+                    "Free space rose on D:",
+                    "Free space on D: rose by 16.4 GB in the 2 minutes after the cleanup (measured; other activity on the drive can add to or hide this). Predicted 16.4 GB.",
+                ),
+            ),
             (
                 "disk-measured-late",
                 disk_measured(
                     "Space hasn't come back yet on D:",
-                    "After 30 minutes, about 0.2 GB has come back on D: (measured). Predicted 16.4 GB. This drive can return deleted space much later; memguard disk shows the free space now.",
+                    "Free space on D: rose by 0.2 GB in the 30 minutes after the cleanup (measured; other activity on the drive can add to or hide this). Predicted 16.4 GB. This drive can return deleted space much later; memguard disk shows the free space now.",
                 ),
             ),
             ("disk-bin-ask", disk_bin_ask("D:", 16.0)),
