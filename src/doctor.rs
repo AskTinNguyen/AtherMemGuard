@@ -596,6 +596,13 @@ pub fn disk_findings(vols: &[crate::disk::Volume], dev: Option<&crate::disk::Dev
     out
 }
 
+/// Is this a THIS PC row from the drive side of the checkup (`disk_findings`: `disk:low:<drive>`
+/// and the Dev Drive health findings `dev:*`)? The checkup window shows these on its Disk
+/// space tab.
+pub fn is_drive_finding(id: &str) -> bool {
+    id.starts_with("disk:low:") || id.starts_with("dev:")
+}
+
 /// Is this a THIS PC row from the RAM and BIOS check?
 pub fn is_ram_finding(id: &str) -> bool {
     id == "sys:ram" || id.starts_with("sys:ram:")

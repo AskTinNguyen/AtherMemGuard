@@ -64,7 +64,7 @@ paused. Its tooltip says the Unreal mode, the pressure and RAM / commit free.
   helpers, empty Windows' caches, or see which drivers hold the "Windows and drivers" memory. Commit free sits at the bottom. Then the buttons
   **Free memory**, **Pause 30 min** (or **Resume**) and **Settings**. "Run a checkup" opens the checkup.
 - **Right-click** opens the menu: Free memory now, Empty Windows file cache, Pause for 30 minutes, Pause until I resume, Settings,
-  Memory history, Run a checkup, Check for updates, Run at Windows startup, Quit.
+  Memory history, Free up memory…, Free up disk space…, Check for updates, Run at Windows startup, Quit.
 - **Double-click** opens Settings.
 - **Ctrl+Alt+M** (change it in Settings) frees memory from anywhere. If another app already uses that
   shortcut, a toast says so once and the shortcut stays off until you pick another.
@@ -105,14 +105,21 @@ settings: what you changed yourself still wins, everything else follows the team
 
 ## Checkup
 
-**Run a checkup** (tray menu or flyout) opens a window that answers: what is using memory on this PC that
-Unreal work doesn't need? It shows the total that could be freed, then sections: apps not needed for Unreal,
+**Free up memory…** (tray menu; "Run a checkup" in the flyout) opens the checkup window on its **Memory**
+tab, which answers: what is using memory on this PC that Unreal work doesn't need? It shows the total that could be freed, then sections: apps not needed for Unreal,
 apps that start with Windows, big tools you might not be using, unknown apps worth a look, apps that should be
 held back, Unreal leftovers, and notes about this PC. Tick what you want, pick what happens to each (close,
-don't start with Windows, close whenever Unreal is running, hold back, leave it) and click **CLEAN UP**.
+don't start with Windows, close whenever Unreal is running, hold back, leave it) and click **FREE MEMORY**.
 Nothing changes without a tick and that click. Apps that ask to save stay open and offer **End it anyway**,
 which asks first. Ending anything always asks first: if a ticked row ends an app or Unreal's leftover
-helpers, **CLEAN UP** lists them and waits for **End them**. **Undo last cleanup** reverses it.
+helpers, **FREE MEMORY** lists them and waits for **End them**. **Undo last cleanup** reverses it.
+
+**Free up disk space…** (tray menu, or the toast when a drive gets full) opens the same window on its
+**Disk space** tab: the last disk checkup's items, grouped by drive, with what each is predicted to free, and
+the drive notes (a Dev Drive almost full, Defender's performance mode off, caches on C:). Tick items, pick
+delete, the bin or the tool's own clean, and click **FREE DISK SPACE**; it lists what goes and asks first.
+Its **Undo last cleanup** puts bin moves back. With no disk checkup yet, the tab offers to run one. The two
+tabs never mix: each has its own ticks, total, button and undo.
 
 When Unreal work starts and a checkup finds at least 4 GB to free, a toast says so (at most once a day), with a
 **Review** button. Apps you put on the "close whenever Unreal is running" list are asked to close when they

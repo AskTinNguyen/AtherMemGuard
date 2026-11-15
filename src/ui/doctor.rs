@@ -1,8 +1,9 @@
-//! The checkup window, the doctor (docs/UI.md section 6): scan on open, findings grouped in
-//! sections with the memory each covers, checkboxes pre-checked from `recommended`, action
-//! pills, a running total, CLEAN UP on a worker thread with every row turning into its result
-//! in place, "End it anyway" with an in-window confirmation, "Undo last cleanup", "Check
-//! again" and the ALL CLEAR state.
+//! The checkup window, the doctor (docs/UI.md section 6): scan on open, two tabs that never
+//! mix ("Memory": what closing apps frees in RAM; "Disk space": what can go from the drives),
+//! findings grouped in sections, checkboxes pre-checked from `recommended`, action pills, a
+//! running total per tab, FREE MEMORY / FREE DISK SPACE on a worker thread with every row
+//! turning into its result in place, "End it anyway" with an in-window confirmation, "Undo
+//! last cleanup" per tab, "Check again" and the ALL CLEAR state.
 //!
 //! The real `doctor` module (docs/DESIGN.md Part F) is built in parallel, so this file has its
 //! own view model, a plain data mirror of Part F's `Report` (fields added for the window are
@@ -28,6 +29,9 @@ pub const KIND: &str = "doctor";
 pub const TITLE: &str = "Ather MemGuard — Checkup";
 const TIMER_WAKE: usize = 7101;
 const TIMER_ANIM: usize = 7102;
+/// Posted by `open_doctor` to an open window: show this tab.
+const TIMER_TAB_MEMORY: usize = 7103;
+const TIMER_TAB_DISK: usize = 7104;
 const MENU_CHOICE: u32 = 1;
 const F_RESULT: Font = Font::new(Face::Display, 34.0, REGULAR);
 
@@ -50,6 +54,65 @@ pub struct Report {
     pub findings: Vec<Finding>,
     pub reclaimable_ram_gb: f64,
     pub reclaimable_commit_gb: f64,
+    /// Addition: when the last disk checkup ran (its drive rows are in `findings`); `None` =
+    /// no disk checkup yet, and the Disk space tab explains it and offers to run one.
+    pub disk_checked: Option<String>,
+}
+
+/// The window's two views. A cleanup, its total and its undo belong to one tab; the window
+/// never runs memory and drive picks in the same action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Tab {
+    #[default]
+    Memory,
+    Disk,
+}
+
+impl Tab {
+    pub const ALL: [Tab; 2] = [Tab::Memory, Tab::Disk];
+    pub fn title(self) -> &'static str {
+        match self {
+            Tab::Memory => "Memory",
+            Tab::Disk => "Disk space",
+        }
+    }
+    /// The footer's primary button.
+    pub fn button(self) -> &'static str {
+        match self {
+            Tab::Memory => "FREE MEMORY",
+            Tab::Disk => "FREE DISK SPACE",
+        }
+    }
+    /// How ui-state.toml remembers it.
+    pub fn key(self) -> &'static str {
+        match self {
+            Tab::Memory => "memory",
+            Tab::Disk => "disk",
+        }
+    }
+    pub fn from_key(k: &str) -> Option<Tab> {
+        Tab::ALL.into_iter().find(|t| t.key() == k)
+    }
+    fn index(self) -> usize {
+        self as usize
+    }
+    fn next(self) -> Tab {
+        match self {
+            Tab::Memory => Tab::Disk,
+            Tab::Disk => Tab::Memory,
+        }
+    }
+}
+
+/// Which tab a finding shows on, by where it came from: drive items of the disk checkup and
+/// the THIS PC notices the drive side of the checkup adds (`drive_notice`: low free space,
+/// Dev Drive health, caches on C:) go to Disk space; everything else is memory.
+pub fn tab_of(f: &Finding) -> Tab {
+    match f.kind {
+        FindingKind::Disk => Tab::Disk,
+        FindingKind::System if f.drive_notice => Tab::Disk,
+        _ => Tab::Memory,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +218,9 @@ pub struct Finding {
     pub help_command: Option<Command>,
     /// Addition: set on drive rows.
     pub disk: Option<DiskRow>,
+    /// Addition: a THIS PC notice from the drive side of the checkup (`doctor::is_drive_finding`):
+    /// it shows on the Disk space tab.
+    pub drive_notice: bool,
 }
 
 /// The link a THIS PC row shows, if any.
@@ -189,9 +255,17 @@ pub struct Outcome {
 /// Scans and acts for the window. `Send` so it can run on a worker thread.
 pub trait DoctorSource: Send + 'static {
     fn scan(&self) -> Report;
+    /// The window only ever passes picks of one tab.
     fn apply(&self, picks: &[(String, ActionKind)], force: bool) -> Vec<Outcome>;
-    fn undo_last(&self) -> Vec<Outcome>;
-    fn can_undo(&self) -> bool;
+    /// Undo the last cleanup of `tab` only: Memory = the memory checkup's undo log, Disk = the
+    /// drive cleanup's bin moves.
+    fn undo_last(&self, tab: Tab) -> Vec<Outcome>;
+    fn can_undo(&self, tab: Tab) -> bool;
+    /// Addition: run the disk checkup (it counts in its own low-priority process and deletes
+    /// nothing); the next `scan` has its drive rows. `Err` says why it didn't run.
+    fn disk_checkup(&self) -> Result<(), String> {
+        Err("The disk checkup can't run from here.".into())
+    }
     /// Addition: what could still be freed after the last `apply` (from a fresh scan), so the
     /// hero number goes down while the rows keep showing their results. `None` = unchanged.
     fn reclaimable_after_apply(&self) -> Option<f64> {
@@ -310,6 +384,8 @@ pub struct RowState {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Section {
     pub kind: SectionKind,
+    /// The header: the kind's title, or "ON D:" for a drive's items on the Disk space tab.
+    pub title: String,
     /// Indices into `report.findings`.
     pub rows: Vec<usize>,
     pub ram_mb: u64,
@@ -368,58 +444,77 @@ impl DoctorModel {
         choices(&self.report.findings[i]).get(self.rows[i].choice).cloned()
     }
 
-    /// What CLEAN UP would run: (finding id, action) for every checked row.
-    pub fn picks(&self) -> Vec<(String, ActionKind)> {
+    /// Is row `i` on `tab`?
+    pub fn in_tab(&self, i: usize, tab: Tab) -> bool {
+        tab_of(&self.report.findings[i]) == tab
+    }
+
+    /// Checked, selectable rows of `tab`.
+    fn checked_in(&self, tab: Tab) -> Vec<usize> {
+        (0..self.rows.len()).filter(|&i| self.rows[i].checked && self.selectable(i) && self.in_tab(i, tab)).collect()
+    }
+
+    /// What FREE MEMORY / FREE DISK SPACE would run on `tab`: (finding id, action) for every
+    /// checked row of that tab only.
+    pub fn picks(&self, tab: Tab) -> Vec<(String, ActionKind)> {
         let mut out = Vec::new();
-        for i in 0..self.rows.len() {
-            if self.rows[i].checked && self.selectable(i) {
-                if let Some(c) = self.chosen(i) {
-                    for k in c.picks {
-                        out.push((self.report.findings[i].id.clone(), k));
-                    }
+        for i in self.checked_in(tab) {
+            if let Some(c) = self.chosen(i) {
+                for k in c.picks {
+                    out.push((self.report.findings[i].id.clone(), k));
                 }
             }
         }
         out
     }
 
-    /// "Selected: frees about {x} GB": the RAM of checked rows whose action closes or ends
-    /// something now. Switching off a startup entry or holding an app back frees nothing now.
+    /// "Selected: frees about {x} GB of RAM": the RAM of checked Memory rows whose action
+    /// closes or ends something now. Switching off a startup entry or holding an app back
+    /// frees nothing now.
     pub fn selected_gb(&self) -> f64 {
-        (0..self.rows.len())
-            .filter(|&i| self.rows[i].checked && self.selectable(i))
+        self.checked_in(Tab::Memory)
+            .into_iter()
             .filter(|&i| self.chosen(i).map(|c| c.picks.iter().any(|k| matches!(k, ActionKind::Close | ActionKind::End))).unwrap_or(false))
             .map(|i| self.report.findings[i].ram_mb as f64 / 1024.0)
             .fold(0.0, |a, b| a + b) // not sum(): an empty f64 sum is -0.0
     }
 
-    pub fn any_checked(&self) -> bool {
-        !self.picks().is_empty()
-    }
-
-    /// Checked rows whose pick ends processes ("End it", "End them"). CLEAN UP asks before
-    /// running these: anything unsaved in them is lost.
-    pub fn ending_rows(&self) -> Vec<usize> {
-        (0..self.rows.len())
-            .filter(|&i| self.rows[i].checked && self.selectable(i))
-            .filter(|&i| self.chosen(i).is_some_and(|c| c.picks.contains(&ActionKind::End)))
+    /// The checked drive rows' picks: (the chosen action, what the row knows).
+    pub fn disk_selection(&self) -> Vec<(ActionKind, DiskRow)> {
+        self.disk_rows()
+            .into_iter()
+            .filter_map(|i| Some((*self.chosen(i)?.picks.first()?, self.report.findings[i].disk.clone().unwrap_or_default())))
             .collect()
     }
 
-    /// Checked drive rows. CLEAN UP lists them (what goes, how, the predicted frees) and asks
-    /// before anything runs.
-    pub fn disk_rows(&self) -> Vec<usize> {
-        (0..self.rows.len()).filter(|&i| self.rows[i].checked && self.selectable(i) && self.report.findings[i].kind == FindingKind::Disk).collect()
+    pub fn any_checked(&self, tab: Tab) -> bool {
+        !self.picks(tab).is_empty()
     }
 
-    /// Mark the checked rows as running and return their picks.
-    pub fn begin_apply(&mut self) -> Vec<(String, ActionKind)> {
-        let picks = self.picks();
-        for i in 0..self.rows.len() {
-            if self.rows[i].checked && self.selectable(i) {
-                self.rows[i].busy = true;
-                self.rows[i].checked = false;
-            }
+    /// Can anything on `tab` be checked?
+    pub fn has_selectable(&self, tab: Tab) -> bool {
+        (0..self.rows.len()).any(|i| self.selectable(i) && self.in_tab(i, tab))
+    }
+
+    /// Checked rows whose pick ends processes ("End it", "End them"; Memory rows only). FREE
+    /// MEMORY asks before running these: anything unsaved in them is lost.
+    pub fn ending_rows(&self) -> Vec<usize> {
+        self.checked_in(Tab::Memory).into_iter().filter(|&i| self.chosen(i).is_some_and(|c| c.picks.contains(&ActionKind::End))).collect()
+    }
+
+    /// Checked drive rows. FREE DISK SPACE lists them (what goes, how, the predicted frees) and
+    /// asks before anything runs.
+    pub fn disk_rows(&self) -> Vec<usize> {
+        self.checked_in(Tab::Disk).into_iter().filter(|&i| self.report.findings[i].kind == FindingKind::Disk).collect()
+    }
+
+    /// Mark the checked rows of `tab` as running and return their picks. The other tab's
+    /// checkboxes stay as they are.
+    pub fn begin_apply(&mut self, tab: Tab) -> Vec<(String, ActionKind)> {
+        let picks = self.picks(tab);
+        for i in self.checked_in(tab) {
+            self.rows[i].busy = true;
+            self.rows[i].checked = false;
         }
         picks
     }
@@ -446,27 +541,132 @@ impl DoctorModel {
         }
     }
 
+    /// A fresh scan for `tab` only: that tab's rows are replaced (new checkboxes, no results),
+    /// the other tab keeps its rows, checks and results as they were.
+    pub fn replace_tab(&mut self, tab: Tab, fresh: Report) {
+        let fresh = DoctorModel::new(fresh);
+        let mut findings = Vec::new();
+        let mut rows = Vec::new();
+        for (f, r) in self.report.findings.drain(..).zip(self.rows.drain(..)) {
+            if tab_of(&f) != tab {
+                findings.push(f);
+                rows.push(r);
+            }
+        }
+        let mut fr = fresh.report;
+        for (f, r) in fr.findings.drain(..).zip(fresh.rows) {
+            if tab_of(&f) == tab {
+                findings.push(f);
+                rows.push(r);
+            }
+        }
+        match tab {
+            Tab::Memory => {
+                self.report.time = fr.time;
+                self.report.system = fr.system;
+                self.report.reclaimable_ram_gb = fr.reclaimable_ram_gb;
+                self.report.reclaimable_commit_gb = fr.reclaimable_commit_gb;
+            }
+            Tab::Disk => self.report.disk_checked = fr.disk_checked,
+        }
+        self.report.findings = findings;
+        self.rows = rows;
+    }
+
     /// True when the app in row `i` stayed open after a close.
     pub fn still_open(&self, i: usize) -> bool {
         self.rows[i].outcomes.iter().any(|o| o.status == OutcomeStatus::StillOpen)
     }
 
-    pub fn sections(&self) -> Vec<Section> {
+    /// The sections of `tab`, in order, empty ones hidden. Memory: the memory sections, then
+    /// its THIS PC notices. Disk space: one section per drive ("ON D:", drives in letter
+    /// order), then the drive notices under THIS PC.
+    pub fn sections(&self, tab: Tab) -> Vec<Section> {
+        let f = &self.report.findings;
+        let in_section = |i: usize, kind: SectionKind| tab_of(&f[i]) == tab && section_of(&f[i]) == Some(kind);
         let mut out = Vec::new();
         for kind in SectionKind::ORDER {
-            let rows: Vec<usize> = (0..self.report.findings.len()).filter(|&i| section_of(&self.report.findings[i]) == Some(kind)).collect();
+            if kind == SectionKind::Disk {
+                let mut vols: Vec<String> = (0..f.len()).filter(|&i| in_section(i, kind)).map(|i| volume_of(&f[i])).collect();
+                vols.sort();
+                vols.dedup();
+                for v in vols {
+                    let rows: Vec<usize> = (0..f.len()).filter(|&i| in_section(i, kind) && volume_of(&f[i]) == v).collect();
+                    let title = if v.is_empty() { kind.title().to_string() } else { format!("ON {}", v) };
+                    out.push(Section { kind, title, rows, ram_mb: 0 });
+                }
+                continue;
+            }
+            let rows: Vec<usize> = (0..f.len()).filter(|&i| in_section(i, kind)).collect();
             if rows.is_empty() {
                 continue;
             }
-            let ram_mb = if kind == SectionKind::ThisPc { 0 } else { rows.iter().map(|&i| self.report.findings[i].ram_mb).sum() };
-            out.push(Section { kind, rows, ram_mb });
+            let ram_mb = if kind == SectionKind::ThisPc { 0 } else { rows.iter().map(|&i| f[i].ram_mb).sum() };
+            out.push(Section { kind, title: kind.title().to_string(), rows, ram_mb });
         }
         out
     }
 
-    /// Nothing proposed: no finding with an action anywhere.
-    pub fn all_clear(&self) -> bool {
-        self.report.findings.iter().all(|f| section_of(f).is_none() || choices(f).is_empty())
+    /// How many rows `tab` shows (its title's count).
+    pub fn count(&self, tab: Tab) -> usize {
+        self.sections(tab).iter().map(|s| s.rows.len()).sum()
+    }
+
+    /// Nothing proposed on `tab`: no finding with an action there.
+    pub fn all_clear(&self, tab: Tab) -> bool {
+        self.report.findings.iter().filter(|f| tab_of(f) == tab).all(|f| section_of(f).is_none() || choices(f).is_empty())
+    }
+}
+
+/// The drive a drive row is on ("D:"), "" when unknown.
+fn volume_of(f: &Finding) -> String {
+    f.disk.as_ref().map(|d| d.volume.trim().to_ascii_uppercase()).unwrap_or_default()
+}
+
+/// The Memory tab's footer.
+pub fn memory_footer_words(gb: f64) -> String {
+    format!("Selected: frees about {:.1} GB of RAM", gb)
+}
+
+/// The Disk space tab's footer for the checked drive rows: what deleting (or a tool's clean)
+/// is predicted to free, per drive ("Selected: frees about 16.8 GB on D: and about 3.1 GB on
+/// C: (predicted)"), and how many go to the bin, which frees nothing until it's emptied.
+pub fn disk_footer_words(sel: &[(ActionKind, DiskRow)]) -> String {
+    if sel.is_empty() {
+        return "Selected: nothing yet".into();
+    }
+    // (drive, known GB, some unknown)
+    let mut vols: Vec<(String, f64, bool)> = Vec::new();
+    for (_, row) in sel.iter().filter(|(k, _)| *k != ActionKind::DiskBin) {
+        let v = row.volume.trim().to_ascii_uppercase();
+        let v = if v.is_empty() { "your drives".to_string() } else { v };
+        let at = match vols.iter().position(|e| e.0 == v) {
+            Some(at) => at,
+            None => {
+                vols.push((v, 0.0, false));
+                vols.len() - 1
+            }
+        };
+        match row.frees_gb {
+            Some(g) => vols[at].1 += g,
+            None => vols[at].2 = true,
+        }
+    }
+    vols.sort_by(|a, b| a.0.cmp(&b.0));
+    let parts: Vec<String> = vols
+        .iter()
+        .map(|(v, gb, unknown)| match (*gb > 0.0, *unknown) {
+            (_, false) => format!("about {} on {}", format_gb(*gb), v),
+            (true, true) => format!("at least {} on {}", format_gb(*gb), v),
+            (false, true) => format!("an unknown amount on {}", v),
+        })
+        .collect();
+    let bins = sel.iter().filter(|(k, _)| *k == ActionKind::DiskBin).count();
+    let items = |n: usize| if n == 1 { "1 item".to_string() } else { format!("{} items", n) };
+    match (parts.is_empty(), bins) {
+        (false, 0) => format!("Selected: frees {} (predicted)", parts.join(" and ")),
+        (false, n) => format!("Selected: frees {} (predicted) · {} to the bin", parts.join(" and "), items(n)),
+        (true, n) => format!("Selected: {} to the bin (frees nothing until it's emptied)", items(n)),
     }
 }
 
@@ -509,17 +709,24 @@ pub fn outcome_text(outs: &[Outcome]) -> (String, Rgb) {
 pub struct FakeDoctor {
     pub clear: bool,
     pub delay: Duration,
-    applied: Mutex<bool>,
+    /// A cleanup ran on [Memory, Disk] (and can be undone there).
+    applied: Mutex<[bool; 2]>,
     /// What is left to free after the last `apply`.
     after_apply: Mutex<Option<f64>>,
+    /// A disk checkup has run (the drive rows exist).
+    disk_checked: Mutex<bool>,
 }
 
 impl FakeDoctor {
     pub fn new() -> FakeDoctor {
-        FakeDoctor { clear: false, delay: Duration::ZERO, applied: Mutex::new(false), after_apply: Mutex::new(None) }
+        FakeDoctor { clear: false, delay: Duration::ZERO, applied: Mutex::new([false; 2]), after_apply: Mutex::new(None), disk_checked: Mutex::new(true) }
     }
     pub fn all_clear() -> FakeDoctor {
         FakeDoctor { clear: true, ..FakeDoctor::new() }
+    }
+    /// No disk checkup has run yet: no drive rows until `disk_checkup`.
+    pub fn without_disk_checkup() -> FakeDoctor {
+        FakeDoctor { disk_checked: Mutex::new(false), ..FakeDoctor::new() }
     }
     pub fn with_delay(mut self, d: Duration) -> FakeDoctor {
         self.delay = d;
@@ -527,6 +734,11 @@ impl FakeDoctor {
     }
 
     pub fn report(clear: bool) -> Report {
+        FakeDoctor::report_with(clear, true)
+    }
+
+    /// The sample report; `disk_checked` false leaves out the drive rows (no disk checkup yet).
+    pub fn report_with(clear: bool, disk_checked: bool) -> Report {
         let f = |id: &str, kind: FindingKind, verdict: Verdict, title: &str, detail: &str, processes: usize, ram_mb: u64, actions: &[ActionKind], recommended: bool| Finding {
             id: id.into(),
             kind,
@@ -543,13 +755,15 @@ impl FakeDoctor {
             help_url: None,
             help_command: None,
             disk: None,
+            drive_notice: false,
         };
         use ActionKind as A;
         use FindingKind as K;
         use Verdict as V;
         let system = SystemStatus { ram_total_gb: 127.7, ram_free_gb: 45.1, commit_limit_gb: 144.0, commit_free_gb: 27.6, memguard_running: true, memguard_paused: false };
+        let disk_time = disk_checked.then(|| "2026-11-14 13:40".to_string());
         if clear {
-            return Report { time: "2026-11-14 14:02:11".into(), system, findings: Vec::new(), reclaimable_ram_gb: 0.0, reclaimable_commit_gb: 0.0 };
+            return Report { time: "2026-11-14 14:02:11".into(), system, findings: Vec::new(), reclaimable_ram_gb: 0.0, reclaimable_commit_gb: 0.0, disk_checked: disk_time };
         }
         let mut findings = vec![
             f("app:steam", K::App, V::Close, "Steam", "Game launcher. Not used by Unreal.", 6, 1270, &[A::Close, A::DisableStartup, A::BlockWhileUnreal], true),
@@ -582,18 +796,35 @@ impl FakeDoctor {
         findings[9].company = "Northwind Systems".into();
         findings[13].help_url = Some("https://github.com/AskTinNguyen/AtherMemGuard/blob/main/docs/PAGEFILE.md".into());
         findings[14].help_command = Some(Command::ShowRamReport);
-        let mut build = f("disk:d1", K::Disk, V::Review, "Build files for S2", r"D:\s2\Intermediate", 0, 0, &[A::DiskNow, A::DiskBin], false);
-        build.disk = Some(DiskRow { volume: "D:".into(), frees_gb: Some(16.4), confidence: "exact".into() });
-        let mut logs = f("disk:d2", K::Disk, V::Review, "Logs for S2", r"D:\s2\Saved\Logs", 0, 0, &[A::DiskBin, A::DiskNow], false);
-        logs.disk = Some(DiskRow { volume: "D:".into(), frees_gb: Some(0.4), confidence: "exact".into() });
-        let mut npm = f("disk:d3", K::Disk, V::Review, "npm cache", r"C:\Users\you\AppData\Local\npm-cache\_cacache", 0, 0, &[A::DiskNow, A::DiskBin, A::DiskTool], false);
-        npm.actions[2].detail = "Clean with npm".into();
-        npm.disk = Some(DiskRow { volume: "C:".into(), frees_gb: Some(3.1), confidence: "estimate".into() });
-        findings.insert(13, npm);
-        findings.insert(13, logs);
-        findings.insert(13, build);
+        // The drive side's notices (THIS PC on the Disk space tab), there with or without a
+        // disk checkup.
+        let mut low = f("disk:low:d", K::System, V::Review, "Your Dev Drive is almost full", "D: has 38 GB free, and a cook usually needs 100 GB.", 0, 0, &[], false);
+        low.drive_notice = true;
+        let mut perf = f("dev:perf_mode_off", K::System, V::Review, "Defender's performance mode is off", "Files on your Dev Drive are scanned before they open. Fix, as administrator: Set-MpPreference -PerformanceModeStatus Enabled", 0, 0, &[], false);
+        perf.drive_notice = true;
+        findings.push(low);
+        findings.push(perf);
+        if disk_checked {
+            let mut build = f("disk:d1", K::Disk, V::Review, "Build files for S2", r"D:\s2\Intermediate", 0, 0, &[A::DiskNow, A::DiskBin], false);
+            build.disk = Some(DiskRow { volume: "D:".into(), frees_gb: Some(16.4), confidence: "exact".into() });
+            let mut logs = f("disk:d2", K::Disk, V::Review, "Logs for S2", r"D:\s2\Saved\Logs", 0, 0, &[A::DiskBin, A::DiskNow], false);
+            logs.disk = Some(DiskRow { volume: "D:".into(), frees_gb: Some(0.4), confidence: "exact".into() });
+            let mut npm = f("disk:d3", K::Disk, V::Review, "npm cache", r"C:\Users\you\AppData\Local\npm-cache\_cacache", 0, 0, &[A::DiskNow, A::DiskBin, A::DiskTool], false);
+            npm.actions[2].detail = "Clean with npm".into();
+            npm.disk = Some(DiskRow { volume: "C:".into(), frees_gb: Some(3.1), confidence: "estimate".into() });
+            findings.insert(13, npm);
+            findings.insert(13, logs);
+            findings.insert(13, build);
+        }
         let reclaim: u64 = findings.iter().filter(|f| f.kind == K::App || f.kind == K::Unreal).filter(|f| f.verdict != V::HoldBack).map(|f| f.ram_mb).sum();
-        Report { time: "2026-11-14 14:02:11".into(), system, findings, reclaimable_ram_gb: reclaim as f64 / 1024.0, reclaimable_commit_gb: reclaim as f64 * 1.25 / 1024.0 }
+        Report {
+            time: "2026-11-14 14:02:11".into(),
+            system,
+            findings,
+            reclaimable_ram_gb: reclaim as f64 / 1024.0,
+            reclaimable_commit_gb: reclaim as f64 * 1.25 / 1024.0,
+            disk_checked: disk_time,
+        }
     }
 
     fn outcome(id: &str, action: ActionKind, force: bool) -> Outcome {
@@ -620,19 +851,24 @@ impl DoctorSource for FakeDoctor {
     fn scan(&self) -> Report {
         std::thread::sleep(self.delay);
         let applied = *self.applied.lock().unwrap();
-        // After a cleanup the closed apps are gone from the next scan.
-        let mut r = FakeDoctor::report(self.clear || applied);
-        if applied && !self.clear {
-            r.findings.clear();
-        }
+        let mut r = FakeDoctor::report_with(self.clear, *self.disk_checked.lock().unwrap());
+        // After a cleanup what it acted on is gone from the next scan of that tab.
+        r.findings.retain(|f| !applied[tab_of(f).index()] || f.kind == FindingKind::System);
         r
     }
     fn apply(&self, picks: &[(String, ActionKind)], force: bool) -> Vec<Outcome> {
         std::thread::sleep(self.delay);
-        *self.applied.lock().unwrap() = true;
+        let r = FakeDoctor::report_with(self.clear, *self.disk_checked.lock().unwrap());
+        {
+            let mut applied = self.applied.lock().unwrap();
+            for (id, _) in picks {
+                if let Some(f) = r.findings.iter().find(|f| f.id == *id) {
+                    applied[tab_of(f).index()] = true;
+                }
+            }
+        }
         let outs: Vec<Outcome> = picks.iter().map(|(id, k)| FakeDoctor::outcome(id, *k, force)).collect();
         // Like the real one: what closed or ended no longer counts as "could be freed".
-        let r = FakeDoctor::report(self.clear);
         let mut freed: Vec<&str> = outs
             .iter()
             .filter(|o| o.status == OutcomeStatus::Done && matches!(o.action, ActionKind::Close | ActionKind::End))
@@ -644,16 +880,21 @@ impl DoctorSource for FakeDoctor {
         *self.after_apply.lock().unwrap() = Some((r.reclaimable_ram_gb - freed_mb as f64 / 1024.0).max(0.0));
         outs
     }
-    fn undo_last(&self) -> Vec<Outcome> {
+    fn undo_last(&self, tab: Tab) -> Vec<Outcome> {
         std::thread::sleep(self.delay);
-        *self.applied.lock().unwrap() = false;
+        self.applied.lock().unwrap()[tab.index()] = false;
         Vec::new()
     }
-    fn can_undo(&self) -> bool {
-        *self.applied.lock().unwrap()
+    fn can_undo(&self, tab: Tab) -> bool {
+        self.applied.lock().unwrap()[tab.index()]
     }
     fn reclaimable_after_apply(&self) -> Option<f64> {
         self.after_apply.lock().unwrap().take()
+    }
+    fn disk_checkup(&self) -> Result<(), String> {
+        std::thread::sleep(self.delay);
+        *self.disk_checked.lock().unwrap() = true;
+        Ok(())
     }
 }
 
@@ -661,11 +902,15 @@ impl DoctorSource for FakeDoctor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Act {
+    /// The tab strip: show this tab.
+    Tab(Tab),
     Check(usize),
     Choice(usize),
     EndAnyway(usize),
     HowToFix(usize),
     CheckAgain,
+    /// Run the disk checkup (the Disk space tab's empty state, "Count again").
+    DiskCheckup,
     CleanUp,
     Undo,
 }
@@ -679,6 +924,8 @@ pub enum Paint {
     Result(String),
     Caption(String),
     Link { label: String, color: Rgb },
+    /// One tab of the strip: its title, the count of its rows, whether it is showing.
+    Tab { label: String, count: Option<usize>, active: bool },
     Section(String),
     SectionGb(String),
     Hairline(Rgb),
@@ -689,8 +936,12 @@ pub enum Paint {
     Label { title: String, meta: String, hint: Vec<String> },
     Pill(Pill),
     Note { lines: Vec<String>, color: Rgb },
-    Checking,
+    /// "Checking…" (or what is being counted) over the indeterminate bar.
+    Checking(String),
     Message(Vec<String>),
+    /// Small left-aligned lines outside the rows (the Disk space tab's checkup line, errors).
+    Info { lines: Vec<String>, color: Rgb },
+    Button(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -710,18 +961,28 @@ impl Item {
     }
 }
 
+/// Can each tab undo its last cleanup: [Memory, Disk].
+type Undoable = [bool; 2];
+
+fn undoable(s: &dyn DoctorSource) -> Undoable {
+    [s.can_undo(Tab::Memory), s.can_undo(Tab::Disk)]
+}
+
 enum Job {
-    Scanned(Report, bool),
-    Applied(Vec<Outcome>, bool, Option<f64>),
+    /// A scan: of everything (`None`) or for one tab, whose rows it replaces.
+    Scanned(Report, Undoable, Option<Tab>),
+    Applied(Vec<Outcome>, Undoable, Option<f64>),
+    /// The disk checkup ran (or why not), then a scan for the Disk space tab.
+    DiskChecked(Result<(), String>, Report, Undoable),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Confirm {
     /// "End it anyway" on a row that stayed open.
     End(usize),
-    /// CLEAN UP with rows that end processes checked: these rows, before anything runs.
+    /// FREE MEMORY with rows that end processes checked: these rows, before anything runs.
     CleanUp(Vec<usize>),
-    /// CLEAN UP with drive rows checked: what goes, how, and the predicted frees.
+    /// FREE DISK SPACE: the checked drive rows, what goes, how, and the predicted frees.
     Disk(Vec<usize>),
 }
 
@@ -774,13 +1035,24 @@ pub fn confirm_words(names: &[String], one_row_is_many: bool) -> (String, String
     }
 }
 
+/// The Disk space tab's words before any disk checkup ran.
+pub const NO_DISK_CHECKUP: &str = "No disk checkup yet. It finds build files, caches and logs on your drives and what removing each would really free. It counts in the background for up to a minute and deletes nothing.";
+
 pub struct DoctorWindow {
     source: Arc<Mutex<Box<dyn DoctorSource>>>,
     pub model: Option<DoctorModel>,
     pub confirm: Option<Confirm>,
+    /// The tab showing.
+    tab: Tab,
     scanning: bool,
+    /// What the running scan is for: everything (`None`) or one tab.
+    scan_scope: Option<Tab>,
+    /// The disk checkup is counting.
+    counting: bool,
+    /// Why the last disk checkup from this window didn't run.
+    disk_error: Option<String>,
     working: bool,
-    can_undo: bool,
+    can_undo: Undoable,
     rx: Option<Receiver<Job>>,
     hwnd: isize,
     started: bool,
@@ -790,8 +1062,15 @@ pub struct DoctorWindow {
     pressed: Option<Act>,
     focus: Option<Act>,
     scroll: Scroll,
+    /// Each tab's scroll position while the other one shows.
+    tab_scroll: [i32; 2],
     anim: f32,
+    /// The header (hero and tabs, fixed) first, then the scrolling content.
     items: Vec<Item>,
+    /// How many of `items` are the header's.
+    head_n: usize,
+    /// The header's area (above `scroll.view`).
+    head: Rect,
     menu_row: Option<usize>,
     /// Where commands from rows go (the tray's dispatcher); a no-op by default.
     commands: Box<dyn Fn(Command)>,
@@ -804,9 +1083,13 @@ impl DoctorWindow {
             source: Arc::new(Mutex::new(source)),
             model: None,
             confirm: None,
+            tab: Tab::Memory,
             scanning: false,
+            scan_scope: None,
+            counting: false,
+            disk_error: None,
             working: false,
-            can_undo: false,
+            can_undo: [false; 2],
             rx: None,
             hwnd: 0,
             started: false,
@@ -816,8 +1099,11 @@ impl DoctorWindow {
             pressed: None,
             focus: None,
             scroll: Scroll::default(),
+            tab_scroll: [0; 2],
             anim: 0.3,
             items: Vec::new(),
+            head_n: 0,
+            head: Rect::default(),
             menu_row: None,
         }
     }
@@ -828,12 +1114,46 @@ impl DoctorWindow {
         self
     }
 
+    /// Open on `tab`.
+    pub fn with_tab(mut self, tab: Tab) -> DoctorWindow {
+        self.tab = tab;
+        self
+    }
+
     pub fn items(&self) -> &[Item] {
         &self.items
     }
 
     pub fn is_scanning(&self) -> bool {
         self.scanning
+    }
+
+    pub fn tab(&self) -> Tab {
+        self.tab
+    }
+
+    /// Show `tab`. Each tab keeps its own checks, results and scroll position. An open
+    /// confirmation is cancelled (nothing has run yet).
+    pub fn set_tab(&mut self, tab: Tab) {
+        if tab == self.tab {
+            return;
+        }
+        self.tab_scroll[self.tab.index()] = self.scroll.y;
+        self.tab = tab;
+        self.scroll.y = self.tab_scroll[tab.index()];
+        self.confirm = None;
+        self.menu_row = None;
+        if !matches!(self.focus, Some(Act::Tab(_))) {
+            self.focus = None;
+        }
+        if self.hwnd != 0 {
+            let _ = super::ui_state::save_str(KIND, "tab", tab.key());
+        }
+    }
+
+    /// Is the showing tab waiting for a scan (or the disk checkup)?
+    fn tab_busy(&self) -> bool {
+        self.model.is_none() || (self.scanning && self.scan_scope.is_none_or(|t| t == self.tab))
     }
 
     /// Run a job on a worker thread (or right here when there is no window, as in tests and
@@ -864,48 +1184,83 @@ impl DoctorWindow {
         }
     }
 
-    /// Scan (again). Results replace everything shown.
+    /// Scan everything. Results replace everything shown.
     pub fn scan(&mut self, host: Option<&mut Host>) {
+        self.scan_for(None, host);
+    }
+
+    /// Scan (again) for one tab: its rows are replaced, the other tab's stay as they are.
+    fn scan_for(&mut self, scope: Option<Tab>, host: Option<&mut Host>) {
         self.scanning = true;
+        self.scan_scope = scope;
+        self.working = true;
         self.confirm = None;
-        self.run(|s| Job::Scanned(s.scan(), s.can_undo()), host);
+        self.run(move |s| Job::Scanned(s.scan(), undoable(s), scope), host);
     }
 
-    /// CLEAN UP: run every checked row's picks. Ending processes always needs a second,
-    /// explicit confirmation (docs/DESIGN.md), so when a checked row's pick is "End it" or
-    /// "End them" this only opens the in-window confirmation listing them; its "End them"
-    /// runs everything (`confirm_ok`), Cancel runs nothing.
+    /// Run the disk checkup (its own process; deletes nothing), then show its rows.
+    pub fn disk_checkup(&mut self, host: Option<&mut Host>) {
+        if self.working {
+            return;
+        }
+        self.scanning = true;
+        self.scan_scope = Some(Tab::Disk);
+        self.counting = true;
+        self.working = true;
+        self.disk_error = None;
+        self.confirm = None;
+        self.run(
+            |s| {
+                let r = s.disk_checkup();
+                Job::DiskChecked(r, s.scan(), undoable(s))
+            },
+            host,
+        );
+    }
+
+    /// FREE MEMORY / FREE DISK SPACE: run the checked rows of the showing tab, never the other
+    /// tab's. Drive rows always ask first (what goes, how, the predicted frees). Ending
+    /// processes always needs a second, explicit confirmation (docs/DESIGN.md), so when a
+    /// checked row's pick is "End it" or "End them" this only opens the in-window
+    /// confirmation listing them; its "End them" runs everything (`confirm_ok`), Cancel runs
+    /// nothing.
     pub fn clean_up(&mut self, host: Option<&mut Host>) {
+        let tab = self.tab;
         let Some(m) = self.model.as_ref() else { return };
-        if self.working || !m.any_checked() {
+        if self.working || !m.any_checked(tab) {
             return;
         }
-        let disk = m.disk_rows();
-        if !disk.is_empty() {
-            self.confirm = Some(Confirm::Disk(disk));
-            return;
+        match tab {
+            Tab::Disk => {
+                let disk = m.disk_rows();
+                if !disk.is_empty() {
+                    self.confirm = Some(Confirm::Disk(disk));
+                }
+            }
+            Tab::Memory => {
+                let ending = m.ending_rows();
+                if ending.is_empty() {
+                    self.run_clean_up(Tab::Memory, host);
+                } else {
+                    self.confirm = Some(Confirm::CleanUp(ending));
+                }
+            }
         }
-        let ending = m.ending_rows();
-        if !ending.is_empty() {
-            self.confirm = Some(Confirm::CleanUp(ending));
-            return;
-        }
-        self.run_clean_up(host);
     }
 
-    /// Run every checked row's picks now (after any confirmation).
-    fn run_clean_up(&mut self, host: Option<&mut Host>) {
+    /// Run every checked row's picks of `tab` now (after any confirmation).
+    fn run_clean_up(&mut self, tab: Tab, host: Option<&mut Host>) {
         let Some(m) = self.model.as_mut() else { return };
-        if self.working || !m.any_checked() {
+        if self.working || !m.any_checked(tab) {
             return;
         }
-        let picks = m.begin_apply();
+        let picks = m.begin_apply(tab);
         let force = picks.iter().any(|(_, k)| *k == ActionKind::End);
         self.working = true;
         self.run(
             move |s| {
                 let outs = s.apply(&picks, force);
-                Job::Applied(outs, s.can_undo(), s.reclaimable_after_apply())
+                Job::Applied(outs, undoable(s), s.reclaimable_after_apply())
             },
             host,
         );
@@ -920,33 +1275,60 @@ impl DoctorWindow {
         self.run(
             move |s| {
                 let outs = s.apply(&[(id, ActionKind::End)], true);
-                Job::Applied(outs, s.can_undo(), s.reclaimable_after_apply())
+                Job::Applied(outs, undoable(s), s.reclaimable_after_apply())
             },
             host,
         );
     }
 
+    /// "Undo last cleanup": the showing tab's last cleanup only, then a scan for that tab.
     pub fn undo(&mut self, host: Option<&mut Host>) {
+        let tab = self.tab;
+        if !self.can_undo[tab.index()] || self.working {
+            return;
+        }
         self.working = true;
         self.scanning = true;
+        self.scan_scope = Some(tab);
         self.run(
-            |s| {
-                s.undo_last();
-                Job::Scanned(s.scan(), s.can_undo())
+            move |s| {
+                s.undo_last(tab);
+                Job::Scanned(s.scan(), undoable(s), Some(tab))
             },
             host,
         );
+    }
+
+    fn on_scanned(&mut self, r: Report, scope: Option<Tab>) {
+        match (scope, self.model.as_mut()) {
+            (Some(t), Some(m)) => m.replace_tab(t, r),
+            _ => self.model = Some(DoctorModel::new(r)),
+        }
+        if scope.is_none_or(|t| t == self.tab) {
+            self.scroll.y = 0;
+            self.focus = None;
+        }
+        for t in Tab::ALL {
+            if scope.is_none_or(|s| s == t) && t != self.tab {
+                self.tab_scroll[t.index()] = 0;
+            }
+        }
+        self.scanning = false;
+        self.scan_scope = None;
+        self.counting = false;
+        self.working = false;
     }
 
     fn on_job(&mut self, job: Job) {
         match job {
-            Job::Scanned(r, can_undo) => {
-                self.model = Some(DoctorModel::new(r));
+            Job::Scanned(r, can_undo, scope) => {
                 self.can_undo = can_undo;
-                self.scanning = false;
-                self.working = false;
-                self.scroll.y = 0;
-                self.focus = None;
+                self.on_scanned(r, scope);
+            }
+            Job::DiskChecked(res, r, can_undo) => {
+                self.can_undo = can_undo;
+                self.disk_error = res.err();
+                self.on_scanned(r, Some(Tab::Disk));
             }
             Job::Applied(outs, can_undo, reclaimable) => {
                 if let Some(m) = self.model.as_mut() {
@@ -981,17 +1363,33 @@ impl DoctorWindow {
         c.s(60.0)
     }
 
-    /// Lay the page out; fills `self.items`.
+    /// The hero's right side for the showing tab: (big words, caption).
+    fn hero_result(&self, m: &DoctorModel) -> Option<(String, Option<&'static str>)> {
+        match self.tab {
+            Tab::Memory if m.all_clear(Tab::Memory) => Some(("ALL CLEAR".into(), None)),
+            Tab::Memory => Some((format!("{:.1} GB", m.report.reclaimable_ram_gb), Some("COULD BE FREED"))),
+            Tab::Disk if m.report.disk_checked.is_none() => None,
+            Tab::Disk => {
+                let n = m.sections(Tab::Disk).iter().filter(|s| s.kind == SectionKind::Disk).map(|s| s.rows.iter().filter(|&&i| !choices(&m.report.findings[i]).is_empty()).count()).sum::<usize>();
+                match n {
+                    0 => Some(("ALL CLEAR".into(), None)),
+                    1 => Some(("1 ITEM".into(), Some("COULD GO FROM YOUR DRIVES"))),
+                    n => Some((format!("{} ITEMS", n), Some("COULD GO FROM YOUR DRIVES"))),
+                }
+            }
+        }
+    }
+
+    /// Lay the page out; fills `self.items`: the fixed header (hero and tab strip), then the
+    /// showing tab's content, which scrolls under it.
     pub fn layout(&mut self, c: &Canvas) {
         let mut items = Vec::new();
         let w = c.width();
         let fh = Self::footer_h(c);
-        self.scroll.view = Rect::new(0, 0, w, c.height() - fh);
         let content_w = (w - 2 * c.s(32.0)).min(c.s(1040.0));
         let left = (w - content_w) / 2;
         let right = left + content_w;
-        let top = c.s(28.0) - self.scroll.y;
-        let mut y = top;
+        let mut y = c.s(24.0);
 
         // Hero.
         let ls = c.s(64.0);
@@ -1005,55 +1403,117 @@ impl DoctorWindow {
         items.push(Item::new(Rect::new(tx, ty, ew, eh), Paint::Eyebrow("ATHER MEMGUARD".into())));
         items.push(Item::new(Rect::new(tx, ty + eh + c.s(6.0), hw, hh), Paint::Headline("CHECKUP".into())));
         let mut hero_bottom = y + ls;
-        if !self.scanning {
+        if !self.tab_busy() {
             if let Some(m) = &self.model {
-                let (big, cap) = if m.all_clear() {
-                    ("ALL CLEAR".to_string(), None)
-                } else {
-                    (format!("{:.1} GB", m.report.reclaimable_ram_gb), Some("COULD BE FREED"))
-                };
+                let res = self.hero_result(m);
                 let rh = c.line_height(F_RESULT);
                 let ch = c.line_height(F_CAPTION);
                 let lh = c.line_height(F_HINT);
-                let block = rh + cap.map(|_| ch + c.s(2.0)).unwrap_or(0) + c.s(6.0) + lh;
+                let block = res.as_ref().map_or(0, |(_, cap)| rh + cap.map_or(0, |_| ch + c.s(2.0)) + c.s(6.0)) + lh;
                 let by = y + (ls - block) / 2;
-                let rw = c.measure(&big, F_RESULT).0 + c.s(4.0);
-                items.push(Item::new(Rect::new(right - rw, by, rw, rh), Paint::Result(big)));
-                let mut yy = by + rh;
-                if let Some(cap) = cap {
-                    let cw = c.measure_spaced(cap, F_CAPTION, c.s(1.3)).0 + c.s(2.0);
-                    items.push(Item::new(Rect::new(right - cw, yy + c.s(2.0), cw, ch), Paint::Caption(cap.into())));
-                    yy += ch + c.s(2.0);
+                let mut yy = by;
+                if let Some((big, cap)) = res {
+                    let rw = c.measure(&big, F_RESULT).0 + c.s(4.0);
+                    items.push(Item::new(Rect::new(right - rw, by, rw, rh), Paint::Result(big)));
+                    yy += rh;
+                    if let Some(cap) = cap {
+                        let cw = c.measure_spaced(cap, F_CAPTION, c.s(1.3)).0 + c.s(2.0);
+                        items.push(Item::new(Rect::new(right - cw, yy + c.s(2.0), cw, ch), Paint::Caption(cap.into())));
+                        yy += ch + c.s(2.0);
+                    }
+                    yy += c.s(6.0);
                 }
                 let lw = c.measure("Check again", F_HINT).0 + c.s(2.0);
                 if !self.working {
-                    items.push(Item::new(Rect::new(right - lw, yy + c.s(6.0), lw, lh), Paint::Link { label: "Check again".into(), color: MUTED }).act(Act::CheckAgain));
+                    items.push(Item::new(Rect::new(right - lw, yy, lw, lh), Paint::Link { label: "Check again".into(), color: MUTED }).act(Act::CheckAgain));
                 }
-                hero_bottom = hero_bottom.max(yy + c.s(6.0) + lh);
+                hero_bottom = hero_bottom.max(yy + lh);
             }
         }
-        y = hero_bottom + c.s(8.0);
+        y = hero_bottom + c.s(14.0);
 
-        if self.scanning || self.model.is_none() {
-            y += c.s(36.0);
-            items.push(Item::new(Rect::new(left, y, content_w, c.s(40.0)), Paint::Checking));
+        // The tab strip.
+        let tab_h = c.s(38.0);
+        let mut x = left;
+        for t in Tab::ALL {
+            let count = self.model.as_ref().filter(|_| !self.scanning || self.scan_scope.is_some_and(|s| s != t)).map(|m| m.count(t)).filter(|n| *n > 0);
+            let tw = tab_width(c, t.title(), count);
+            items.push(Item::new(Rect::new(x, y, tw, tab_h), Paint::Tab { label: t.title().into(), count, active: t == self.tab }).act(Act::Tab(t)));
+            x += tw + c.s(8.0);
+        }
+        y += tab_h;
+        items.push(Item::new(Rect::new(left, y, content_w, c.px1(1.0)), Paint::Hairline(BORDER)));
+        y += c.px1(1.0);
+        let head_n = items.len();
+        self.head = Rect::new(0, 0, w, y);
+        self.scroll.view = Rect::new(0, y, w, (c.height() - fh - y).max(0));
+
+        // The showing tab, scrolled.
+        let top = y - self.scroll.y;
+        let mut y = top + c.s(4.0);
+        if self.tab_busy() {
+            y += c.s(28.0);
+            let what = if self.counting && self.tab == Tab::Disk { "Counting what's on your drives… (up to a minute)" } else { "Checking…" };
+            items.push(Item::new(Rect::new(left, y, content_w, c.s(40.0)), Paint::Checking(what.into())));
             y += c.s(40.0);
         } else if let Some(m) = self.model.clone() {
-            let sections = m.sections();
-            if sections.is_empty() {
-                y += c.s(36.0);
-                let msg = "Nothing here needs your attention. Every app that's running is one Unreal work needs, or too small to matter.";
-                let lines = c.wrap_lines(msg, F_BODY, content_w.min(c.s(560.0)), 3);
-                let h = lines.len() as i32 * (c.line_height(F_BODY) + c.s(2.0));
-                items.push(Item::new(Rect::new(left, y, content_w, h), Paint::Message(lines)));
-                y += h;
+            let sections = m.sections(self.tab);
+            let msg_w = content_w.min(c.s(600.0));
+            let body_lh = c.line_height(F_BODY) + c.s(2.0);
+            let message = |items: &mut Vec<Item>, y: &mut i32, text: &str| {
+                let lines = c.wrap_lines(text, F_BODY, msg_w, 4);
+                let h = lines.len() as i32 * body_lh;
+                items.push(Item::new(Rect::new(left, *y, msg_w, h), Paint::Message(lines)));
+                *y += h;
+            };
+            match self.tab {
+                Tab::Memory if sections.is_empty() => {
+                    y += c.s(28.0);
+                    message(&mut items, &mut y, "Nothing here needs your attention. Every app that's running is one Unreal work needs, or too small to matter.");
+                }
+                Tab::Memory => {}
+                Tab::Disk => {
+                    y += c.s(20.0);
+                    match &m.report.disk_checked {
+                        None => {
+                            message(&mut items, &mut y, NO_DISK_CHECKUP);
+                            y += c.s(14.0);
+                            let b = Button::new("Run the disk checkup", ButtonStyle::Normal);
+                            let (bw, bh) = b.size(c);
+                            items.push(Item::new(Rect::new(left, y, bw, bh), Paint::Button(b.label.clone())).act(Act::DiskCheckup));
+                            y += bh;
+                        }
+                        Some(time) => {
+                            let line = format!("From the disk checkup of {}.", time);
+                            let lh = c.line_height(F_HINT);
+                            let lw = (c.measure(&line, F_HINT).0 + c.s(2.0)).min(content_w - c.s(120.0));
+                            items.push(Item::new(Rect::new(left, y, lw, lh), Paint::Info { lines: vec![line], color: MUTED }));
+                            let cw = c.measure("Count again", F_HINT).0 + c.s(2.0);
+                            if !self.working {
+                                items.push(Item::new(Rect::new(left + lw + c.s(10.0), y, cw, lh), Paint::Link { label: "Count again".into(), color: MUTED }).act(Act::DiskCheckup));
+                            }
+                            y += lh;
+                            if !sections.iter().any(|s| s.kind == SectionKind::Disk) {
+                                y += c.s(14.0);
+                                message(&mut items, &mut y, "Nothing on your drives needs your attention: the last disk checkup found nothing that can go.");
+                            }
+                        }
+                    }
+                    if let Some(e) = &self.disk_error {
+                        y += c.s(10.0);
+                        let lines = wrap_hard(c, &format!("The disk checkup didn't run: {}", e), F_HINT, msg_w, 3);
+                        let h = lines.len() as i32 * c.line_height(F_HINT);
+                        items.push(Item::new(Rect::new(left, y, msg_w, h), Paint::Info { lines, color: ERROR }));
+                        y += h;
+                    }
+                }
             }
             for s in &sections {
                 let lh = c.line_height(F_SECTION);
                 let sh = c.s(26.0) + lh + c.s(8.0);
                 let gb = if s.ram_mb > 0 { format_gb(s.ram_mb as f64 / 1024.0) } else { String::new() };
                 let gw = if gb.is_empty() { 0 } else { c.measure(&gb, F_LABEL).0 + c.s(2.0) };
-                items.push(Item::new(Rect::new(left, y + c.s(26.0), content_w - gw - c.s(16.0), lh), Paint::Section(s.kind.title().into())));
+                items.push(Item::new(Rect::new(left, y + c.s(26.0), content_w - gw - c.s(16.0), lh), Paint::Section(s.title.clone())));
                 if gw > 0 {
                     items.push(Item::new(Rect::new(right - gw, y + c.s(26.0) + (lh - c.line_height(F_LABEL)) / 2, gw, c.line_height(F_LABEL)), Paint::SectionGb(gb)));
                 }
@@ -1065,9 +1525,10 @@ impl DoctorWindow {
             }
         }
         y += c.s(24.0);
-        self.scroll.content = y - top + c.s(28.0);
+        self.scroll.content = y - top;
         self.scroll.clamp();
         self.items = items;
+        self.head_n = head_n;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1093,10 +1554,8 @@ impl DoctorWindow {
                 if f.ram_mb > 0 { format!("Starts every time you sign in. Uses about {}.", gb) } else { "Starts every time you sign in.".to_string() },
             ),
             SectionKind::Unreal => (gb.clone(), f.detail.clone()),
-            SectionKind::Disk => (
-                f.disk.as_ref().map(|d| format!("{} · frees {} (predicted)", d.volume, d.frees_words())).unwrap_or_default(),
-                f.detail.clone(),
-            ),
+            // The section header names the drive.
+            SectionKind::Disk => (f.disk.as_ref().map(|d| format!("frees {} (predicted)", d.frees_words())).unwrap_or_default(), f.detail.clone()),
             SectionKind::ThisPc => (String::new(), f.detail.clone()),
         };
         let hint_lines = if hint.is_empty() { Vec::new() } else { wrap_hard(c, &hint, F_HINT, text_w, 2) };
@@ -1184,17 +1643,21 @@ impl DoctorWindow {
         h
     }
 
-    /// Footer pieces: (text rect, undo link rect, clean-up button rect).
+    fn undo_shown(&self) -> bool {
+        self.can_undo[self.tab.index()] && !self.working
+    }
+
+    /// Footer pieces: (text rect, undo link rect, the tab's button rect).
     pub fn footer_layout(&self, c: &Canvas) -> (Rect, Option<Rect>, Rect) {
         let fh = Self::footer_h(c);
         let y = c.height() - fh;
         let w = c.width();
         let pad = c.s(32.0);
-        let b = Button::new("CLEAN UP", ButtonStyle::Primary);
+        let b = Button::new(self.tab.button(), ButtonStyle::Primary);
         let (bw, bh) = b.size(c);
         let bw = bw + c.s(16.0);
         let br = Rect::new(w - pad - bw, y + (fh - bh) / 2, bw, bh);
-        let undo = if self.can_undo && !self.working {
+        let undo = if self.undo_shown() {
             let lw = c.measure("Undo last cleanup", F_HINT).0 + c.s(2.0);
             let lh = c.line_height(F_HINT);
             Some(Rect::new(br.x - c.s(20.0) - lw, y + (fh - lh) / 2, lw, lh))
@@ -1205,29 +1668,30 @@ impl DoctorWindow {
         (tr, undo, br)
     }
 
-    fn footer_text(&self) -> String {
+    /// The showing tab's running total; empty while it is checking or has nothing to check.
+    pub fn footer_text(&self) -> String {
         match &self.model {
-            Some(m) if !self.scanning && (0..m.rows.len()).any(|i| m.selectable(i)) => {
-                let drive = m.disk_rows().len();
-                let mem = (0..m.rows.len()).any(|i| m.rows[i].checked && m.selectable(i) && m.report.findings[i].kind != FindingKind::Disk);
-                match (mem || drive == 0, drive) {
-                    (true, 0) => format!("Selected: frees about {:.1} GB", m.selected_gb()),
-                    (true, n) => format!("Selected: frees about {:.1} GB of memory · {} drive item{}", m.selected_gb(), n, if n == 1 { "" } else { "s" }),
-                    (false, n) => format!("Selected: {} drive item{} (frees are listed before anything runs)", n, if n == 1 { "" } else { "s" }),
-                }
-            }
+            Some(m) if !self.tab_busy() && m.has_selectable(self.tab) => match self.tab {
+                Tab::Memory => memory_footer_words(m.selected_gb()),
+                Tab::Disk => disk_footer_words(&m.disk_selection()),
+            },
             _ => String::new(),
         }
     }
 
     fn can_clean(&self) -> bool {
-        !self.working && !self.scanning && self.model.as_ref().map(|m| m.any_checked()).unwrap_or(false)
+        !self.working && !self.tab_busy() && self.model.as_ref().map(|m| m.any_checked(self.tab)).unwrap_or(false)
     }
 
     // ------------------------------------------------------------ painting
 
+    /// Is `p` where `r` shows: the header for header items, the scrolling view for the rest.
+    fn shows_at(&self, r: Rect, p: Pt) -> bool {
+        r.contains(p) && (self.scroll.view.contains(p) || (self.head.contains(p) && r.bottom() <= self.head.bottom()))
+    }
+
     fn state_for(&self, act: Option<Act>, r: Rect) -> WState {
-        let over = self.confirm.is_none() && act.is_some() && self.mouse.map(|m| r.contains(m) && self.scroll.view.contains(m)).unwrap_or(false);
+        let over = self.confirm.is_none() && act.is_some() && self.mouse.map(|m| self.shows_at(r, m)).unwrap_or(false);
         WState { hover: over, pressed: over && self.pressed == act, focused: act.is_some() && self.focus == act, disabled: false, mouse: if over { self.mouse } else { None } }
     }
 
@@ -1245,6 +1709,7 @@ impl DoctorWindow {
             Paint::Result(s) => c.text(r, s, F_RESULT, ACCENT, Align::Right),
             Paint::Caption(s) => c.spaced_text(r, s, F_CAPTION, ACCENT, c.s(1.3), Align::Right),
             Paint::Link { label, color } => paint_link(c, r, label, F_HINT, *color, &st),
+            Paint::Tab { label, count, active } => paint_tab(c, r, label, *count, *active, &st),
             Paint::Section(s) => c.spaced_text(r, s, F_SECTION, ACCENT, c.s(3.1), Align::Left),
             Paint::SectionGb(s) => c.text(r, s, F_LABEL, TEXT_DIM, Align::Right),
             Paint::Hairline(col) => c.fill_rect(r, *col),
@@ -1298,9 +1763,15 @@ impl DoctorWindow {
                     c.text_top(Rect::new(r.x, r.y + k as i32 * hh, r.w, hh), line, F_HINT, *color, Align::Right);
                 }
             }
-            Paint::Checking => {
+            Paint::Info { lines, color } => {
+                let hh = c.line_height(F_HINT);
+                for (k, line) in lines.iter().enumerate() {
+                    c.text_top(Rect::new(r.x, r.y + k as i32 * hh, r.w, hh), line, F_HINT, *color, Align::Left);
+                }
+            }
+            Paint::Checking(what) => {
                 let th = c.line_height(F_BODY);
-                c.text(Rect::new(r.x, r.y, r.w, th), "Checking…", F_BODY, TEXT_DIM, Align::Left);
+                c.text(Rect::new(r.x, r.y, r.w, th), what, F_BODY, TEXT_DIM, Align::Left);
                 indeterminate_bar(c, Rect::new(r.x, r.y + th + c.s(12.0), r.w, c.s(3.0).max(2)), self.anim);
             }
             Paint::Message(lines) => {
@@ -1308,6 +1779,11 @@ impl DoctorWindow {
                 for (k, l) in lines.iter().enumerate() {
                     c.text(Rect::new(r.x, r.y + k as i32 * lh, r.w, lh), l, F_BODY, TEXT_DIM, Align::Left);
                 }
+            }
+            Paint::Button(label) => {
+                let mut st = st;
+                st.disabled = self.working;
+                Button::new(label, ButtonStyle::Normal).paint(c, r, &st);
             }
         }
     }
@@ -1328,13 +1804,14 @@ impl DoctorWindow {
             paint_link(c, u, "Undo last cleanup", F_HINT, MUTED, &self.state_for(Some(Act::Undo), u));
         }
         let enabled = self.can_clean();
+        let label = self.tab.button();
         let mut st = self.state_for(Some(Act::CleanUp), br);
         if enabled {
-            Button::new("CLEAN UP", ButtonStyle::Primary).paint(c, br, &st);
+            Button::new(label, ButtonStyle::Primary).paint(c, br, &st);
         } else {
             st.disabled = true;
             st.hover = false;
-            Button::new("CLEAN UP", ButtonStyle::Normal).paint(c, br, &st);
+            Button::new(label, ButtonStyle::Normal).paint(c, br, &st);
         }
     }
 
@@ -1380,10 +1857,14 @@ impl DoctorWindow {
         if undo.map(|u| u.contains(p)).unwrap_or(false) {
             return Some(Act::Undo);
         }
+        let n = self.head_n.min(self.items.len());
+        if self.head.contains(p) {
+            return self.items[..n].iter().rev().find(|i| i.act.is_some() && i.rect.contains(p)).and_then(|i| i.act);
+        }
         if !self.scroll.view.contains(p) {
             return None;
         }
-        self.items.iter().rev().find(|i| i.act.is_some() && i.rect.contains(p)).and_then(|i| i.act)
+        self.items[n..].iter().rev().find(|i| i.act.is_some() && i.rect.contains(p)).and_then(|i| i.act)
     }
 
     /// The checkbox of the row under `p` (clicking anywhere on a row toggles it).
@@ -1397,6 +1878,7 @@ impl DoctorWindow {
 
     pub fn activate(&mut self, a: Act, host: &mut Host) {
         match a {
+            Act::Tab(t) => self.set_tab(t),
             Act::Check(i) => {
                 if let Some(m) = self.model.as_mut() {
                     m.toggle(i);
@@ -1423,22 +1905,19 @@ impl DoctorWindow {
             }
             Act::CheckAgain => {
                 if !self.working {
-                    self.scan(Some(host));
+                    self.scan_for(Some(self.tab), Some(host));
                 }
             }
+            Act::DiskCheckup => self.disk_checkup(Some(host)),
             Act::CleanUp => self.clean_up(Some(host)),
-            Act::Undo => {
-                if self.can_undo && !self.working {
-                    self.undo(Some(host));
-                }
-            }
+            Act::Undo => self.undo(Some(host)),
         }
         host.invalidate();
     }
 
     fn focusables(&self) -> Vec<Act> {
         let mut out: Vec<Act> = self.items.iter().filter_map(|i| i.act).collect();
-        if self.can_undo && !self.working {
+        if self.undo_shown() {
             out.push(Act::Undo);
         }
         if self.can_clean() {
@@ -1449,19 +1928,48 @@ impl DoctorWindow {
 
     fn confirm_ok(&mut self, host: &mut Host) {
         match self.confirm.take() {
-            Some(Confirm::Disk(_)) => {
-                // Ending processes still gets its own question.
-                let ending = self.model.as_ref().map(|m| m.ending_rows()).unwrap_or_default();
-                if ending.is_empty() {
-                    self.run_clean_up(Some(host));
-                } else {
-                    self.confirm = Some(Confirm::CleanUp(ending));
-                }
-            }
+            Some(Confirm::Disk(_)) => self.run_clean_up(Tab::Disk, Some(host)),
             Some(Confirm::End(i)) => self.end_anyway(i, Some(host)),
-            Some(Confirm::CleanUp(_)) => self.run_clean_up(Some(host)),
+            Some(Confirm::CleanUp(_)) => self.run_clean_up(Tab::Memory, Some(host)),
             None => {}
         }
+    }
+}
+
+/// A tab's width: its title and, when there is one, the count badge.
+fn tab_width(c: &Canvas, label: &str, count: Option<usize>) -> i32 {
+    let pad = c.s(12.0);
+    let badge = count.map_or(0, |n| c.s(8.0) + badge_width(c, n));
+    pad + c.measure(label, F_GROUP).0 + badge + pad
+}
+
+fn badge_width(c: &Canvas, n: usize) -> i32 {
+    (c.measure(&n.to_string(), F_HINT).0 + c.s(12.0)).max(c.s(22.0))
+}
+
+/// One tab of the strip: the title (TEXT when showing, MUTED otherwise), a count badge, and a
+/// lime underline under the showing one.
+fn paint_tab(c: &mut Canvas, r: Rect, label: &str, count: Option<usize>, active: bool, st: &WState) {
+    let pad = c.s(12.0);
+    if st.hover && !active {
+        c.fill_round_rect(r.inset(0, c.s(3.0)), c.s(RADIUS), SELECTED);
+    }
+    let lw = c.measure(label, F_GROUP).0;
+    let col = if active { TEXT } else if st.hover { TEXT_DIM } else { MUTED };
+    c.text(Rect::new(r.x + pad, r.y, lw + c.s(2.0), r.h), label, F_GROUP, col, Align::Left);
+    if let Some(n) = count {
+        let bw = badge_width(c, n);
+        let bh = c.s(18.0);
+        let b = Rect::new(r.x + pad + lw + c.s(8.0), r.cy() - bh / 2, bw, bh);
+        c.fill_round_rect(b, bh / 2, if active { ACCENT } else { RAISED });
+        c.text(b, &n.to_string(), F_HINT, if active { ON_ACCENT } else { MUTED }, Align::Center);
+    }
+    if active {
+        let uh = c.s(2.0).max(2);
+        c.fill_rect(Rect::new(r.x, r.bottom() - uh, r.w, uh), ACCENT);
+    }
+    if st.focused {
+        super::kit::focus_ring(c, r.inset(0, c.s(3.0)), c.s(RADIUS));
     }
 }
 
@@ -1472,15 +1980,19 @@ impl Surface for DoctorWindow {
         self.layout(c);
         c.fill_rect(c.bounds(), BG);
         let view = self.scroll.view;
-        c.push_clip(view);
         let items = std::mem::take(&mut self.items);
-        for it in &items {
+        let n = self.head_n.min(items.len());
+        c.push_clip(view);
+        for it in &items[n..] {
             if it.rect.intersects(&view) {
                 self.paint_item(c, it);
             }
         }
-        self.items = items;
         c.pop_clip();
+        for it in &items[..n] {
+            self.paint_item(c, it);
+        }
+        self.items = items;
         self.scroll.paint(c, false);
         self.paint_footer(c);
         if let Some(d) = self.dialog() {
@@ -1505,6 +2017,14 @@ impl Surface for DoctorWindow {
             Event::Timer(TIMER_ANIM) => {
                 self.anim = (self.anim + 0.012).rem_euclid(1.0);
                 self.poll(host);
+                host.invalidate();
+            }
+            Event::Timer(TIMER_TAB_MEMORY) => {
+                self.set_tab(Tab::Memory);
+                host.invalidate();
+            }
+            Event::Timer(TIMER_TAB_DISK) => {
+                self.set_tab(Tab::Disk);
                 host.invalidate();
             }
             Event::MouseMove(p) => {
@@ -1572,6 +2092,19 @@ impl Surface for DoctorWindow {
                     VK_ESCAPE => host.close(),
                     0x57 if m.ctrl => host.close(),
                     VK_F5 => self.activate(Act::CheckAgain, host),
+                    // Ctrl+Tab and Ctrl+Shift+Tab switch tabs (two tabs: both go to the other).
+                    VK_TAB if m.ctrl => {
+                        let next = self.tab.next();
+                        self.set_tab(next);
+                        host.invalidate();
+                    }
+                    // Left and Right on a focused tab move to the other tab and show it.
+                    VK_LEFT | VK_RIGHT if matches!(self.focus, Some(Act::Tab(_))) => {
+                        let next = self.tab.next();
+                        self.set_tab(next);
+                        self.focus = Some(Act::Tab(next));
+                        host.invalidate();
+                    }
                     VK_TAB => {
                         let list = self.focusables();
                         if !list.is_empty() {
@@ -1584,7 +2117,8 @@ impl Surface for DoctorWindow {
                                 (Some(i), true) => (i + n - 1) % n,
                             };
                             self.focus = Some(list[next]);
-                            if let Some(r) = self.items.iter().find(|it| it.act == Some(list[next])).map(|it| it.rect) {
+                            let content = self.items.iter().skip(self.head_n).find(|it| it.act == Some(list[next])).map(|it| it.rect);
+                            if let Some(r) = content {
                                 self.scroll.reveal(r, (self.scale.0 * 24.0) as i32);
                             }
                         }
@@ -1608,6 +2142,9 @@ impl Surface for DoctorWindow {
                 if let Some(r) = host.window_rect() {
                     let _ = super::ui_state::save(KIND, r);
                 }
+                if self.hwnd != 0 {
+                    let _ = super::ui_state::save_str(KIND, "tab", self.tab.key());
+                }
             }
             _ => return false,
         }
@@ -1615,15 +2152,25 @@ impl Surface for DoctorWindow {
     }
 }
 
-/// Open the checkup window (it scans right away), or bring the open one to the front.
-/// Call on the UI thread. `commands` receives what rows ask for ("Show me how").
-pub fn open_doctor(source: Box<dyn DoctorSource>, commands: Box<dyn Fn(Command)>) -> HWND {
+/// The tab the window showed last time (ui-state.toml `[doctor] tab`).
+pub fn last_tab() -> Option<Tab> {
+    super::ui_state::load_str(KIND, "tab").as_deref().and_then(Tab::from_key)
+}
+
+/// Open the checkup window on `tab` (the last one shown when `None`; it scans right away), or
+/// bring the open one to the front and show `tab` there. Call on the UI thread. `commands`
+/// receives what rows ask for ("Show me how").
+pub fn open_doctor(source: Box<dyn DoctorSource>, commands: Box<dyn Fn(Command)>, tab: Option<Tab>) -> HWND {
     if let Some(h) = window::find(KIND) {
         window::bring_to_front(h);
+        if let Some(t) = tab {
+            wake(h as isize, if t == Tab::Disk { TIMER_TAB_DISK } else { TIMER_TAB_MEMORY });
+        }
         return h;
     }
+    let tab = tab.or_else(last_tab).unwrap_or_default();
     let spec = WindowSpec { kind: KIND, title: TITLE.into(), size: (760, 720), min_size: (620, 480), placement: super::ui_state::load(KIND), resizable: true };
-    window::open(spec, Box::new(DoctorWindow::new(source).with_commands(commands)))
+    window::open(spec, Box::new(DoctorWindow::new(source).with_commands(commands).with_tab(tab)))
 }
 
 /// Paint the window at `w` (96-DPI px) wide and `h` high, or the whole page with `h == None`.
@@ -1634,7 +2181,7 @@ pub fn render(win: &mut DoctorWindow, scale: Scale, w: i32, h: Option<i32>) -> C
         None => {
             let probe = Canvas::new(pw, scale.s(720.0), scale);
             win.layout(&probe);
-            win.scroll.content + DoctorWindow::footer_h(&probe)
+            win.head.h + win.scroll.content + DoctorWindow::footer_h(&probe)
         }
     };
     let mut c = Canvas::new(pw, ph, scale);
@@ -1654,22 +2201,138 @@ mod tests {
         m.report.findings.iter().position(|f| f.id == id).unwrap()
     }
 
+    fn ids(m: &DoctorModel, s: &Section) -> Vec<String> {
+        s.rows.iter().map(|&i| m.report.findings[i].id.clone()).collect()
+    }
+
     #[test]
     fn sections_follow_the_spec_order_and_hide_empty_ones() {
         let m = model();
-        let kinds: Vec<SectionKind> = m.sections().iter().map(|s| s.kind).collect();
-        assert_eq!(kinds, SectionKind::ORDER.to_vec());
-        let not_needed = &m.sections()[0];
+        let mem = m.sections(Tab::Memory);
+        let kinds: Vec<SectionKind> = mem.iter().map(|s| s.kind).collect();
+        assert_eq!(kinds, SectionKind::ORDER.iter().copied().filter(|k| *k != SectionKind::Disk).collect::<Vec<_>>(), "no drive section on Memory");
+        let not_needed = &mem[0];
+        assert_eq!(not_needed.title, "NOT NEEDED FOR UNREAL");
         assert_eq!(not_needed.rows.len(), 5);
         assert_eq!(not_needed.ram_mb, 1270 + 980 + 640 + 410 + 560);
-        assert_eq!(m.sections()[7].kind, SectionKind::ThisPc);
-        assert_eq!(m.sections()[7].ram_mb, 0, "THIS PC shows no memory");
-        assert_eq!(m.sections()[6].kind, SectionKind::Disk);
-        assert_eq!(m.sections()[6].ram_mb, 0, "drive rows show no memory");
+        let this_pc = mem.last().unwrap();
+        assert_eq!(this_pc.kind, SectionKind::ThisPc);
+        assert_eq!(this_pc.ram_mb, 0, "THIS PC shows no memory");
+        assert_eq!(ids(&m, this_pc), ["sys:pagefile", "sys:ram"], "only the RAM-side notices");
+
+        // Disk space: one section per drive in letter order, then the drive notices.
+        let disk = m.sections(Tab::Disk);
+        let titles: Vec<&str> = disk.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, ["ON C:", "ON D:", "THIS PC"]);
+        assert_eq!(ids(&m, &disk[0]), ["disk:d3"]);
+        assert_eq!(ids(&m, &disk[1]), ["disk:d1", "disk:d2"]);
+        assert_eq!(ids(&m, &disk[2]), ["disk:low:d", "dev:perf_mode_off"]);
+        assert!(disk.iter().all(|s| s.ram_mb == 0), "drive rows show no memory");
+
         let clear = DoctorModel::new(FakeDoctor::report(true));
-        assert!(clear.sections().is_empty());
-        assert!(clear.all_clear());
-        assert!(!m.all_clear());
+        assert!(clear.sections(Tab::Memory).is_empty() && clear.sections(Tab::Disk).is_empty());
+        assert!(clear.all_clear(Tab::Memory) && clear.all_clear(Tab::Disk));
+        assert!(!m.all_clear(Tab::Memory) && !m.all_clear(Tab::Disk));
+    }
+
+    #[test]
+    fn each_finding_goes_to_one_tab_by_where_it_came_from() {
+        let m = model();
+        let tab = |id: &str| tab_of(&m.report.findings[idx(&m, id)]);
+        for id in ["app:steam", "startup:hkcu:Steam", "startup:hklm:iCUE", "app:blender", "app:nwsync", "app:discord", "ue:orphans", "sys:pagefile", "sys:ram"] {
+            assert_eq!(tab(id), Tab::Memory, "{}", id);
+        }
+        for id in ["disk:d1", "disk:d2", "disk:d3", "disk:low:d", "dev:perf_mode_off"] {
+            assert_eq!(tab(id), Tab::Disk, "{}", id);
+        }
+        // By origin, not by the words: a THIS PC row without the drive mark stays on Memory
+        // whatever its title says, and one with it goes to Disk space.
+        let mut f = m.report.findings[idx(&m, "sys:pagefile")].clone();
+        f.title = "Your Dev Drive is almost full".into();
+        assert_eq!(tab_of(&f), Tab::Memory);
+        f.drive_notice = true;
+        assert_eq!(tab_of(&f), Tab::Disk);
+        // Every row is on exactly one tab, and the counts add up to every row shown.
+        let shown = m.report.findings.iter().filter(|f| section_of(f).is_some()).count();
+        assert_eq!(m.count(Tab::Memory) + m.count(Tab::Disk), shown);
+        assert_eq!(m.count(Tab::Disk), 5);
+        assert_eq!(m.count(Tab::Memory), shown - 5);
+        for i in 0..m.rows.len() {
+            assert!(m.in_tab(i, Tab::Memory) != m.in_tab(i, Tab::Disk));
+        }
+    }
+
+    #[test]
+    fn totals_and_picks_stay_on_their_tab() {
+        let mut m = model();
+        let (build, npm, steam) = (idx(&m, "disk:d1"), idx(&m, "disk:d3"), idx(&m, "app:steam"));
+        let mem_gb = m.selected_gb();
+        let mem_picks = m.picks(Tab::Memory);
+        assert!(!m.any_checked(Tab::Disk), "nothing on the drives starts checked");
+        m.toggle(build);
+        m.toggle(npm);
+        // Checking drive rows changes nothing on Memory.
+        assert_eq!(m.selected_gb(), mem_gb);
+        assert_eq!(m.picks(Tab::Memory), mem_picks);
+        assert_eq!(m.picks(Tab::Disk), vec![("disk:d1".to_string(), ActionKind::DiskNow), ("disk:d3".to_string(), ActionKind::DiskNow)]);
+        assert!(m.picks(Tab::Memory).iter().all(|(id, _)| !id.starts_with("disk:")));
+        assert!(m.picks(Tab::Disk).iter().all(|(id, _)| id.starts_with("disk:")));
+        assert!(m.ending_rows().iter().all(|&i| m.in_tab(i, Tab::Memory)));
+        assert_eq!(m.disk_rows(), vec![build, npm]);
+        // Running one tab leaves the other's checks alone.
+        let picks = m.begin_apply(Tab::Disk);
+        assert_eq!(picks.len(), 2);
+        assert!(m.rows[steam].checked && !m.rows[steam].busy, "Memory picks stay checked");
+        assert!(m.rows[build].busy && !m.rows[build].checked);
+        assert_eq!(m.picks(Tab::Memory), mem_picks);
+    }
+
+    #[test]
+    fn footer_words_per_tab() {
+        assert_eq!(memory_footer_words(1680.0 / 1024.0), "Selected: frees about 1.6 GB of RAM");
+        assert_eq!(memory_footer_words(0.0), "Selected: frees about 0.0 GB of RAM");
+        let row = |v: &str, gb: Option<f64>| DiskRow { volume: v.into(), frees_gb: gb, confidence: "exact".into() };
+        assert_eq!(disk_footer_words(&[]), "Selected: nothing yet");
+        assert_eq!(disk_footer_words(&[(ActionKind::DiskNow, row("D:", Some(16.4)))]), "Selected: frees about 16.4 GB on D: (predicted)");
+        // Per drive, drives in letter order; a tool's clean counts, bin moves don't.
+        assert_eq!(
+            disk_footer_words(&[
+                (ActionKind::DiskNow, row("D:", Some(16.4))),
+                (ActionKind::DiskTool, row("C:", Some(3.1))),
+                (ActionKind::DiskNow, row("d:", Some(1.6))),
+            ]),
+            "Selected: frees about 3.1 GB on C: and about 18.0 GB on D: (predicted)"
+        );
+        assert_eq!(
+            disk_footer_words(&[(ActionKind::DiskNow, row("D:", Some(16.4))), (ActionKind::DiskBin, row("D:", Some(0.4)))]),
+            "Selected: frees about 16.4 GB on D: (predicted) · 1 item to the bin"
+        );
+        assert_eq!(
+            disk_footer_words(&[(ActionKind::DiskBin, row("D:", Some(0.4))), (ActionKind::DiskBin, row("C:", Some(2.0)))]),
+            "Selected: 2 items to the bin (frees nothing until it's emptied)"
+        );
+        // Not measured: never a made-up number.
+        assert_eq!(disk_footer_words(&[(ActionKind::DiskNow, row("E:", None))]), "Selected: frees an unknown amount on E: (predicted)");
+        assert_eq!(
+            disk_footer_words(&[(ActionKind::DiskNow, row("E:", None)), (ActionKind::DiskNow, row("E:", Some(2.0)))]),
+            "Selected: frees at least 2.0 GB on E: (predicted)"
+        );
+
+        // The window says the showing tab's total, with its own button.
+        let mut w = DoctorWindow::new(Box::new(FakeDoctor::new()));
+        w.scan(None);
+        assert_eq!(w.footer_text(), "Selected: frees about 1.6 GB of RAM");
+        assert_eq!(w.tab().button(), "FREE MEMORY");
+        w.set_tab(Tab::Disk);
+        assert_eq!(w.footer_text(), "Selected: nothing yet");
+        assert_eq!(w.tab().button(), "FREE DISK SPACE");
+        let m = w.model.as_mut().unwrap();
+        let (build, npm) = (idx(m, "disk:d1"), idx(m, "disk:d3"));
+        m.toggle(build);
+        m.toggle(npm);
+        assert_eq!(w.footer_text(), "Selected: frees about 3.1 GB on C: and about 16.4 GB on D: (predicted)");
+        w.set_tab(Tab::Memory);
+        assert_eq!(w.footer_text(), "Selected: frees about 1.6 GB of RAM", "drive picks never count as RAM");
     }
 
     #[test]
@@ -1694,7 +2357,9 @@ mod tests {
         m.toggle(admin);
         m.toggle(sys);
         assert!(!m.rows[admin].checked && !m.rows[sys].checked);
-        assert!(m.picks().iter().all(|(id, _)| id != "startup:hklm:iCUE" && id != "sys:pagefile"));
+        assert!(m.picks(Tab::Memory).iter().all(|(id, _)| id != "startup:hklm:iCUE" && id != "sys:pagefile"));
+        let notice = idx(&m, "disk:low:d");
+        assert!(!m.selectable(notice), "drive notices are notes, never picks");
     }
 
     #[test]
@@ -1710,13 +2375,13 @@ mod tests {
         let spotify = idx(&m, "app:spotify");
         m.toggle(spotify);
         m.set_choice(spotify, 1);
-        assert!(m.picks().contains(&("app:spotify".into(), ActionKind::BlockWhileUnreal)));
-        assert!(m.picks().contains(&("app:spotify".into(), ActionKind::Close)));
+        assert!(m.picks(Tab::Memory).contains(&("app:spotify".into(), ActionKind::BlockWhileUnreal)));
+        assert!(m.picks(Tab::Memory).contains(&("app:spotify".into(), ActionKind::Close)));
         // Unchecking everything: nothing to clean up.
         for i in 0..m.rows.len() {
             m.rows[i].checked = false;
         }
-        assert!(!m.any_checked());
+        assert!(!m.any_checked(Tab::Memory));
         assert_eq!(m.selected_gb(), 0.0);
     }
 
@@ -1738,7 +2403,7 @@ mod tests {
         let mut m = model();
         let spotify = idx(&m, "app:spotify");
         m.toggle(spotify);
-        let picks = m.begin_apply();
+        let picks = m.begin_apply(Tab::Memory);
         assert!(m.rows.iter().enumerate().all(|(i, r)| r.busy == picks.iter().any(|(id, _)| *id == m.report.findings[i].id)));
         let fake = FakeDoctor::new();
         m.apply_outcomes(fake.apply(&picks, false));
@@ -1765,9 +2430,9 @@ mod tests {
         let mut host = Host::detached((760, 720), Scale(1.0));
         w.scan(None);
         assert!(w.model.is_some() && !w.is_scanning());
-        assert!(!w.can_undo);
+        assert_eq!(w.can_undo, [false, false]);
         w.activate(Act::CleanUp, &mut host);
-        assert!(w.can_undo);
+        assert_eq!(w.can_undo, [true, false], "a memory cleanup undoes on Memory only");
         let m = w.model.as_ref().unwrap();
         assert!(m.rows.iter().any(|r| !r.outcomes.is_empty()));
         // Spotify wasn't checked, so nothing is still open; check it and clean up again.
@@ -1781,7 +2446,7 @@ mod tests {
         w.confirm_ok(&mut host);
         assert!(!w.model.as_ref().unwrap().still_open(spotify));
         w.activate(Act::Undo, &mut host);
-        assert!(!w.can_undo);
+        assert!(!w.can_undo[0]);
         assert_eq!(w.model.as_ref().unwrap().rows.iter().filter(|r| !r.outcomes.is_empty()).count(), 0, "undo re-scans");
     }
 
@@ -1844,7 +2509,7 @@ mod tests {
         assert_eq!((d.ok.label.as_str(), d.cancel.label.as_str()), ("End them", "Cancel"));
         let m = w.model.as_ref().unwrap();
         assert!(m.rows.iter().all(|r| r.outcomes.is_empty() && !r.busy), "nothing ran before the answer");
-        assert!(!w.can_undo);
+        assert!(!w.can_undo[0]);
 
         // Cancel (Enter is Cancel, the focused default; Esc too): nothing ran, the picks stay.
         w.event(Event::Key(VK_RETURN, Default::default()), &mut host);
@@ -1865,7 +2530,7 @@ mod tests {
         assert_eq!(outcome_text(&m.rows[icue].outcomes).0, "Ended");
         assert_eq!(outcome_text(&m.rows[orphans].outcomes).0, "Ended 3 helpers");
         assert_eq!(outcome_text(&m.rows[steam].outcomes).0, "Closed");
-        assert!(w.can_undo);
+        assert!(w.can_undo[0]);
     }
 
     #[test]
@@ -1887,6 +2552,10 @@ mod tests {
         m.toggle(logs);
         m.toggle(npm);
         m.set_choice(npm, 2);
+        // On the Memory tab FREE MEMORY has nothing to run: the drive rows are another tab's.
+        w.activate(Act::CleanUp, &mut host);
+        assert_eq!(w.confirm, None);
+        w.activate(Act::Tab(Tab::Disk), &mut host);
         w.activate(Act::CleanUp, &mut host);
         assert_eq!(w.confirm, Some(Confirm::Disk(vec![build, logs, npm])));
         let d = w.dialog().unwrap();
@@ -1909,7 +2578,7 @@ mod tests {
         let m = w.model.as_ref().unwrap();
         assert_eq!(outcome_text(&m.rows[build].outcomes).0, "Deleted · frees 16.4 GB (predicted); measured later");
         assert_eq!(outcome_text(&m.rows[logs].outcomes).0, "Moved to the bin · frees nothing until it's emptied");
-        assert!(w.can_undo);
+        assert_eq!(w.can_undo, [false, true], "the bin moves undo on Disk space only");
         // Only bin moves: the confirmation says so and offers the bin.
         let (t, b, ok) = disk_confirm_words(&[("Logs", ActionKind::DiskBin, &DiskRow::default(), "")]);
         assert_eq!(t, "Clean up 1 item on your drives?");
@@ -1918,21 +2587,174 @@ mod tests {
     }
 
     #[test]
-    fn drive_rows_and_ending_both_ask() {
+    fn memory_and_drive_picks_never_run_together() {
         let mut w = DoctorWindow::new(Box::new(FakeDoctor::new()));
         let mut host = Host::detached((760, 720), Scale(1.0));
         w.scan(None);
         let m = w.model.as_mut().unwrap();
-        let (build, orphans) = (idx(m, "disk:d1"), idx(m, "ue:orphans"));
+        let (build, orphans, steam) = (idx(m, "disk:d1"), idx(m, "ue:orphans"), idx(m, "app:steam"));
         m.toggle(build);
         m.toggle(orphans);
+        // FREE MEMORY: only the memory question, only memory rows run.
+        w.activate(Act::CleanUp, &mut host);
+        assert_eq!(w.confirm, Some(Confirm::CleanUp(vec![orphans])));
+        w.confirm_ok(&mut host);
+        let m = w.model.as_ref().unwrap();
+        assert!(!m.rows[orphans].outcomes.is_empty() && !m.rows[steam].outcomes.is_empty());
+        assert!(m.rows[build].outcomes.is_empty() && m.rows[build].checked, "the drive row didn't run and is still checked");
+        assert_eq!(w.can_undo, [true, false]);
+        // FREE DISK SPACE: only the drive question, only the drive row runs.
+        w.set_tab(Tab::Disk);
         w.activate(Act::CleanUp, &mut host);
         assert_eq!(w.confirm, Some(Confirm::Disk(vec![build])));
         w.confirm_ok(&mut host);
-        assert_eq!(w.confirm, Some(Confirm::CleanUp(vec![orphans])), "ending still gets its own question");
-        assert!(w.model.as_ref().unwrap().rows.iter().all(|r| r.outcomes.is_empty()));
-        w.confirm_ok(&mut host);
+        assert_eq!(w.confirm, None);
         assert!(!w.model.as_ref().unwrap().rows[build].outcomes.is_empty());
+        assert_eq!(w.can_undo, [true, true]);
+        // Undo on Disk space puts the drive cleanup back and leaves Memory's results and undo.
+        w.activate(Act::Undo, &mut host);
+        assert_eq!(w.can_undo, [true, false]);
+        let m = w.model.as_ref().unwrap();
+        assert!(!m.rows[idx(m, "app:steam")].outcomes.is_empty(), "Memory's results stay");
+        assert!(m.rows[idx(m, "disk:d1")].outcomes.is_empty(), "Disk space was scanned again");
+        // Undo on Memory: its own.
+        w.set_tab(Tab::Memory);
+        w.activate(Act::Undo, &mut host);
+        assert_eq!(w.can_undo, [false, false]);
+    }
+
+    #[test]
+    fn undo_link_shows_on_its_own_tab() {
+        let mut w = DoctorWindow::new(Box::new(FakeDoctor::new()));
+        let mut host = Host::detached((760, 720), Scale(1.0));
+        w.scan(None);
+        w.set_tab(Tab::Disk);
+        let m = w.model.as_mut().unwrap();
+        let logs = idx(m, "disk:d2");
+        m.toggle(logs);
+        w.activate(Act::CleanUp, &mut host);
+        w.confirm_ok(&mut host);
+        let c = Canvas::new(760, 720, Scale(1.0));
+        assert!(w.footer_layout(&c).1.is_some(), "Disk space can undo its bin move");
+        assert!(w.focusables().contains(&Act::Undo));
+        w.set_tab(Tab::Memory);
+        assert!(w.footer_layout(&c).1.is_none(), "Memory has nothing to undo");
+        assert!(!w.focusables().contains(&Act::Undo));
+        // Undo on Memory does nothing to the drive cleanup.
+        w.activate(Act::Undo, &mut host);
+        assert_eq!(w.can_undo, [false, true]);
+    }
+
+    #[test]
+    fn disk_tab_without_a_disk_checkup_explains_and_runs_one() {
+        let mut w = DoctorWindow::new(Box::new(FakeDoctor::without_disk_checkup())).with_tab(Tab::Disk);
+        let mut host = Host::detached((760, 720), Scale(1.0));
+        w.scan(None);
+        // Memory picks made before, kept through the disk checkup.
+        let m = w.model.as_mut().unwrap();
+        let spotify = idx(m, "app:spotify");
+        m.toggle(spotify);
+        assert!(m.report.disk_checked.is_none());
+        assert_eq!(m.sections(Tab::Disk).iter().map(|s| s.title.as_str()).collect::<Vec<_>>(), ["THIS PC"], "the drive notices show anyway");
+        let c = Canvas::new(760, 3000, Scale(1.0));
+        w.layout(&c);
+        let msg: Vec<String> = w.items().iter().filter_map(|it| if let Paint::Message(l) = &it.paint { Some(l.join(" ")) } else { None }).collect();
+        assert_eq!(msg, [NO_DISK_CHECKUP.to_string()]);
+        let run = w.items().iter().find(|it| it.act == Some(Act::DiskCheckup)).unwrap();
+        assert_eq!(run.paint, Paint::Button("Run the disk checkup".into()));
+        assert_eq!(w.footer_text(), "", "nothing to pick yet");
+        assert!(!w.items().iter().any(|it| matches!(it.paint, Paint::Result(_))), "no number before a checkup");
+        w.activate(Act::DiskCheckup, &mut host);
+        let m = w.model.as_ref().unwrap();
+        assert_eq!(m.report.disk_checked.as_deref(), Some("2026-11-14 13:40"));
+        assert_eq!(m.sections(Tab::Disk).iter().map(|s| s.title.as_str()).collect::<Vec<_>>(), ["ON C:", "ON D:", "THIS PC"]);
+        assert!(m.rows[idx(m, "app:spotify")].checked, "the Memory tab's checks stay");
+        w.layout(&c);
+        assert!(w.items().iter().any(|it| it.paint == Paint::Result("3 ITEMS".into())));
+        assert!(w.items().iter().any(|it| it.paint == Paint::Link { label: "Count again".into(), color: MUTED }));
+        assert_eq!(w.footer_text(), "Selected: nothing yet");
+    }
+
+    #[test]
+    fn a_failed_disk_checkup_says_why() {
+        struct NoCli(FakeDoctor);
+        impl DoctorSource for NoCli {
+            fn scan(&self) -> Report {
+                self.0.scan()
+            }
+            fn apply(&self, p: &[(String, ActionKind)], f: bool) -> Vec<Outcome> {
+                self.0.apply(p, f)
+            }
+            fn undo_last(&self, t: Tab) -> Vec<Outcome> {
+                self.0.undo_last(t)
+            }
+            fn can_undo(&self, t: Tab) -> bool {
+                self.0.can_undo(t)
+            }
+        }
+        let mut w = DoctorWindow::new(Box::new(NoCli(FakeDoctor::without_disk_checkup()))).with_tab(Tab::Disk);
+        w.scan(None);
+        w.disk_checkup(None);
+        let c = Canvas::new(760, 3000, Scale(1.0));
+        w.layout(&c);
+        assert!(w.items().iter().any(|it| matches!(&it.paint, Paint::Info { lines, color } if *color == ERROR && lines[0].starts_with("The disk checkup didn't run: "))));
+    }
+
+    #[test]
+    fn tabs_switch_by_click_keyboard_and_command() {
+        let mut w = DoctorWindow::new(Box::new(FakeDoctor::new()));
+        let mut host = Host::detached((760, 720), Scale(1.0));
+        w.scan(None);
+        let c = Canvas::new(760, 720, Scale(1.0));
+        w.layout(&c);
+        // The strip: both tabs with their counts, Memory showing.
+        let tabs: Vec<Paint> = w.items().iter().filter(|it| matches!(it.paint, Paint::Tab { .. })).map(|it| it.paint.clone()).collect();
+        let m = w.model.as_ref().unwrap();
+        assert_eq!(
+            tabs,
+            [
+                Paint::Tab { label: "Memory".into(), count: Some(m.count(Tab::Memory)), active: true },
+                Paint::Tab { label: "Disk space".into(), count: Some(5), active: false },
+            ]
+        );
+        // Clicking the tab.
+        w.size = (760, 720);
+        let r = w.items().iter().find(|it| it.act == Some(Act::Tab(Tab::Disk))).unwrap().rect;
+        w.event(Event::MouseDown(Pt::new(r.cx(), r.cy()), MouseButton::Left), &mut host);
+        w.event(Event::MouseUp(Pt::new(r.cx(), r.cy()), MouseButton::Left), &mut host);
+        assert_eq!(w.tab(), Tab::Disk);
+        // Ctrl+Tab.
+        let ctrl = window::Mods { ctrl: true, ..Default::default() };
+        w.event(Event::Key(VK_TAB, ctrl), &mut host);
+        assert_eq!(w.tab(), Tab::Memory);
+        // Tab walks the header in order (Check again, then the tabs); Right shows the other
+        // tab, Enter on a tab shows it.
+        w.focus = None;
+        w.event(Event::Key(VK_TAB, Default::default()), &mut host);
+        assert_eq!(w.focus, Some(Act::CheckAgain));
+        w.event(Event::Key(VK_TAB, Default::default()), &mut host);
+        assert_eq!(w.focus, Some(Act::Tab(Tab::Memory)));
+        w.event(Event::Key(VK_RIGHT, Default::default()), &mut host);
+        assert_eq!((w.tab(), w.focus), (Tab::Disk, Some(Act::Tab(Tab::Disk))));
+        w.focus = Some(Act::Tab(Tab::Memory));
+        w.event(Event::Key(VK_RETURN, Default::default()), &mut host);
+        assert_eq!(w.tab(), Tab::Memory);
+        // The tray asking an open window for a tab.
+        w.event(Event::Timer(TIMER_TAB_DISK), &mut host);
+        assert_eq!(w.tab(), Tab::Disk);
+        w.event(Event::Timer(TIMER_TAB_MEMORY), &mut host);
+        assert_eq!(w.tab(), Tab::Memory);
+        // Switching away cancels an open question (nothing has run).
+        let m = w.model.as_mut().unwrap();
+        let orphans = idx(m, "ue:orphans");
+        m.toggle(orphans);
+        w.activate(Act::CleanUp, &mut host);
+        assert!(w.confirm.is_some());
+        w.set_tab(Tab::Disk);
+        assert_eq!(w.confirm, None);
+        assert!(w.model.as_ref().unwrap().rows[orphans].outcomes.is_empty());
+        assert_eq!(Tab::from_key(Tab::Disk.key()), Some(Tab::Disk));
+        assert_eq!(Tab::from_key("nonsense"), None);
     }
 
     #[test]
@@ -1999,7 +2821,7 @@ mod tests {
         let s = Scale(scale);
         let probe = Canvas::new(s.s(width as f32), s.s(720.0), s);
         w.layout(&probe);
-        let h = w.scroll.content + DoctorWindow::footer_h(&probe);
+        let h = w.head.h + w.scroll.content + DoctorWindow::footer_h(&probe);
         let c = Canvas::new(s.s(width as f32), h, s);
         w.layout(&c);
         let items = w.items().to_vec();
@@ -2022,7 +2844,10 @@ mod tests {
         if let Some(u) = undo {
             assert!(!u.intersects(&br) && !u.intersects(&tr), "{ctx}: undo link");
         }
-        assert!(tr.w >= c.measure("Selected: frees about 10.0 GB", F_VALUE).0, "{ctx}: footer text cut");
+        assert!(tr.w >= c.measure("Selected: frees about 10.0 GB of RAM", F_VALUE).0, "{ctx}: footer text cut");
+        let n = w.head_n;
+        assert!(items[..n].iter().all(|i| i.rect.bottom() <= w.head.bottom()), "{ctx}: header outside its area");
+        assert!(items[n..].iter().all(|i| i.rect.y >= w.head.bottom()), "{ctx}: content under the header at the top");
     }
 
     #[test]
@@ -2038,6 +2863,12 @@ mod tests {
         w.paint(&mut c);
         w.clean_up(None);
         w.paint(&mut c);
+        w.set_tab(Tab::Disk);
+        w.paint(&mut c);
+        let mut none = DoctorWindow::new(Box::new(FakeDoctor::without_disk_checkup())).with_tab(Tab::Disk);
+        none.paint(&mut c);
+        none.scan(None);
+        none.paint(&mut c);
     }
 
     #[test]
@@ -2052,9 +2883,23 @@ mod tests {
                 w.model.as_mut().unwrap().toggle(spotify);
                 w.clean_up(None);
                 check_layout(&mut w, scale, width, "results");
+                w.set_tab(Tab::Disk);
+                check_layout(&mut w, scale, width, "disk space");
+                let m = w.model.as_mut().unwrap();
+                let (build, npm) = (idx(m, "disk:d1"), idx(m, "disk:d3"));
+                m.toggle(build);
+                m.toggle(npm);
+                w.clean_up(None);
+                w.confirm_ok(&mut Host::detached((width, 720), Scale(scale)));
+                check_layout(&mut w, scale, width, "disk results");
                 let mut clear = DoctorWindow::new(Box::new(FakeDoctor::all_clear()));
                 clear.scan(None);
                 check_layout(&mut clear, scale, width, "all clear");
+                clear.set_tab(Tab::Disk);
+                check_layout(&mut clear, scale, width, "disk all clear");
+                let mut none = DoctorWindow::new(Box::new(FakeDoctor::without_disk_checkup())).with_tab(Tab::Disk);
+                none.scan(None);
+                check_layout(&mut none, scale, width, "no disk checkup");
             }
         }
     }

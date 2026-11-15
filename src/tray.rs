@@ -129,7 +129,7 @@ pub mod model {
         MenuEntry::Item { label: label.to_string(), accel: String::new(), cmd, checked: false, disabled: false }
     }
 
-    /// The right-click menu (docs/UI.md section 3, plus "Run a checkup" from section 6).
+    /// The right-click menu (docs/UI.md section 3, plus the checkup's two tabs from section 6).
     pub fn menu(v: &TrayView) -> Vec<MenuEntry> {
         let mut m = vec![MenuEntry::Status(status_line(v)), MenuEntry::Separator];
         m.push(MenuEntry::Item { label: "Free memory now".into(), accel: v.hotkey.clone(), cmd: Command::FreeMemory, checked: false, disabled: false });
@@ -143,7 +143,8 @@ pub mod model {
         m.push(MenuEntry::Separator);
         m.push(item("Settings", Command::OpenSettings));
         m.push(item("Memory history", Command::OpenHistory));
-        m.push(item("Run a checkup", Command::OpenDoctor));
+        m.push(item("Free up memory…", Command::OpenDoctor));
+        m.push(item("Free up disk space…", Command::OpenDoctorDisk));
         m.push(MenuEntry::Separator);
         m.push(match (&v.update_version, v.updating) {
             (Some(ver), true) => MenuEntry::Item { label: format!("Updating to version {}…", ver), accel: String::new(), cmd: Command::InstallUpdate, checked: false, disabled: true },
@@ -489,10 +490,11 @@ pub fn open_history_window() {
     crate::ui::history::open_history(Box::new(TrayHistory::default()));
 }
 
-pub fn open_doctor_window() {
+/// The checkup window on `tab` (an open one switches to it).
+pub fn open_doctor_window(tab: crate::ui::doctor::Tab) {
     flyout::close();
     let tray = TRAY_HWND.load(Ordering::SeqCst);
-    crate::ui::doctor::open_doctor(Box::new(RealDoctor::new(tray)), Box::new(post_command));
+    crate::ui::doctor::open_doctor(Box::new(RealDoctor::new(tray)), Box::new(post_command), Some(tab));
 }
 
 /// Write the RAM report page to `path` (atomically, creating the folder).
@@ -639,6 +641,7 @@ impl crate::ui::doctor::DoctorSource for RealDoctor {
             let cfg = crate::doctor::load_config_readonly();
             view.findings.extend(doctor_map::disk_rows(c, cfg.disk().fresh_sec, crate::disk_clean::unix_now()));
         }
+        view.disk_checked = seen.as_ref().map(|c| c.time.clone());
         *self.disk_seen.lock().unwrap() = seen;
         *self.last.lock().unwrap() = Some(r);
         view
@@ -646,7 +649,9 @@ impl crate::ui::doctor::DoctorSource for RealDoctor {
 
     fn apply(&self, picks: &[(String, crate::ui::doctor::ActionKind)], force: bool) -> Vec<crate::ui::doctor::Outcome> {
         let (outs, summary) = self.apply_mapped(picks, force);
-        if self.tray != 0 {
+        // Drive picks change no memory: only a memory cleanup scans again for the hero number.
+        let memory = picks.iter().any(|(id, _)| !id.starts_with("disk:"));
+        if self.tray != 0 && memory {
             // Scan again so the window's hero number goes down; later picks act on this one.
             let fresh = Self::fresh_scan();
             *self.after_apply.lock().unwrap() = Some(fresh.reclaimable_ram_gb);
@@ -658,28 +663,36 @@ impl crate::ui::doctor::DoctorSource for RealDoctor {
         outs
     }
 
-    fn undo_last(&self) -> Vec<crate::ui::doctor::Outcome> {
-        // The newer of the two: the memory cleanup's undo log, or the drive cleanup's bin moves.
-        let files = crate::disk_clean::DiskFiles::default();
-        let disk_run = files.undo_log().latest_undoable_run().map(str::to_string);
-        let mem_log = crate::doctor::UndoLog::load();
-        let mem_run = mem_log.select(true, None).first().map(|(r, _)| mem_log.runs[*r].id.clone());
-        if disk_run.is_some() && disk_run >= mem_run {
-            return crate::disk_clean::undo(&files, None)
+    fn undo_last(&self, tab: crate::ui::doctor::Tab) -> Vec<crate::ui::doctor::Outcome> {
+        match tab {
+            // The drive cleanup's last bin moves.
+            crate::ui::doctor::Tab::Disk => crate::disk_clean::undo(&crate::disk_clean::DiskFiles::default(), None)
                 .iter()
+                // "Nothing to undo" names no item.
+                .filter(|o| !o.id.is_empty())
                 .map(|o| crate::ui::doctor::Outcome {
                     finding_id: format!("disk:{}", o.id),
                     action: crate::ui::doctor::ActionKind::DiskBin,
                     status: if o.result == "undone" { crate::ui::doctor::OutcomeStatus::Done } else { crate::ui::doctor::OutcomeStatus::Failed },
                     message: o.message.clone(),
                 })
-                .collect();
+                .collect(),
+            // The memory cleanup's undo log.
+            crate::ui::doctor::Tab::Memory => crate::doctor::undo(true, None).iter().filter(|o| !o.finding_id.is_empty()).map(doctor_map::outcome_view).collect(),
         }
-        crate::doctor::undo(true, None).iter().filter(|o| !o.finding_id.is_empty()).map(doctor_map::outcome_view).collect()
     }
 
-    fn can_undo(&self) -> bool {
-        crate::doctor::UndoLog::load().can_undo() || crate::disk_clean::DiskFiles::default().undo_log().can_undo()
+    fn can_undo(&self, tab: crate::ui::doctor::Tab) -> bool {
+        match tab {
+            crate::ui::doctor::Tab::Memory => crate::doctor::UndoLog::load().can_undo(),
+            crate::ui::doctor::Tab::Disk => crate::disk_clean::DiskFiles::default().undo_log().can_undo(),
+        }
+    }
+
+    /// `memguard disk checkup` in a hidden child (counting never runs in the tray); it saves
+    /// the checkup the next `scan` reads.
+    fn disk_checkup(&self) -> Result<(), String> {
+        crate::disk_clean::run_cli_json(&["disk", "checkup", "--refresh", "--json"], Duration::from_secs(600)).map(|_| ())
     }
 
     fn reclaimable_after_apply(&self) -> Option<f64> {
@@ -777,6 +790,8 @@ pub mod doctor_map {
             help_url: if f.kind == real::FindingKind::System { help_url(&f.id) } else { None },
             help_command: (f.kind == real::FindingKind::System && real::is_ram_finding(&f.id)).then_some(crate::ui::Command::ShowRamReport),
             disk: None,
+            // The drive side's notices go to the Disk space tab.
+            drive_notice: f.kind == real::FindingKind::System && real::is_drive_finding(&f.id),
         }
     }
 
@@ -866,6 +881,7 @@ pub mod doctor_map {
                 help_url: None,
                 help_command: None,
                 disk: Some(vm::DiskRow { volume: it["volume"].as_str().unwrap_or("").to_string(), frees_gb: it["frees_alone_gb"].as_f64(), confidence: conf }),
+                drive_notice: false,
             });
         }
         out
@@ -926,6 +942,8 @@ pub mod doctor_map {
             findings: r.findings.iter().map(finding_view).collect(),
             reclaimable_ram_gb: r.reclaimable_ram_gb,
             reclaimable_commit_gb: r.reclaimable_commit_gb,
+            // `RealDoctor::scan` fills it from the saved disk checkup.
+            disk_checked: None,
         }
     }
 
@@ -1596,7 +1614,8 @@ fn dispatch(hwnd: HWND, cmd: Command) {
         }
         Command::OpenSettings => open_settings_window(),
         Command::OpenHistory => open_history_window(),
-        Command::OpenDoctor => open_doctor_window(),
+        Command::OpenDoctor => open_doctor_window(crate::ui::doctor::Tab::Memory),
+        Command::OpenDoctorDisk => open_doctor_window(crate::ui::doctor::Tab::Disk),
         Command::UndoDoctor => undo_doctor(),
         Command::EmptyDiskBin => {
             // The person said yes on the toast: the CLI empties it (the tray never deletes files).
@@ -2158,7 +2177,8 @@ mod tests {
                 "-",
                 "Settings",
                 "Memory history",
-                "Run a checkup",
+                "Free up memory…",
+                "Free up disk space…",
                 "-",
                 "Check for updates…",
                 "✓ Run at Windows startup",
@@ -2191,6 +2211,7 @@ mod tests {
                 Command::OpenSettings,
                 Command::OpenHistory,
                 Command::OpenDoctor,
+                Command::OpenDoctorDisk,
                 Command::CheckUpdates,
                 Command::ToggleStartup,
                 Command::Quit
@@ -2339,7 +2360,7 @@ mod tests {
 
     #[test]
     fn real_report_maps_onto_the_checkup_window() {
-        use crate::ui::doctor::{self as vm, ActionKind as VA, SectionKind};
+        use crate::ui::doctor::{self as vm, ActionKind as VA, SectionKind, Tab};
         let r = real_report();
         let v = doctor_map::report_view(&r);
         assert_eq!(v.findings.len(), r.findings.len());
@@ -2383,15 +2404,17 @@ mod tests {
 
         // Every section shows, in order, and the window's pre-checks follow `recommended`.
         let m = vm::DoctorModel::new(v.clone());
-        let kinds: Vec<SectionKind> = m.sections().iter().map(|s| s.kind).collect();
+        let kinds: Vec<SectionKind> = m.sections(Tab::Memory).iter().map(|s| s.kind).collect();
         // Drive rows come from the disk checkup, not the memory report.
         assert_eq!(kinds, SectionKind::ORDER.iter().copied().filter(|k| *k != SectionKind::Disk).collect::<Vec<_>>());
-        let picks = m.picks();
+        assert!(m.sections(Tab::Disk).is_empty(), "nothing in the memory report is about the drives");
+        let picks = m.picks(Tab::Memory);
         assert!(picks.contains(&("app:steam".to_string(), VA::Close)));
         assert!(picks.contains(&("startup:hkcu:Steam".to_string(), VA::DisableStartup)));
         assert!(picks.contains(&("app:discord".to_string(), VA::HoldBack)), "held-back rows start checked");
         assert!(!picks.iter().any(|(id, _)| id == "app:spotify" || id == "app:mystery" || id == "app:blender" || id.starts_with("startup:hklm")));
-        assert!(!m.all_clear());
+        assert!(!m.all_clear(Tab::Memory));
+        assert!(m.picks(Tab::Disk).is_empty());
 
         // A paused copy is reported as such.
         let mut paused = r.clone();
