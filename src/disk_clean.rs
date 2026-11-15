@@ -417,6 +417,10 @@ pub struct PathFacts {
     /// Cloud placeholder attributes on the root.
     pub cloud_attrs: bool,
     pub git: Option<GitCheck>,
+    /// A `.git` somewhere inside the item (a nested repository), and whether that walk
+    /// couldn't finish.
+    pub holds_repo: bool,
+    pub repo_walk_incomplete: bool,
     pub file_id: Option<u128>,
 }
 
@@ -531,6 +535,12 @@ fn path_refusal(item: &ItemCheck, p: &PathFacts, planned_id: Option<u128>) -> Op
         Some(GitCheck::Failed(why)) => return Some(format!("Ather MemGuard couldn't ask git whether it tracks files in it ({}).", why)),
         _ => {}
     }
+    if p.holds_repo {
+        return Some("It holds a git repository (a .git folder) inside it, so Ather MemGuard leaves it alone.".into());
+    }
+    if p.repo_walk_incomplete {
+        return Some("Ather MemGuard couldn't check every folder in it for a git repository, so it leaves it alone.".into());
+    }
     if let Some(planned) = planned_id {
         if p.file_id != Some(planned) {
             return Some("The folder was replaced since the plan was made (its file id changed). Make a new plan first.".into());
@@ -595,28 +605,72 @@ pub fn sync_roots() -> Vec<String> {
 }
 
 /// Ask git whether it tracks anything under `path`. Not in a checkout: `NotRepo`.
+///
+/// Every repository above the item is asked, nearest first, so a nested repository (a plugin
+/// with its own `.git` inside the project's checkout) can't hide files the outer one tracks.
+/// The pathspec ignores case (`:(literal,icase)`): Windows paths do, and the catalogue's
+/// spelling (`Intermediate`) need not be the one git recorded (`intermediate/...`). A git that
+/// refuses the repository (`safe.directory`, dubious ownership) or fails is a refusal, never
+/// "not tracked".
 pub fn git_check(path: &Path) -> GitCheck {
-    let Some(repo) = path.ancestors().skip(1).find(|a| a.join(".git").exists()) else {
+    git_check_env(path, &[])
+}
+
+/// `git_check` with extra environment variables for git (tests).
+pub fn git_check_env(path: &Path, env: &[(&str, &str)]) -> GitCheck {
+    let repos: Vec<&Path> = path.ancestors().skip(1).filter(|a| std::fs::symlink_metadata(a.join(".git")).is_ok()).collect();
+    if repos.is_empty() {
         return GitCheck::NotRepo;
-    };
+    }
+    let mut tracked = 0;
+    for repo in repos {
+        match git_ls(repo, path, env) {
+            GitCheck::Tracked(n) => tracked += n,
+            GitCheck::Clean | GitCheck::NotRepo => {}
+            other => return other,
+        }
+    }
+    if tracked > 0 {
+        GitCheck::Tracked(tracked)
+    } else {
+        GitCheck::Clean
+    }
+}
+
+/// Environment variables that would point git at another repository or index.
+const GIT_ENV_CLEARED: &[&str] = &["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM", "GIT_NAMESPACE", "GIT_OBJECT_DIRECTORY"];
+
+fn git_ls(repo: &Path, path: &Path, env: &[(&str, &str)]) -> GitCheck {
     let rel = path.strip_prefix(repo).map(|r| r.display().to_string()).unwrap_or_default();
     let repo_s = repo.display().to_string();
-    let rel_spec = rel.replace('\\', "/");
-    let args = ["-C", repo_s.as_str(), "ls-files", "-z", "--", rel_spec.as_str()];
-    match run_with_timeout(Path::new("git"), &args, GIT_TIMEOUT) {
-        Ok((0, out)) => {
-            let n = out.split(|b| *b == 0).filter(|s| !s.is_empty()).count();
-            if n == 0 {
-                GitCheck::Clean
-            } else {
-                GitCheck::Tracked(n)
-            }
-        }
-        Ok((code, _)) => GitCheck::Failed(format!("git stopped with exit code {}", code)),
+    let spec = format!(":(literal,icase){}", rel.replace('\\', "/"));
+    // No fsmonitor: a repository's config must not get to run a program here.
+    let args = ["-c", "core.fsmonitor=false", "-C", repo_s.as_str(), "ls-files", "-z", "--", spec.as_str()];
+    let mut envs: Vec<(&str, Option<&str>)> = GIT_ENV_CLEARED.iter().map(|k| (*k, None)).collect();
+    envs.extend(env.iter().map(|(k, v)| (*k, Some(*v))));
+    match run_cmd(Path::new("git"), &args, GIT_TIMEOUT, &envs) {
+        Ok((code, out, err)) => git_answer(code, &out, &err),
         Err(RunError::TimedOut) => GitCheck::TimedOut,
         Err(RunError::NotFound) => GitCheck::Failed("git isn't installed or isn't on PATH".into()),
         Err(RunError::Other(e)) => GitCheck::Failed(e),
     }
+}
+
+/// What `git ls-files -z` said, from its exit code, stdout and stderr (pure).
+pub fn git_answer(code: i32, out: &[u8], err: &[u8]) -> GitCheck {
+    if code == 0 {
+        let n = out.split(|b| *b == 0).filter(|s| !s.is_empty()).count();
+        return if n == 0 { GitCheck::Clean } else { GitCheck::Tracked(n) };
+    }
+    let e = String::from_utf8_lossy(err).to_ascii_lowercase();
+    if e.contains("dubious ownership") || e.contains("safe.directory") {
+        return GitCheck::Failed("git won't read this repository because another user owns it (safe.directory)".into());
+    }
+    let first = String::from_utf8_lossy(err).lines().map(str::trim).find(|l| !l.is_empty()).map(|l| l.chars().take(160).collect::<String>());
+    GitCheck::Failed(match first {
+        Some(l) => format!("git stopped with exit code {}: {}", code, l),
+        None => format!("git stopped with exit code {}", code),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -628,24 +682,35 @@ pub enum RunError {
 
 /// Run a console program with no window; (exit code, stdout), killed after `timeout`.
 pub fn run_with_timeout(exe: &Path, args: &[&str], timeout: Duration) -> Result<(i32, Vec<u8>), RunError> {
+    run_cmd(exe, args, timeout, &[]).map(|(c, o, _)| (c, o))
+}
+
+/// `run_with_timeout` that also returns stderr, with environment changes (`None` removes one).
+pub fn run_cmd(exe: &Path, args: &[&str], timeout: Duration, env: &[(&str, Option<&str>)]) -> Result<(i32, Vec<u8>, Vec<u8>), RunError> {
     use std::io::Read;
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut child = Command::new(exe)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { RunError::NotFound } else { RunError::Other(e.to_string()) })?;
-    let mut stdout = child.stdout.take().ok_or(RunError::Other("no stdout".into()))?;
-    let reader = std::thread::spawn(move || {
-        let mut s = Vec::new();
-        let _ = stdout.read_to_end(&mut s);
-        s
-    });
+    let mut cmd = Command::new(exe);
+    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).creation_flags(CREATE_NO_WINDOW);
+    for (k, v) in env {
+        match v {
+            Some(v) => cmd.env(k, v),
+            None => cmd.env_remove(k),
+        };
+    }
+    let mut child = cmd.spawn().map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { RunError::NotFound } else { RunError::Other(e.to_string()) })?;
+    let read_all = |mut r: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut s = Vec::new();
+            let _ = r.read_to_end(&mut s);
+            s
+        })
+    };
+    let stdout = child.stdout.take().ok_or(RunError::Other("no stdout".into()))?;
+    let stderr = child.stderr.take().ok_or(RunError::Other("no stderr".into()))?;
+    let out_reader = read_all(Box::new(stdout));
+    let err_reader = read_all(Box::new(stderr));
     let start = Instant::now();
     let code = loop {
         match child.try_wait() {
@@ -659,8 +724,34 @@ pub fn run_with_timeout(exe: &Path, args: &[&str], timeout: Duration) -> Result<
             Err(e) => return Err(RunError::Other(e.to_string())),
         }
     };
-    let out = reader.join().unwrap_or_default();
-    Ok((code, out))
+    let out = out_reader.join().unwrap_or_default();
+    let err = err_reader.join().unwrap_or_default();
+    Ok((code, out, err))
+}
+
+/// Does `root` hold a git repository (a `.git` file or folder) anywhere inside it? Links are
+/// not followed. `None` when the walk couldn't read everything before `deadline`.
+pub fn holds_repo(root: &Path, deadline: Instant) -> Option<bool> {
+    use std::os::windows::fs::MetadataExt;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        if Instant::now() > deadline {
+            return None;
+        }
+        let rd = std::fs::read_dir(&d).ok()?;
+        for e in rd {
+            let e = e.ok()?;
+            if e.file_name().to_string_lossy().eq_ignore_ascii_case(".git") {
+                return Some(true);
+            }
+            let Ok(m) = std::fs::symlink_metadata(e.path()) else { continue };
+            let a = m.file_attributes();
+            if a & disk_win::A_DIR != 0 && a & disk_win::A_REPARSE == 0 {
+                stack.push(e.path());
+            }
+        }
+    }
+    Some(false)
 }
 
 /// Read every fact the rules need about one path, now.
@@ -696,6 +787,10 @@ pub fn path_facts(path: &str, global: bool, profile: Option<&str>, syncs: &[Stri
     }
     if check_git {
         f.git = Some(git_check(p));
+        match holds_repo(p, Instant::now() + Duration::from_secs(60)) {
+            Some(h) => f.holds_repo = h,
+            None => f.repo_walk_incomplete = true,
+        }
     }
     f.file_id = disk_win::identity(path).map(|(_, id, _)| id);
     f
@@ -2282,6 +2377,92 @@ mod tests {
         assert_eq!(git_check(&root.join("Intermediate")), GitCheck::Clean);
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(git_check(&std::env::temp_dir().join("amg-surely-not-a-repo-x\\y")), GitCheck::NotRepo);
+    }
+
+    /// Found in review: git tracked `intermediate/Build/tracked.txt`, the item was cleaned as
+    /// `...\Game1\Intermediate`, and the case-sensitive pathspec said "not tracked".
+    #[test]
+    fn git_check_ignores_case_like_windows_does() {
+        let root = std::env::temp_dir().join(format!("amg-clean-gitcase-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let game = root.join("Game1");
+        std::fs::create_dir_all(game.join(r"intermediate\Build")).unwrap();
+        std::fs::write(game.join(r"intermediate\Build\tracked.txt"), b"x").unwrap();
+        let r = |args: &[&str]| run_with_timeout(Path::new("git"), args, Duration::from_secs(20));
+        let gs = game.display().to_string();
+        if r(&["-C", &gs, "init", "-q"]).is_err() {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        r(&["-C", &gs, "add", "intermediate/Build/tracked.txt"]).unwrap();
+        assert_eq!(git_check(&game.join("Intermediate")), GitCheck::Tracked(1), "the catalogue's spelling must still find it");
+        assert_eq!(git_check(&game.join("INTERMEDIATE")), GitCheck::Tracked(1));
+        // Pathspec characters in a folder name are taken literally.
+        std::fs::create_dir_all(game.join("Saved").join("[ab]")).unwrap();
+        assert_eq!(git_check(&game.join("Saved").join("[ab]")), GitCheck::Clean);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A nested repository between the item and the project root: the outer checkout still
+    /// tracks a file in the item, and the inner (empty) one must not hide it.
+    #[test]
+    fn git_check_asks_every_repository_above_the_item() {
+        let root = std::env::temp_dir().join(format!("amg-clean-gitnest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let game = root.join("Game1");
+        let foo = game.join(r"Plugins\Foo");
+        std::fs::create_dir_all(foo.join("Intermediate")).unwrap();
+        std::fs::write(foo.join(r"Intermediate\kept.txt"), b"x").unwrap();
+        let r = |args: &[&str]| run_with_timeout(Path::new("git"), args, Duration::from_secs(20));
+        let gs = game.display().to_string();
+        if r(&["-C", &gs, "init", "-q"]).is_err() {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        r(&["-C", &gs, "add", "Plugins/Foo/Intermediate/kept.txt"]).unwrap();
+        r(&["-C", &foo.display().to_string(), "init", "-q"]).unwrap();
+        assert_eq!(git_check(&foo.join("Intermediate")), GitCheck::Tracked(1));
+        // A repository inside the item: the walk finds it, and the rule refuses it.
+        let lane = game.join("Intermediate");
+        std::fs::create_dir_all(lane.join(r"Deep\Sub\.git")).unwrap();
+        assert_eq!(holds_repo(&lane, Instant::now() + Duration::from_secs(10)), Some(true));
+        assert_eq!(holds_repo(&foo.join("Intermediate"), Instant::now() + Duration::from_secs(10)), Some(false));
+        assert_eq!(holds_repo(&lane, Instant::now() - Duration::from_secs(1)), None, "out of time: unknown, not false");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// git refusing the repository (another user owns it) is a refusal, never "not tracked".
+    #[test]
+    fn git_safe_directory_failure_refuses() {
+        let root = std::env::temp_dir().join(format!("amg-clean-gitsafe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Intermediate")).unwrap();
+        let r = |args: &[&str]| run_with_timeout(Path::new("git"), args, Duration::from_secs(20));
+        if r(&["-C", &root.display().to_string(), "init", "-q"]).is_err() {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let g = git_check_env(&root.join("Intermediate"), &[("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")]);
+        assert!(matches!(&g, GitCheck::Failed(w) if w.contains("safe.directory")), "{:?}", g);
+        let mut f = proj_facts("Intermediate");
+        f.git = Some(g);
+        assert!(refusal(&proj_item("ue:intermediate", "regenerable", "Intermediate"), &[f]).unwrap().contains("couldn't ask git"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn git_answers_are_read_strictly() {
+        assert_eq!(git_answer(0, b"", b""), GitCheck::Clean);
+        assert_eq!(git_answer(0, b"a\0b\0", b""), GitCheck::Tracked(2));
+        let g = git_answer(128, b"", b"fatal: detected dubious ownership in repository at 'D:/x'\nTo add an exception...");
+        assert!(matches!(&g, GitCheck::Failed(w) if w.contains("another user")), "{:?}", g);
+        assert!(matches!(git_answer(128, b"", b"fatal: not a git repository\n"), GitCheck::Failed(w) if w.contains("not a git repository")));
+        let mut f = proj_facts("Intermediate");
+        f.holds_repo = true;
+        assert!(refusal(&proj_item("ue:intermediate", "regenerable", "Intermediate"), &[f.clone()]).unwrap().contains("git repository"));
+        f.holds_repo = false;
+        f.repo_walk_incomplete = true;
+        assert!(refusal(&proj_item("ue:intermediate", "regenerable", "Intermediate"), &[f]).is_some());
     }
 
     #[test]

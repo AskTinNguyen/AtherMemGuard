@@ -476,8 +476,11 @@ proposal section 4 E/F with the product owner's decisions, which override it whe
   old caches: the paths in the relocation record). Never-list on the path relative to the project.
   A reparse point at the item root or any folder up to the project root (or the profile) refuses it;
   inside an item, links are removed as links (`remove_dir`/`remove_file` on the link, never followed).
-  Cloud attributes or a registered sync root refuse it. `git ls-files` with a 5 s limit; a timeout or
-  a failure inside a checkout refuses it. Anything written in the last `min_age_hours`, or after the
+  Cloud attributes or a registered sync root refuse it. `git ls-files` with a 5 s limit, asked in every
+  repository above the item (nested ones too), with a case-insensitive literal pathspec
+  (`:(literal,icase)`, since the catalogue's spelling need not be git's) and `core.fsmonitor` off; a
+  timeout, a failure or a `safe.directory` refusal inside a checkout refuses it, and so does a `.git`
+  anywhere inside the item. Anything written in the last `min_age_hours`, or after the
   plan's newest write, refuses the whole item, as does an Unreal process working in that project (or
   one whose command line can't be read). The path's file id must match the plan's.
 - **Plans** are recorded (`disk-plans.json`, last 10) with each path's file id and newest write.
