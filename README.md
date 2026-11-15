@@ -339,7 +339,8 @@ MemGuard as tools: `memguard_status`, `memguard_prime`, `memguard_wait`, `memgua
 `memguard_history`, `memguard_doctor`, `memguard_ram`, `memguard_disk`, `memguard_disk_checkup` and
 `memguard_disk_plan` and `memguard_disk_clean`. `memguard_prime` and `memguard_wait` with `prime` free
 memory; `memguard_disk_clean` is the one tool that deletes files, and only regenerable build output and
-caches from a plan the agent made in the last 10 minutes, with every rule checked again; the rest are
+caches from a plan the agent made in the same session in the last 10 minutes (its `plan_id` is
+required), with every rule checked again; the rest are
 read-only. Agents are told to quote disk "frees" numbers as predicted, to tell you what they deleted, and
 never to promise space before it has been measured. The agent
 starts it by itself; there is no port and nothing to enable. Run `memguard agent-setup` for ready-to-paste

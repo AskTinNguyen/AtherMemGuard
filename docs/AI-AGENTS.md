@@ -468,7 +468,8 @@ drives). Same as `memguard disk plan <ids> --json`.
 |---|---|---|
 | `ids` | array of strings | Item ids from the latest `memguard_disk_checkup`, e.g. `["d7"]`. Empty = all of them |
 
-The result has a `plan_id`. The plan is recorded: `memguard_disk_clean` acts only on a plan under 10
+The result has a `plan_id`. The MCP server keeps the plan in its own memory (a plan file on disk is
+never read for agents): `memguard_disk_clean` acts only on a plan this same server made, under 10
 minutes old, and only while nothing in its items has been written since. Each item also lists its
 `actions` (`now`, `bin`, `tool`) with what each frees now (`bin` frees 0 until the bin is emptied).
 
@@ -483,12 +484,17 @@ predicted frees.
 | Argument | Type | Meaning |
 |---|---|---|
 | `ids` | array of strings, required | Ids of regenerable items from your latest `memguard_disk_plan` |
-| `plan_id` | string | The `plan_id` that plan returned. Default: the newest plan holding all the ids |
+| `plan_id` | string, required | The `plan_id` that plan returned. There is no default: a missing `plan_id` is a tool error |
+
+Each item's class and allowed actions come from Ather MemGuard's built-in catalogue, by its key, at the
+moment of acting: never from the plan or a file. `cache:old`, lanes and anything that isn't one of the
+catalogue's `regenerable` entries are always refused here.
 
 What it refuses, item by item (the whole item, never half of it):
 - anything not `regenerable` (logs, cooked output, shared caches, lanes, worktrees, the bin): those are
   the person's call (`memguard disk clean --fix`), and bin moves and tool cleans are not offered here;
-- ids not in a plan, or a plan 10 minutes old or more (a tool error: call `memguard_disk_plan` again);
+- a missing `plan_id`, a plan this server didn't make, ids not in that plan, or a plan 10 minutes old or
+  more (a tool error: call `memguard_disk_plan` again);
 - an item where anything was written in the last 2 hours (`[disk] min_age_hours`) or since the plan;
 - an item whose folder was replaced since the plan (its file id changed);
 - an item in a project where an Unreal editor, build or cook is working;

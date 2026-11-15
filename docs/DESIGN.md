@@ -486,7 +486,10 @@ proposal section 4 E/F with the product owner's decisions, which override it whe
 - **Plans** are recorded (`disk-plans.json`, last 10) with each path's file id and newest write.
   The CLI makes a fresh plan for exactly the picks (its `frees_together` covers only the `now` and
   `tool` items) and acts on it after the confirmation. The MCP tool acts only on a plan under 10
-  minutes old. The prediction after acting is the plan's `frees_together` when exactly that set went,
+  minutes old that the same server made (kept in its memory, never read from `disk-plans.json`), and
+  `plan_id` is required. Every cleanup takes an item's class, tool and actions from the embedded
+  catalogue by key at apply time, never from a plan; agents act only on the catalogue's `regenerable`
+  keys (never `cache:old` or lanes). The prediction after acting is the plan's `frees_together` when exactly that set went,
   else the sum of the items' own numbers labelled `lower_bound` (it can only be lower); a partial
   delete makes it `estimate`.
 - **Undo:** `disk-undo.json`, the shape of `doctor-undo.json` (`runs[].entries[]` with `id`,

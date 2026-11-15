@@ -50,8 +50,8 @@ estimate as about, upper_bound as at most) and the word predicted; never add num
 space that can be freed, and never promise the space right after a delete (on ReFS it can take a long time to show up). \
 To check that a set frees enough, call memguard_disk_plan and use free_after_gb, only when exact or lower_bound. \
 memguard_disk_clean is the only tool that deletes: prefer it only for regenerable build output and caches (Intermediate, \
-DerivedDataCache, crash and shader debug files, tool caches), only on ids from a memguard_disk_plan you made less than 10 \
-minutes before, and always tell the person what you deleted (titles and paths) and the predicted frees. Its measured \
+DerivedDataCache, crash and shader debug files, tool caches), only on ids from a memguard_disk_plan you made in this session \
+less than 10 minutes before, always passing its plan_id (required), and always tell the person what you deleted (titles and paths) and the predicted frees. Its measured \
 result comes later, in memguard_disk recent_cleanups: report that as measured, never earlier. Moves to the bin, tool \
 cleans, logs, cooked output and the shared caches are the person's call (memguard disk clean --fix); lanes and worktrees \
 are never deleted by Ather MemGuard. Mention dev:* findings from memguard_disk once and never claim to have fixed them.";
@@ -79,6 +79,9 @@ pub struct Server {
     disk_files: crate::disk_clean::DiskFiles,
     /// How `memguard_disk_clean` acts (tests: no waiting, no watcher, fixed Unreal facts).
     clean_opts: crate::disk_clean::CleanOpts,
+    /// The plans `memguard_disk_plan` made in this server, newest last. `memguard_disk_clean`
+    /// acts only on these: a plan file on disk is something an agent could edit.
+    agent_plans: std::cell::RefCell<Vec<crate::disk_clean::PlanRecord>>,
 }
 
 impl Default for Server {
@@ -105,6 +108,7 @@ impl Server {
             load_checkup: Box::new(crate::disk_scan::load_cache),
             disk_files: crate::disk_clean::DiskFiles::default(),
             clean_opts: crate::disk_clean::CleanOpts { agent: true, presample_secs: 5, start_watcher: true, ..Default::default() },
+            agent_plans: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -328,6 +332,11 @@ impl Server {
                 if let Err(e) = self.disk_files.save_plan(&rec) {
                     eprintln!("memguard mcp: could not save the plan: {}", e);
                 }
+                let mut mine = self.agent_plans.borrow_mut();
+                mine.push(rec);
+                if mine.len() > 10 {
+                    mine.remove(0);
+                }
                 Ok(v)
             }
             // ---- The one tool that deletes: regenerable items of a fresh plan, rules re-checked now.
@@ -337,9 +346,12 @@ impl Server {
                     Some(Value::Array(a)) if !a.is_empty() && a.iter().all(Value::is_string) => a.iter().filter_map(|v| v.as_str().map(|s| s.trim().to_string())).collect(),
                     _ => return Err(ToolError("ids must be a non-empty list of item ids from your memguard_disk_plan, like [\"d1\", \"d2\"].".into())),
                 };
-                let plan_id = str_arg(args, "plan_id")?;
-                let plans = self.disk_files.plans();
-                let plan = crate::disk_clean::plan_for_agent(&plans, plan_id.as_deref(), &ids, crate::disk_clean::unix_now()).map_err(ToolError)?;
+                let Some(plan_id) = str_arg(args, "plan_id")?.filter(|p| !p.trim().is_empty()) else {
+                    return Err(ToolError("plan_id is required: call memguard_disk_plan with exactly the ids you want to clean and pass the plan_id it returns.".into()));
+                };
+                // Only a plan this server made (in memory); never one read back from disk.
+                let plans = self.agent_plans.borrow().clone();
+                let plan = crate::disk_clean::plan_for_agent(&plans, plan_id.trim(), &ids, crate::disk_clean::unix_now()).map_err(ToolError)?;
                 let picks: Vec<(String, Option<crate::disk_clean::CleanAction>)> = ids.iter().map(|i| (i.clone(), Some(crate::disk_clean::CleanAction::Now))).collect();
                 let r = crate::disk_clean::clean(&(self.load_config)(), &self.disk_files, plan, &picks, &self.clean_opts);
                 let mut v = r.to_json();
@@ -716,8 +728,9 @@ Ather MemGuard deletes nothing; the person removes the folders (or runs git work
             "name": "memguard_disk_clean",
             "title": "Delete regenerable build output",
             "description": "DELETES FILES for good (no undo). Only for regenerable items (class regenerable: Intermediate, \
-DerivedDataCache, crash reports, shader debug files, tool caches) whose ids are in a memguard_disk_plan made less than 10 \
-minutes ago. Every safety rule is checked again now and an item is refused whole if anything in it was written in the last \
+DerivedDataCache, crash reports, shader debug files, tool caches) whose ids are in the memguard_disk_plan named by plan_id \
+(required; made by this server less than 10 minutes ago). The class and the allowed actions come from Ather MemGuard's \
+built-in list, never from the plan. Every safety rule is checked again now and an item is refused whole if anything in it was written in the last \
 2 hours or since the plan, if an Unreal editor, build or cook works in that project, if git tracks a file in it, if its folder \
 changed (file id), or if it is a link, in a cloud folder, or outside the allow-list. Lanes, worktrees, Content, Config, \
 Source, Saved\\Autosaves and the like are never touched, and bin moves and tool cleans are not available here. Returns \
@@ -727,9 +740,9 @@ memguard_disk recent_cleanups. Tell the person what you deleted.",
                 "type": "object",
                 "properties": {
                     "ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Ids of regenerable items from your latest memguard_disk_plan, e.g. [\"d1\", \"d2\"]." },
-                    "plan_id": { "type": "string", "description": "The plan_id memguard_disk_plan returned. Default: the newest plan holding all the ids." }
+                    "plan_id": { "type": "string", "description": "Required. The plan_id memguard_disk_plan returned in this session, less than 10 minutes ago." }
                 },
-                "required": ["ids"],
+                "required": ["ids", "plan_id"],
                 "additionalProperties": false
             },
             "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false },
@@ -1048,21 +1061,58 @@ mod tests {
             assert_eq!(r["result"]["isError"], false, "{}", r);
             r["result"]["structuredContent"]["plan_id"].as_str().unwrap().to_string()
         };
-        // No plan yet: refused, and nothing is touched.
-        assert!(tool_error_text(&run(1, "memguard_disk_clean", json!({ "ids": ["d1"] }))).contains("memguard_disk_plan"));
+        // No plan yet: refused, and nothing is touched. plan_id is required.
+        assert!(tool_error_text(&run(1, "memguard_disk_clean", json!({ "ids": ["d1"] }))).contains("plan_id is required"));
+        assert!(tool_error_text(&run(1, "memguard_disk_clean", json!({ "ids": ["d1"], "plan_id": "p1" }))).contains("memguard_disk_plan"));
         let p1 = plan(2);
+        assert!(tool_error_text(&run(1, "memguard_disk_clean", json!({ "ids": ["d1"] }))).contains("plan_id is required"), "no newest-plan fallback");
         // Logs are disposable: not for agents.
         let r = run(3, "memguard_disk_clean", json!({ "ids": ["d2"], "plan_id": p1 }));
         let s = &r["result"]["structuredContent"];
         assert_eq!(s["outcomes"][0]["result"], "refused", "{}", s);
         assert!(s["outcomes"][0]["message"].as_str().unwrap().contains("regenerable"));
         assert!(game.join(r"Saved\Logs\Game.log").is_file());
+        // Found in review: editing disk-plans.json (class -> regenerable) let the agent delete
+        // Saved\Logs. The file is never read for agents; the class comes from the catalogue.
+        let mut on_disk = files.plans();
+        for p in on_disk.iter_mut() {
+            for it in p.items.iter_mut() {
+                it.class = "regenerable".into();
+            }
+        }
+        let mut forged_file = on_disk.last().unwrap().clone();
+        forged_file.id = "pfile".into();
+        on_disk.push(forged_file);
+        std::fs::write(root.join(r"data\disk-plans.json"), serde_json::to_string(&on_disk).unwrap()).unwrap();
+        let r = run(3, "memguard_disk_clean", json!({ "ids": ["d2"], "plan_id": p1 }));
+        assert_eq!(r["result"]["structuredContent"]["outcomes"][0]["result"], "refused", "{}", r);
+        assert!(tool_error_text(&run(3, "memguard_disk_clean", json!({ "ids": ["d2"], "plan_id": "pfile" }))).contains("no plan pfile"), "a plan only in the file is unknown");
+        assert!(game.join(r"Saved\Logs\Game.log").is_file());
+        // A forged class in the server's own plan (it can't happen through the tools, but the
+        // catalogue decides anyway), and cache:old: refused.
+        {
+            let mut mine = srv.agent_plans.borrow_mut();
+            let mut f = mine.last().unwrap().clone();
+            f.id = "pclass".into();
+            f.items[1].class = "regenerable".into();
+            let mut old = f.items[0].clone();
+            old.id = "d9".into();
+            old.key = "cache:old".into();
+            old.class = "disposable".into();
+            f.items.push(old);
+            mine.push(f);
+        }
+        let r = run(3, "memguard_disk_clean", json!({ "ids": ["d2", "d9"], "plan_id": "pclass" }));
+        let s = &r["result"]["structuredContent"];
+        assert_eq!(s["outcomes"][0]["result"], "refused", "{}", s);
+        assert!(s["outcomes"][0]["message"].as_str().unwrap().contains("class was changed"), "{}", s);
+        assert_eq!(s["outcomes"][1]["result"], "refused", "{}", s);
+        assert!(s["outcomes"][1]["message"].as_str().unwrap().contains("regenerable"), "{}", s);
+        assert!(game.join(r"Saved\Logs\Game.log").is_file() && game.join(r"Intermediate\Build\Win64\a.obj").is_file());
         // A stale plan (older than 10 minutes) is refused.
-        let mut plans = files.plans();
-        for p in plans.iter_mut() {
+        for p in srv.agent_plans.borrow_mut().iter_mut() {
             p.unix -= 700;
         }
-        std::fs::write(root.join(r"data\disk-plans.json"), serde_json::to_string(&plans).unwrap()).unwrap();
         assert!(tool_error_text(&run(4, "memguard_disk_clean", json!({ "ids": ["d1"], "plan_id": p1 }))).contains("under 10 minutes"));
         // A recent write refuses the whole item.
         let p2 = plan(5);
@@ -1077,13 +1127,13 @@ mod tests {
         let r = run(7, "memguard_disk_clean", json!({ "ids": ["d1"], "plan_id": p2 }));
         assert!(r["result"]["structuredContent"]["outcomes"][0]["message"].as_str().unwrap().contains("after the plan"), "{}", r);
         // A protected path smuggled into a plan record is refused by the rules at apply time.
-        let mut forged: PlanRecord = files.plans().last().unwrap().clone();
+        let mut forged: PlanRecord = srv.agent_plans.borrow().last().unwrap().clone();
         forged.id = "pforged".into();
         forged.unix = crate::disk_clean::unix_now();
         forged.items[0].paths = vec![game.join("Content").display().to_string()];
         forged.items[0].path_ids = vec![crate::disk_win::identity(&game.join("Content").display().to_string()).map(|x| x.1)];
         forged.items[0].last_write = u64::MAX;
-        files.save_plan(&forged).unwrap();
+        srv.agent_plans.borrow_mut().push(forged);
         let r = run(8, "memguard_disk_clean", json!({ "ids": ["d1"], "plan_id": "pforged" }));
         let s = &r["result"]["structuredContent"];
         assert_eq!(s["outcomes"][0]["result"], "refused", "{}", s);

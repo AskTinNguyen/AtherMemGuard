@@ -317,17 +317,14 @@ impl PlanRecord {
     }
 }
 
-/// The plan an agent may act on: `plan_id` if given, else the newest plan holding every id.
-/// Refused when older than 10 minutes.
-pub fn plan_for_agent<'a>(plans: &'a [PlanRecord], plan_id: Option<&str>, ids: &[String], now_unix: u64) -> Result<&'a PlanRecord, String> {
-    let p = match plan_id {
-        Some(pid) => plans.iter().find(|p| p.id == pid).ok_or_else(|| format!("There is no plan {}. Call memguard_disk_plan with the ids first.", pid))?,
-        None => plans
-            .iter()
-            .rev()
-            .find(|p| ids.iter().all(|i| p.item(i).is_some()))
-            .ok_or("No plan holds all of these ids. Call memguard_disk_plan with exactly the ids you want to clean first.")?,
-    };
+/// The plan an agent may act on: exactly `plan_id`, from the plans this MCP server made itself
+/// (kept in its memory, never read back from a file an agent could edit). Refused when older
+/// than 10 minutes or when an id isn't in it.
+pub fn plan_for_agent<'a>(plans: &'a [PlanRecord], plan_id: &str, ids: &[String], now_unix: u64) -> Result<&'a PlanRecord, String> {
+    let p = plans
+        .iter()
+        .find(|p| p.id == plan_id)
+        .ok_or_else(|| format!("There is no plan {} from this session. Call memguard_disk_plan with exactly the ids you want to clean, then pass its plan_id.", plan_id))?;
     if p.age_sec(now_unix) > AGENT_PLAN_MAX_AGE.as_secs() {
         return Err(format!(
             "The plan {} was made {} minutes ago; an agent may only act on a plan under 10 minutes old. Call memguard_disk_plan again.",
@@ -339,6 +336,22 @@ pub fn plan_for_agent<'a>(plans: &'a [PlanRecord], plan_id: Option<&str>, ids: &
         return Err(format!("{} is not in plan {}. Plan exactly the items you want to clean.", missing, p.id));
     }
     Ok(p)
+}
+
+/// What the cleanup allows for an item key, from the embedded catalogue (never from a plan or a
+/// cache file): (class, tool). `cache:old` is the relocation's old caches (disposable); lanes
+/// and the bin are `review`. `None`: not a key Ather MemGuard cleans.
+pub fn catalog_class(key: &str) -> Option<(String, Option<String>)> {
+    match key {
+        "cache:old" => Some(("disposable".into(), None)),
+        "lane" | "memguard:bin" => Some(("review".into(), None)),
+        _ => crate::disk_scan::catalog_info(key).map(|i| (i.class, i.tool)),
+    }
+}
+
+/// Keys an agent may clean: the catalogue's `regenerable` entries, nothing else.
+pub fn agent_may_clean(key: &str) -> bool {
+    key != "cache:old" && crate::disk_scan::catalog_info(key).is_some_and(|i| i.class == "regenerable")
 }
 
 // ---------------------------------------------------------------- safety rules (pure)
@@ -1871,10 +1884,27 @@ pub fn clean(cfg: &crate::config::Config, files: &DiskFiles, plan: &PlanRecord, 
             continue;
         }
         seen.push(id.clone());
-        let Some(item) = plan.item(id) else {
+        let Some(planned) = plan.item(id) else {
             outcomes.push(refuse("", want.unwrap_or(CleanAction::Now), format!("{} is not in plan {}. Make a plan with it first.", id, plan.id)));
             continue;
         };
+        // The class and the tool come from the built-in catalogue, by key: a plan or cache file
+        // that says otherwise was changed by someone.
+        let Some((class, tool)) = catalog_class(&planned.key) else {
+            outcomes.push(refuse(&planned.title, want.unwrap_or(CleanAction::Now), "It isn't on the list of folders Ather MemGuard may clean.".into()));
+            continue;
+        };
+        if planned.class != class {
+            outcomes.push(refuse(&planned.title, want.unwrap_or(CleanAction::Now), "The plan doesn't match Ather MemGuard's list of what may be cleaned (its class was changed). Make a new plan.".into()));
+            continue;
+        }
+        let mut item = planned.clone();
+        item.tool = tool;
+        let item = &item;
+        if opts.agent && !agent_may_clean(&item.key) {
+            outcomes.push(refuse(&item.title, want.unwrap_or(CleanAction::Now), "Agents may only delete regenerable build output and caches (action now). Ask the person to do the rest.".into()));
+            continue;
+        }
         let offered = offered_actions(&item.key, &item.class, item.tool.as_deref(), item.volume_root.is_some());
         let action = match want.or_else(|| offered.first().copied()) {
             Some(a) => a,
@@ -2669,11 +2699,26 @@ mod tests {
     fn agent_plans_must_be_fresh_and_hold_the_ids() {
         let item = |id: &str| PlannedItem { id: id.into(), key: "ue:intermediate".into(), class: "regenerable".into(), title: "x".into(), paths: vec![], path_ids: vec![], last_write: 0, volume: None, volume_root: None, frees_alone: Some(1), confidence: "exact".into(), tool: None, unmeasurable: None };
         let plans = vec![PlanRecord { id: "p1".into(), unix: 1000, time: String::new(), items: vec![item("d1"), item("d2")], volumes: vec![] }];
-        assert_eq!(plan_for_agent(&plans, None, &["d1".into()], 1000 + 599).unwrap().id, "p1");
-        assert!(plan_for_agent(&plans, None, &["d1".into()], 1000 + 601).unwrap_err().contains("under 10 minutes"));
-        assert!(plan_for_agent(&plans, None, &["d3".into()], 1000).is_err());
-        assert!(plan_for_agent(&plans, Some("p9"), &["d1".into()], 1000).is_err());
-        assert!(plan_for_agent(&plans, Some("p1"), &["d1".into(), "d3".into()], 1000).unwrap_err().contains("d3 is not in plan"));
+        assert_eq!(plan_for_agent(&plans, "p1", &["d1".into()], 1000 + 599).unwrap().id, "p1");
+        assert!(plan_for_agent(&plans, "p1", &["d1".into()], 1000 + 601).unwrap_err().contains("under 10 minutes"));
+        assert!(plan_for_agent(&plans, "p1", &["d3".into()], 1000).is_err());
+        assert!(plan_for_agent(&plans, "p9", &["d1".into()], 1000).unwrap_err().contains("no plan p9"));
+        assert!(plan_for_agent(&plans, "p1", &["d1".into(), "d3".into()], 1000).unwrap_err().contains("d3 is not in plan"));
+    }
+
+    #[test]
+    fn class_and_agent_limits_come_from_the_catalogue() {
+        assert_eq!(catalog_class("ue:logs").unwrap().0, "disposable");
+        assert_eq!(catalog_class("cache:npm").unwrap(), ("regenerable".to_string(), Some("npm".to_string())));
+        assert_eq!(catalog_class("cache:old").unwrap().0, "disposable");
+        assert_eq!(catalog_class("lane").unwrap().0, "review");
+        assert_eq!(catalog_class("made:up"), None);
+        for k in ["ue:intermediate", "ue:plugin_intermediate", "ue:ddc", "ue:crashes", "ue:shader_debug", "cache:npm", "cache:pip", "gpu:d3dscache"] {
+            assert!(agent_may_clean(k), "{}", k);
+        }
+        for k in ["ue:logs", "ue:cooked", "ue:staged", "ue:global_ddc", "ue:zen", "temp:old", "cache:old", "lane", "memguard:bin", "git:lfs", "made:up"] {
+            assert!(!agent_may_clean(k), "{}", k);
+        }
     }
 
     const G: u64 = 1 << 30;
