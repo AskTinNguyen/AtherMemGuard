@@ -780,13 +780,42 @@ pub mod doctor_map {
         }
     }
 
+    /// Shown on a drive row whose report entry and cleanup entry don't name the same thing.
+    pub const CHECKUP_DOESNT_ADD_UP: &str = "The checkup file doesn't add up; check again";
+
+    /// Does the checkup's report entry `shown` name the same thing as `item`, the entry a
+    /// clean of that id deletes (same key, same set of paths)? A disk-checkup.json edited by
+    /// hand could otherwise show one folder and delete another.
+    pub fn checkup_entry_agrees(shown: &serde_json::Value, item: Option<&crate::disk_scan::CatItem>) -> bool {
+        let Some(item) = item else { return false };
+        if shown["key"].as_str() != Some(item.key.as_str()) {
+            return false;
+        }
+        let Some(arr) = shown["paths"].as_array() else { return false };
+        let set = |v: Vec<String>| -> std::collections::BTreeSet<String> { v.into_iter().map(|p| crate::disk_space::norm(&p)).collect() };
+        let Some(shown_paths) = arr.iter().map(|p| p.as_str().map(str::to_string)).collect::<Option<Vec<String>>>() else { return false };
+        set(shown_paths) == set(item.paths.clone())
+    }
+
+    /// The cleanup entry for report entry `shown`, when the two agree.
+    fn agreeing_item<'a>(c: &'a crate::disk_scan::CachedCheckup, shown: &serde_json::Value) -> Result<&'a crate::disk_scan::CatItem, Option<&'a crate::disk_scan::CatItem>> {
+        let item = shown["id"].as_str().and_then(|id| c.index_of(id)).map(|k| &c.items[k]);
+        if checkup_entry_agrees(shown, item) {
+            Ok(item.unwrap())
+        } else {
+            Err(item)
+        }
+    }
+
     /// Drive rows from the last disk checkup: every item that offers an action, in its
-    /// default order. Older than `fresh_sec`, exact numbers become "about".
+    /// default order. Older than `fresh_sec`, exact numbers become "about". Title and paths
+    /// come from the entry a clean deletes; a row whose report entry disagrees with it is
+    /// shown as not cleanable.
     pub fn disk_rows(c: &crate::disk_scan::CachedCheckup, fresh_sec: u64, now_unix: u64) -> Vec<vm::Finding> {
         let stale = now_unix.saturating_sub(c.unix) > fresh_sec;
         let mut out = Vec::new();
         for it in &c.report.items {
-            let actions: Vec<vm::Action> = it["actions"]
+            let mut actions: Vec<vm::Action> = it["actions"]
                 .as_array()
                 .into_iter()
                 .flatten()
@@ -807,17 +836,25 @@ pub mod doctor_map {
             if stale && (conf == "exact" || conf == "lower_bound") {
                 conf = "estimate".into();
             }
-            let paths: Vec<&str> = it["paths"].as_array().into_iter().flatten().filter_map(|p| p.as_str()).collect();
-            let detail = match paths.len() {
-                0 => String::new(),
-                1 => paths[0].to_string(),
-                n => format!("{} and {} more", paths[0], n - 1),
+            let (title, detail) = match agreeing_item(c, it) {
+                Ok(item) => {
+                    let detail = match item.paths.len() {
+                        0 => String::new(),
+                        1 => item.paths[0].clone(),
+                        n => format!("{} and {} more", item.paths[0], n - 1),
+                    };
+                    (item.title.clone(), detail)
+                }
+                Err(item) => {
+                    actions.clear();
+                    (item.map(|i| i.title.clone()).unwrap_or_else(|| it["title"].as_str().unwrap_or("").to_string()), CHECKUP_DOESNT_ADD_UP.to_string())
+                }
             };
             out.push(vm::Finding {
                 id: format!("disk:{}", it["id"].as_str().unwrap_or("")),
                 kind: vm::FindingKind::Disk,
                 verdict: vm::Verdict::Review,
-                title: it["title"].as_str().unwrap_or("").to_string(),
+                title,
                 detail,
                 processes: 0,
                 ram_mb: 0,
@@ -842,6 +879,10 @@ pub mod doctor_map {
         let mut fix = Vec::new();
         for (id, k) in picks {
             let short = id.trim_start_matches("disk:");
+            let shown = seen.report.items.iter().find(|it| it["id"].as_str().is_some_and(|i| i.eq_ignore_ascii_case(short)));
+            if !shown.is_some_and(|s| agreeing_item(seen, s).is_ok()) {
+                return Err(CHECKUP_DOESNT_ADD_UP.into());
+            }
             let fp = crate::disk_clean::checkup_item_fingerprint(seen, short).ok_or_else(|| "Check again first".to_string())?;
             args.push("--expect".into());
             args.push(format!("{}={}", short, fp));
@@ -2533,16 +2574,38 @@ mod disk_row_tests {
         }
     }
 
-    #[test]
-    fn checkup_items_with_actions_become_drive_rows() {
+    fn cat(key: &str, title: &str, paths: &[&str]) -> crate::disk_scan::CatItem {
+        crate::disk_scan::CatItem { key: key.into(), class: "regenerable".into(), title: title.into(), paths: paths.iter().map(|p| p.to_string()).collect(), lane: None }
+    }
+
+    /// The report's entries `d1`..`dN` and the cleanup entries they stand for.
+    fn cached_with(items: Vec<serde_json::Value>, cats: Vec<crate::disk_scan::CatItem>, unix: u64) -> crate::disk_scan::CachedCheckup {
+        let mut c = cached(items, unix);
+        c.root_ids = vec![vec![]; cats.len()];
+        c.items = cats;
+        c
+    }
+
+    fn three_items() -> (Vec<serde_json::Value>, Vec<crate::disk_scan::CatItem>) {
+        let mut filler: Vec<crate::disk_scan::CatItem> = (2..=8).map(|n| cat("ue:saved_logs", "Logs", &[&format!(r"D:\p{}\Saved\Logs", n)])).collect();
+        filler[5] = cat("lane", "Lane a", &[r"D:\lanes\a"]);
+        let mut cats = vec![cat("ue:intermediate", "Build files for S2", &[r"D:\s2\Intermediate"])];
+        cats.extend(filler);
+        cats.push(cat("cache:npm", "npm cache", &["x", "y"]));
         let items = vec![
-            json!({ "id": "d1", "title": "Build files for S2", "volume": "D:", "paths": [r"D:\s2\Intermediate"], "frees_alone_gb": 16.4, "frees_confidence": "exact",
+            json!({ "id": "d1", "key": "ue:intermediate", "title": "Build files for S2", "volume": "D:", "paths": [r"D:\s2\Intermediate"], "frees_alone_gb": 16.4, "frees_confidence": "exact",
                     "actions": [{ "kind": "now", "label": "Delete it" }, { "kind": "bin", "label": "Move to the bin" }] }),
-            json!({ "id": "d7", "title": "Lane a", "volume": "D:", "paths": [r"D:\lanes\a"], "frees_alone_gb": 91.2, "frees_confidence": "exact", "actions": [] }),
-            json!({ "id": "d9", "title": "npm cache", "volume": "C:", "paths": ["x", "y"], "frees_alone_gb": 3.0, "frees_confidence": "exact",
+            json!({ "id": "d7", "key": "lane", "title": "Lane a", "volume": "D:", "paths": [r"D:\lanes\a"], "frees_alone_gb": 91.2, "frees_confidence": "exact", "actions": [] }),
+            json!({ "id": "d9", "key": "cache:npm", "title": "npm cache", "volume": "C:", "paths": ["x", "y"], "frees_alone_gb": 3.0, "frees_confidence": "exact",
                     "actions": [{ "kind": "now" }, { "kind": "tool", "label": "Clean with npm" }] }),
         ];
-        let rows = doctor_map::disk_rows(&cached(items.clone(), 1000), 300, 1100);
+        (items, cats)
+    }
+
+    #[test]
+    fn checkup_items_with_actions_become_drive_rows() {
+        let (items, cats) = three_items();
+        let rows = doctor_map::disk_rows(&cached_with(items.clone(), cats.clone(), 1000), 300, 1100);
         assert_eq!(rows.len(), 2, "lanes offer nothing and are not rows");
         assert_eq!(rows[0].id, "disk:d1");
         assert_eq!(rows[0].kind, vm::FindingKind::Disk);
@@ -2550,15 +2613,50 @@ mod disk_row_tests {
         assert_eq!(vm::choices(&rows[1]).iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), ["Delete it", "Clean with npm"]);
         assert_eq!(rows[1].detail, "x and 1 more");
         // An old checkup: "about".
-        let old = doctor_map::disk_rows(&cached(items, 1000), 300, 5000);
+        let old = doctor_map::disk_rows(&cached_with(items, cats, 1000), 300, 5000);
         assert_eq!(old[0].disk.as_ref().unwrap().frees_words(), "about 16.4 GB");
+    }
+
+    /// Found in review: the rows showed title and path from the report while the pick deleted
+    /// the cleanup entry. Both must name the same thing, or the row offers nothing.
+    #[test]
+    fn report_and_cleanup_entries_must_agree() {
+        use doctor_map::checkup_entry_agrees as agrees;
+        let it = cat("ue:intermediate", "Build files", &[r"D:\s2\Intermediate", r"D:\s2\Plugins\X\Intermediate"]);
+        let shown = |key: &str, paths: serde_json::Value| json!({ "id": "d1", "key": key, "title": "Build files", "paths": paths });
+        // Same key and set of paths, in any order and case.
+        assert!(agrees(&shown("ue:intermediate", json!([r"d:\s2\plugins\x\intermediate", r"D:/s2/Intermediate"])), Some(&it)));
+        assert!(!agrees(&shown("ue:saved_logs", json!([r"D:\s2\Intermediate", r"D:\s2\Plugins\X\Intermediate"])), Some(&it)), "key differs");
+        assert!(!agrees(&shown("ue:intermediate", json!([r"D:\s2\Intermediate"])), Some(&it)), "a path is missing");
+        assert!(!agrees(&shown("ue:intermediate", json!([r"D:\s2\Intermediate", r"C:\Users\me\Documents"])), Some(&it)), "a path differs");
+        assert!(!agrees(&shown("ue:intermediate", json!("D:\\s2")), Some(&it)), "paths not a list");
+        assert!(!agrees(&json!({ "id": "d1", "paths": [r"D:\s2\Intermediate", r"D:\s2\Plugins\X\Intermediate"] }), Some(&it)), "no key");
+        assert!(!agrees(&shown("ue:intermediate", json!([])), None), "no cleanup entry for the id");
+
+        // A forged report: d1 shows "Build files" at the Intermediate folder, but the cleanup
+        // entry d1 is the npm cache. The row shows what would be deleted and offers nothing.
+        let (mut items, mut cats) = three_items();
+        cats[0] = cat("cache:npm", "npm cache", &[r"C:\Users\me\AppData\Local\npm-cache"]);
+        let c = cached_with(items.clone(), cats.clone(), 1000);
+        let rows = doctor_map::disk_rows(&c, 300, 1100);
+        assert_eq!(rows[0].id, "disk:d1");
+        assert_eq!(rows[0].title, "npm cache");
+        assert_eq!(rows[0].detail, doctor_map::CHECKUP_DOESNT_ADD_UP);
+        assert!(rows[0].actions.is_empty() && vm::choices(&rows[0]).is_empty(), "not cleanable");
+        assert!(!rows[1].actions.is_empty(), "an agreeing row still offers its actions");
+        assert_eq!(doctor_map::disk_clean_args(&c, &[("disk:d1".into(), vm::ActionKind::DiskNow)]).unwrap_err(), doctor_map::CHECKUP_DOESNT_ADD_UP);
+        assert!(doctor_map::disk_clean_args(&c, &[("disk:d9".into(), vm::ActionKind::DiskNow)]).is_ok());
+        // The title comes from the cleanup entry even when the report's title is changed.
+        items[2]["title"] = json!("Something harmless");
+        let rows = doctor_map::disk_rows(&cached_with(items, cats, 1000), 300, 1100);
+        assert_eq!((rows[1].title.as_str(), rows[1].detail.as_str()), ("npm cache", "x and 1 more"));
     }
 
     /// The window confirms on its snapshot (checkup A); another checkup (B) replaces the saved
     /// one before the clean runs: the arguments the window passes make the CLI refuse.
     #[test]
     fn drive_cleanup_carries_what_the_window_showed() {
-        let mut a = cached(vec![], 1000);
+        let mut a = cached(vec![json!({ "id": "d1", "key": "ue:intermediate", "paths": [r"D:\s2\Intermediate"] })], 1000);
         a.id = "cA".into();
         a.items = vec![crate::disk_scan::CatItem { key: "ue:intermediate".into(), class: "regenerable".into(), title: "Build files".into(), paths: vec![r"D:\s2\Intermediate".into()], lane: None }];
         a.root_ids = vec![vec![42]];
