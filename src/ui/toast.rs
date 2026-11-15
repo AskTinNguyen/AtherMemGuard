@@ -888,7 +888,7 @@ pub mod catalog {
     /// it unasked (that would take back the undo it promised).
     pub fn disk_bin_ask(volume: &str, holds_gb: f64) -> Toast {
         let body = format!(
-            "The bin holds {} GB on {}. Emptying it gives that space back, but what's in it can't be put back afterwards.",
+            "The bin holds {} GB of files on {}. Emptying it is predicted to give up to that much space back (files can share space, and a Dev Drive may return it late), but what's in it can't be put back afterwards.",
             gb(holds_gb),
             volume
         );

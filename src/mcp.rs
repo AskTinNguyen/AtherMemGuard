@@ -967,7 +967,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("amg-mcp-disk-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(r"Game\Intermediate")).unwrap();
-        std::fs::write(root.join(r"Game\Game.uproject"), b"{}").unwrap();
+        std::fs::write(root.join(r"Game\Game.uproject"), br#"{ "FileVersion": 3 }"#).unwrap();
         std::fs::write(root.join(r"Game\Intermediate\x.bin"), vec![3u8; 200_000]).unwrap();
         let srv = server().with_disk(
             Box::new(|job, p| Ok(crate::disk_scan::run_job(job, p))),
@@ -1032,7 +1032,7 @@ mod tests {
         for d in [r"Intermediate\Build\Win64", r"Saved\Logs", r"Saved\Autosaves", "Content", "Config"] {
             std::fs::create_dir_all(game.join(d)).unwrap();
         }
-        std::fs::write(game.join("Game.uproject"), b"{}").unwrap();
+        std::fs::write(game.join("Game.uproject"), br#"{ "FileVersion": 3, "EngineAssociation": "5.4" }"#).unwrap();
         std::fs::write(game.join(r"Intermediate\Build\Win64\a.obj"), vec![1u8; 300_000]).unwrap();
         std::fs::write(game.join(r"Saved\Logs\Game.log"), vec![2u8; 50_000]).unwrap();
         std::fs::write(game.join(r"Saved\Autosaves\Map_auto1.umap"), b"autosave").unwrap();

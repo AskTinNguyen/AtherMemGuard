@@ -497,7 +497,10 @@ What it refuses, item by item (the whole item, never half of it):
   more (a tool error: call `memguard_disk_plan` again);
 - an item where anything was written in the last 2 hours (`[disk] min_age_hours`) or since the plan;
 - an item whose folder was replaced since the plan (its file id changed);
-- an item in a project where an Unreal editor, build or cook is working;
+- an item in a project where an Unreal editor, build or cook is working (including `dotnet
+  UnrealBuildTool.dll`/`AutomationTool.dll` builds and shader workers); while such a process runs and its
+  project can't be told, every item waits;
+- an item inside (or holding) a folder in `[disk] keep`, read again at the moment of cleaning;
 - anything git tracks (a 5 second limit; no answer is a refusal), a link or a folder under a link, a
   cloud-synced folder, anything outside the user's folder and the project roots, and anything on the
   never-list (`Content`, `Config`, `Source`, `Binaries`, `.git`, `Plugins\*\Content`,

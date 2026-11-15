@@ -544,6 +544,9 @@ fn disk_relocate_cmd(to: Option<String>, apply: bool, undo: bool, yes: bool, jso
             Err(e) => fail(e),
         };
     }
+    if let Some(why) = to.as_deref().and_then(dr::to_path_problem) {
+        return fail(format!("Nothing was set: {}", why));
+    }
     let cfg = load_config();
     let vars = dr::read_vars(&store, &dr::quick_size);
     let sys = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());

@@ -118,18 +118,41 @@ fn is_reparse(p: &Path) -> bool {
     std::fs::symlink_metadata(p).map(|m| m.file_attributes() & disk_win::A_REPARSE != 0).unwrap_or(false)
 }
 
-/// Does `dir` hold a `.uproject` file directly?
+/// Does `dir` hold a real `.uproject` file directly (see `is_real_uproject`)?
 pub fn has_uproject(dir: &Path) -> bool {
     !uprojects(dir).is_empty()
 }
 
-/// The `.uproject` file names directly in `dir`.
+/// Does `dir` hold any file named `*.uproject`, real or not? (For refusals: a folder that looks
+/// like a project is never deleted.)
+pub fn has_any_uproject(dir: &Path) -> bool {
+    std::fs::read_dir(dir).map(|rd| rd.flatten().any(|e| e.file_name().to_string_lossy().to_ascii_lowercase().ends_with(".uproject"))).unwrap_or(false)
+}
+
+/// The biggest `.uproject` read (real ones are a few KB).
+pub const UPROJECT_MAX_BYTES: u64 = 1 << 20;
+
+/// Is `path` a real Unreal project file: a regular file of at most 1 MB that parses as a JSON
+/// object with `FileVersion` or `EngineAssociation`? A stray or empty `.uproject` (`{}`, "not
+/// json") would otherwise make its siblings cleanable.
+pub fn is_real_uproject(path: &Path) -> bool {
+    let Ok(m) = std::fs::symlink_metadata(path) else { return false };
+    if !m.is_file() || m.len() > UPROJECT_MAX_BYTES {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(path) else { return false };
+    let text = String::from_utf8_lossy(&bytes);
+    let text = text.trim_start_matches('\u{feff}');
+    serde_json::from_str::<Value>(text).ok().and_then(|v| v.as_object().map(|o| o.contains_key("FileVersion") || o.contains_key("EngineAssociation"))).unwrap_or(false)
+}
+
+/// The real `.uproject` file names directly in `dir`.
 fn uprojects(dir: &Path) -> Vec<String> {
     let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
     rd.flatten()
         .filter_map(|e| {
             let n = e.file_name().to_string_lossy().to_string();
-            n.to_ascii_lowercase().ends_with(".uproject").then_some(n)
+            (n.to_ascii_lowercase().ends_with(".uproject") && is_real_uproject(&e.path())).then_some(n)
         })
         .collect()
 }
@@ -852,16 +875,97 @@ pub fn busy_state() -> (Vec<String>, bool) {
     let mut out = Vec::new();
     let mut unknown = false;
     for p in crate::win::list_processes() {
-        let n = p.name.to_ascii_lowercase();
-        if !(n.starts_with("unrealeditor") || n == "unrealbuildtool" || n == "automationtool" || n.starts_with("unrealpak")) {
+        if !unreal_candidate(&p.name) {
             continue;
         }
-        match crate::win::command_line(p.pid) {
-            Some(cmd) => out.extend(uproject_dirs_in(&cmd)),
-            None => unknown = true,
+        match unreal_use(&p.name, crate::win::command_line(p.pid).as_deref()) {
+            UnrealUse::NotUnreal => {}
+            UnrealUse::Projects(dirs) => out.extend(dirs),
+            UnrealUse::Unknown => unknown = true,
         }
     }
+    out.sort();
+    out.dedup();
     (out, unknown)
+}
+
+/// What one process means for cleanups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnrealUse {
+    NotUnreal,
+    /// Unreal work in these project folders (normalised).
+    Projects(Vec<String>),
+    /// Unreal work, but its command line couldn't be read or names no project: every cleanup
+    /// waits ("busy, unknown project").
+    Unknown,
+}
+
+/// Could this process name be Unreal work (an editor, a build, a cook, a shader compile, a
+/// pak), or `dotnet` running UnrealBuildTool or AutomationTool? `.exe` is optional.
+pub fn unreal_candidate(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    let n = n.strip_suffix(".exe").unwrap_or(&n);
+    n.starts_with("unrealeditor")
+        || n.starts_with("unrealbuildtool")
+        || n.starts_with("automationtool")
+        || n.starts_with("shadercompileworker")
+        || n.starts_with("unrealpak")
+        || n == "dotnet"
+}
+
+/// What a process with this name and command line (`None`: couldn't be read) is doing.
+/// Builds started from a command line run as `dotnet UnrealBuildTool.dll ...` or
+/// `dotnet AutomationTool.dll ...`; any `dotnet` that runs neither is not Unreal work.
+pub fn unreal_use(name: &str, cmd: Option<&str>) -> UnrealUse {
+    if !unreal_candidate(name) {
+        return UnrealUse::NotUnreal;
+    }
+    let n = name.to_ascii_lowercase();
+    let dotnet = n.strip_suffix(".exe").unwrap_or(&n) == "dotnet";
+    let Some(cmd) = cmd else { return UnrealUse::Unknown };
+    if dotnet {
+        let l = cmd.to_ascii_lowercase();
+        if !(l.contains("unrealbuildtool.dll") || l.contains("automationtool.dll")) {
+            return UnrealUse::NotUnreal;
+        }
+    }
+    let mut dirs = uproject_dirs_in(cmd);
+    dirs.extend(project_args_in(cmd));
+    dirs.sort();
+    dirs.dedup();
+    if dirs.is_empty() {
+        UnrealUse::Unknown
+    } else {
+        UnrealUse::Projects(dirs)
+    }
+}
+
+/// Project folders named by `-project=` or `-ScriptsForProject=` (a `.uproject` or its folder),
+/// quoted or not (normalised).
+pub fn project_args_in(cmd: &str) -> Vec<String> {
+    let lower = cmd.to_ascii_lowercase();
+    let mut out = Vec::new();
+    for key in ["-project=", "-scriptsforproject="] {
+        let mut from = 0;
+        while let Some(k) = lower[from..].find(key) {
+            let start = from + k + key.len();
+            let rest = &cmd[start..];
+            let value = match rest.strip_prefix('"') {
+                Some(q) => q.split('"').next().unwrap_or(""),
+                None => rest.split_whitespace().next().unwrap_or(""),
+            };
+            let v = value.trim().trim_matches('"');
+            if !v.is_empty() {
+                let p = norm(v);
+                let dir = if p.ends_with(".uproject") { Path::new(&p).parent().map(|d| norm(&d.display().to_string())) } else { Some(p) };
+                if let Some(d) = dir.filter(|d| !d.is_empty()) {
+                    out.push(d);
+                }
+            }
+            from = start;
+        }
+    }
+    out
 }
 
 /// Folders of the `.uproject` files a command line names (normalised).
@@ -1472,6 +1576,37 @@ mod tests {
         assert_eq!(dirs, vec![r"d:\lanes\a".to_string()]);
     }
 
+    /// Found in review: builds started from a command line (dotnet UnrealBuildTool.dll, UAT,
+    /// shader workers) weren't seen as "in use".
+    #[test]
+    fn command_line_builds_are_unreal_work() {
+        use UnrealUse::*;
+        let p = |v: &[&str]| Projects(v.iter().map(|s| s.to_string()).collect());
+        assert_eq!(
+            unreal_use("dotnet", Some(r#""C:\Program Files\dotnet\dotnet.exe" "C:\UE_5.4\Engine\Binaries\DotNET\UnrealBuildTool\UnrealBuildTool.dll" S2Editor Win64 Development -Project="D:\s2\S2.uproject" -WaitMutex"#)),
+            p(&[r"d:\s2"])
+        );
+        assert_eq!(
+            unreal_use("dotnet.exe", Some(r#"dotnet "C:\UE\Engine\Binaries\DotNET\AutomationTool\AutomationTool.dll" BuildCookRun -project=D:\lanes\a\S2.uproject -cook"#)),
+            p(&[r"d:\lanes\a"])
+        );
+        // A folder instead of a .uproject, and ScriptsForProject.
+        assert_eq!(unreal_use("AutomationTool", Some(r#"AutomationTool.exe BuildCookRun -project="D:\s2" -cook"#)), p(&[r"d:\s2"]));
+        assert_eq!(unreal_use("UnrealBuildTool", Some(r#"UnrealBuildTool.exe -Mode=QueryTargets -ScriptsForProject=D:\s2\S2.uproject"#)), p(&[r"d:\s2"]));
+        assert_eq!(unreal_use("UnrealEditor-Cmd", Some(r#""C:\UE\UnrealEditor-Cmd.exe" "D:\s2\S2.uproject" -run=cook -targetplatform=Windows"#)), p(&[r"d:\s2"]));
+        // Running, but no project can be found: busy, unknown project.
+        assert_eq!(unreal_use("ShaderCompileWorker", Some(r#""C:\UE\ShaderCompileWorker.exe" "D:\s2\Intermediate\Shaders\WorkingDirectory\1234\" 4321 7 Worker.in Worker.out"#)), Unknown);
+        assert_eq!(unreal_use("UnrealPak", Some(r#"UnrealPak.exe D:\out\pak.pak -create=list.txt"#)), Unknown);
+        assert_eq!(unreal_use("dotnet", Some(r#"dotnet UnrealBuildTool.dll -Mode=GenerateClangDatabase"#)), Unknown);
+        assert_eq!(unreal_use("UnrealEditor", Some(r#""C:\UE\UnrealEditor.exe""#)), Unknown);
+        assert_eq!(unreal_use("UnrealBuildTool", None), Unknown, "command line unreadable");
+        assert_eq!(unreal_use("dotnet", None), Unknown, "an unreadable dotnet could be a build");
+        // Other dotnet work and other programs are not Unreal work.
+        assert_eq!(unreal_use("dotnet", Some(r#"dotnet "C:\Users\me\.vscode\extensions\csharp\Microsoft.CodeAnalysis.LanguageServer.dll""#)), NotUnreal);
+        assert_eq!(unreal_use("devenv", Some("devenv.exe D:\\s2\\S2.sln")), NotUnreal);
+        assert!(unreal_candidate("ShaderCompileWorker.exe") && unreal_candidate("UnrealPak") && !unreal_candidate("node"));
+    }
+
     /// A small tree on this PC's temp drive, scanned in-process: files, nested items and the
     /// set total follow the rules (everything there is exclusive to the test).
     #[test]
@@ -1480,7 +1615,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(r"proj\Intermediate\Build")).unwrap();
         std::fs::create_dir_all(root.join(r"proj\Saved\Logs")).unwrap();
-        std::fs::write(root.join(r"proj\Game.uproject"), b"{}").unwrap();
+        std::fs::write(root.join(r"proj\Game.uproject"), br#"{ "FileVersion": 3 }"#).unwrap();
         std::fs::write(root.join(r"proj\Intermediate\Build\a.bin"), vec![7u8; 300_000]).unwrap();
         std::fs::write(root.join(r"proj\Saved\Logs\Game.log"), vec![1u8; 100_000]).unwrap();
         let cfg = Config::builtin();

@@ -466,23 +466,35 @@ proposal section 4 E/F with the product owner's decisions, which override it whe
   `<vol>:\.AtherMemGuard-bin\<run-id>\<n>\<name>`; the default for `disposable` and `rebuild_cost`;
   frees nothing until emptied and every output says so), `tool` (`npm cache clean --force`,
   `pip cache purge`, `dotnet nuget locals http-cache --clear`, found on PATH with PATHEXT; permanent,
-  "can't be undone"). Zen, lanes, worktrees, the git LFS store, `review` items and the bin itself
+  "can't be undone"; before running it Ather MemGuard asks the tool where its cache is: `npm config get
+  cache` (+ `\_cacache`), `pip cache dir`, `dotnet nuget locals http-cache --list`, and refuses when that
+  isn't the checked item's folder; afterwards it sizes the item again and reports what was actually
+  removed, `partial` or `failed` even on exit code 0). Zen, lanes, worktrees, the git LFS store, `review` items and the bin itself
   offer nothing. `bin` is refused at apply time when the volume root isn't writable.
 - **Safety rules** are `disk_clean::refusal(&ItemCheck, &[PathFacts])`, pure and tested one by one;
   `clean` reads every fact again at apply time (`path_facts`, `newest_write`, `busy_state`,
   `sync_roots`, `git_check`). Allow-list: project items only at their catalogue path under the
-  nearest folder with a `.uproject` or an `Engine` folder with `Build\Build.version`; shared caches
+  nearest folder with a real `.uproject` (at most 1 MB, JSON with `FileVersion` or
+  `EngineAssociation`; a stray `{}` or "not json" file doesn't count, though any `.uproject` still
+  makes its own folder a checkout) or an `Engine` folder with `Build\Build.version`; shared caches
   only at their catalogue path inside `%USERPROFILE%` (TEMP entries: direct children of TEMP only;
-  old caches: the paths in the relocation record). Never-list on the path relative to the project.
+  old caches: the paths in the relocation record; a cache a relocation moved out of the profile, such
+  as the DDC, at exactly the new place the relocation record says it set). `[disk] keep` is read again
+  at clean time (CLI, window and agents): an item inside a kept folder, or holding one, is refused. Never-list on the path relative to the project.
   A reparse point at the item root or any folder up to the project root (or the profile) refuses it;
   inside an item, links are removed as links (`remove_dir`/`remove_file` on the link, never followed).
+  A read-only file with more than one hard link is left alone and reported (clearing read-only would
+  change the other name's file too).
   Cloud attributes or a registered sync root refuse it. `git ls-files` with a 5 s limit, asked in every
   repository above the item (nested ones too), with a case-insensitive literal pathspec
   (`:(literal,icase)`, since the catalogue's spelling need not be git's) and `core.fsmonitor` off; a
   timeout, a failure or a `safe.directory` refusal inside a checkout refuses it, and so does a `.git`
   anywhere inside the item. Anything written in the last `min_age_hours`, or after the
-  plan's newest write, refuses the whole item, as does an Unreal process working in that project (or
-  one whose command line can't be read). The path's file id must match the plan's.
+  plan's newest write, refuses the whole item, as does Unreal work in that project: an editor
+  (`UnrealEditor*`, `UnrealEditor-Cmd`), `UnrealBuildTool`, `AutomationTool`, `ShaderCompileWorker`,
+  `UnrealPak`, or `dotnet` running `UnrealBuildTool.dll` / `AutomationTool.dll` (builds started from a
+  command line). Such a process whose command line can't be read, or names no project (`.uproject`,
+  `-project=`, `-ScriptsForProject=`), refuses every cleanup as "busy, unknown project". The path's file id must match the plan's.
 - **Plans** are recorded (`disk-plans.json`, last 10) with each path's file id and newest write.
   The CLI makes a fresh plan for exactly the picks (its `frees_together` covers only the `now` and
   `tool` items) and acts on it after the confirmation. The MCP tool acts only on a plan under 10
@@ -498,7 +510,15 @@ proposal section 4 E/F with the product owner's decisions, which override it whe
   moved copy is. Emptying a bin run turns its entries into `nothing`.
 - **The bin** empties runs older than `hold_hours` from the tray's disk poll, through a hidden
   `memguard disk bin --expired --yes` (at most once an hour). At `critical` the tray asks
-  ("Empty the bin on D:?", `Command::EmptyDiskBin`) and never empties it unasked.
+  ("Empty the bin on D:?", `Command::EmptyDiskBin`; it says the files' size is a predicted "up to" and
+  that a Dev Drive may return it late) and never empties it unasked. The bin folder is made with its
+  own ACL (`disk_win::create_private_dir`: owner this user; full control for this user, SYSTEM and
+  Administrators; inheritance off), so other users can't list it. Known limit: a folder moved into it
+  keeps its own permissions, so someone who already knows a full path inside could still open what
+  those permissions allow (Windows grants "bypass traverse checking" to everyone); a bin made by an
+  earlier build keeps the ACL it was made with. Slots are `<run>\<entry>-<path>`, unique for any
+  number of paths. An undo retried after a partial restore counts what is already back and says what
+  is still in the bin.
 - **Measured result:** one `disk-watch.json` record per volume acted on, with the free space read
   just before acting (5 readings a second apart) and the prediction. The cleaner starts the detached
   watcher (`--wait` watches in-process instead); the tray restarts one whose process is gone, shows
@@ -524,7 +544,11 @@ proposal section 4 E/F with the product owner's decisions, which override it whe
   `VCPKG_DEFAULT_BINARY_CACHE`; never `CARGO_HOME`, `GRADLE_USER_HOME`, `TEMP` or Zen (its variable is
   unconfirmed). The destination is the fixed, local, non-rotating drive with most room that stays
   `normal` after taking the caches' current size; a named destination that would drop below that is
-  refused. `--apply` saves the previous values first (`disk-relocate.json`), makes the new folders
+  refused. When a size is only a lower bound (the count ran out of time), the destination must stay
+  `normal` with room for twice the counted size, and the plan says why. `--to` must be a full path with
+  a drive letter on a fixed local drive: relative paths, `..`, network and device paths, removable
+  drives and the system drive are refused. The notes say NuGet needs a restore (network) afterwards and
+  that the tools fail if the destination drive goes missing. `--apply` saves the previous values first (`disk-relocate.json`), makes the new folders
   empty, sets `REG_SZ` user variables and broadcasts `WM_SETTINGCHANGE`; `--undo` restores only
   variables still holding the value it set. Registry writes go through `EnvStore`;
   `ATHER_MEMGUARD_ENV_KEY` (must be under `HKCU\Software\AtherMemGuard-test\`) points the CLI at a

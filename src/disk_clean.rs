@@ -548,6 +548,12 @@ pub struct ItemCheck {
     /// command line couldn't be read.
     pub busy: Vec<String>,
     pub busy_unknown: bool,
+    /// `[disk] keep` (normalised), read again at clean time: an item inside a kept folder, or
+    /// holding one, is never cleaned.
+    pub keep: Vec<String>,
+    /// Global items: cache folders a cache relocation set (the relocation record's new places,
+    /// normalised). They sit outside the profile and are allowed there, at exactly that path.
+    pub relocated: Vec<String>,
 }
 
 /// The first rule an item breaks, in plain words, or `None` when it may be cleaned. The whole
@@ -593,15 +599,19 @@ fn path_refusal(item: &ItemCheck, p: &PathFacts, planned_id: Option<u128>) -> Op
     if !p.exists {
         return Some(format!("{} isn't there any more.", p.path));
     }
+    let np = norm(&p.path);
+    if let Some(k) = item.keep.iter().find(|k| is_within(&np, k) || is_within(k, &np)) {
+        return Some(format!("You asked Ather MemGuard to keep {} ([disk] keep), so it leaves this alone.", k));
+    }
     if p.is_checkout {
         return Some("It is a project checkout (a lane or worktree). Ather MemGuard never removes those.".into());
     }
     // Allow-list only, under a recognised root (projects) or at the catalogue path (caches).
     if item.global {
-        if !p.in_profile {
+        let np = norm(&p.path);
+        if !p.in_profile && !item.relocated.contains(&np) {
             return Some("It is outside your user folder and outside any Unreal project, so Ather MemGuard doesn't touch it.".into());
         }
-        let np = norm(&p.path);
         let listed = item.allowed_paths.iter().any(|a| *a == np)
             || item.allowed_parent.as_deref().is_some_and(|par| Path::new(&np).parent().map(|x| norm(&x.display().to_string())) == Some(par.to_string()));
         if !listed {
@@ -664,11 +674,10 @@ fn attrs(p: &Path) -> Option<u32> {
     std::fs::symlink_metadata(p).ok().map(|m| m.file_attributes())
 }
 
-/// `.uproject` folder, or an `Engine` folder with `Build\Build.version`.
+/// A folder with a real `.uproject` (JSON with `FileVersion` or `EngineAssociation`, at most
+/// 1 MB), or an `Engine` folder with `Build\Build.version`.
 pub fn is_recognised_root(dir: &Path) -> bool {
-    let has_uproject = std::fs::read_dir(dir)
-        .map(|rd| rd.flatten().any(|e| e.file_name().to_string_lossy().to_ascii_lowercase().ends_with(".uproject")))
-        .unwrap_or(false);
+    let has_uproject = crate::disk_scan::has_uproject(dir);
     let engine = dir.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("Engine")) && dir.join(r"Build\Build.version").is_file();
     has_uproject || engine
 }
@@ -862,7 +871,7 @@ pub fn path_facts(path: &str, global: bool, profile: Option<&str>, syncs: &[Stri
     f.cloud_attrs = a & (disk_win::A_RECALL_OPEN | disk_win::A_RECALL_DATA | disk_win::A_OFFLINE) != 0;
     f.sync_root = syncs.iter().find(|s| is_within(&np, s)).cloned();
     f.in_profile = profile.map(norm).is_some_and(|pr| is_within(&np, &pr) && np != pr);
-    f.is_checkout = p.join(".git").exists() || crate::disk_scan::has_uproject(p);
+    f.is_checkout = std::fs::symlink_metadata(p.join(".git")).is_ok() || crate::disk_scan::has_any_uproject(p);
     f.recognised_root = p.ancestors().skip(1).find(|a| is_recognised_root(a)).map(|r| r.display().to_string());
     if let Some(root) = &f.recognised_root {
         f.rel = p.strip_prefix(root).ok().map(|r| r.display().to_string());
@@ -944,9 +953,13 @@ pub struct DeleteReport {
 
 impl DeleteReport {
     fn fail(&mut self, p: &Path, e: &std::io::Error) {
+        self.fail_why(p, &e.to_string());
+    }
+
+    fn fail_why(&mut self, p: &Path, why: &str) {
         self.failed_count += 1;
         if self.failed.len() < 20 {
-            self.failed.push((p.display().to_string(), e.to_string()));
+            self.failed.push((p.display().to_string(), why.to_string()));
         }
     }
 
@@ -958,8 +971,9 @@ impl DeleteReport {
         }
         if self.failed_count > 0 {
             s.push_str(&format!(
-                ". {} could not be removed and are still there{}",
-                thousands(self.failed_count),
+                ". {} could not be removed and {} still there{}",
+                plural(self.failed_count, "file or folder").replace("file or folders", "files or folders"),
+                if self.failed_count == 1 { "is" } else { "are" },
                 self.failed.first().map(|(p, e)| format!(", for example {} ({})", p, e)).unwrap_or_default()
             ));
         }
@@ -1054,6 +1068,12 @@ fn delete_dir(dir: &Path, r: &mut DeleteReport) {
                 } else if a & disk_win::A_DIR != 0 {
                     delete_dir(&p, r);
                 } else {
+                    // Read-only is a property of the file, not of the name: clearing it on a file
+                    // with another name outside the item would change that file too.
+                    if m.permissions().readonly() && disk_win::link_count(&p.display().to_string()).is_none_or(|n| n > 1) {
+                        r.fail_why(&p, "it is read-only and hard-linked to a file elsewhere, so it was left alone");
+                        continue;
+                    }
                     clear_readonly(&p, &m);
                     match std::fs::remove_file(&p) {
                         Ok(()) => {
@@ -1089,19 +1109,28 @@ pub fn bin_root(volume_root: &str) -> PathBuf {
     PathBuf::from(format!("{}\\{}", volume_root.trim_end_matches('\\'), BIN_DIR))
 }
 
+/// Make the bin folder if it is missing: only this user, SYSTEM and Administrators may open it
+/// (its own ACL, nothing inherited from the drive's root, where other users can read).
+pub fn ensure_bin(bin: &Path) -> Result<(), String> {
+    if bin.is_dir() {
+        return Ok(());
+    }
+    disk_win::create_private_dir(&bin.display().to_string())
+}
+
 /// Can the bin be made on this volume? Creates the bin folder if it is missing (it is ours).
 pub fn bin_writable(volume_root: &str) -> bool {
     if cfg!(test) {
         return true;
     }
-    let b = bin_root(volume_root);
-    b.is_dir() || std::fs::create_dir(&b).is_ok()
+    ensure_bin(&bin_root(volume_root)).is_ok()
 }
 
 /// Move `src` into `<bin>\<run>\<n>\<name>` on the same volume. Never copies: a move across
 /// volumes fails instead.
-pub fn move_to_bin(src: &Path, bin: &Path, run: &str, n: usize) -> Result<PathBuf, String> {
-    let dir = bin.join(run).join(n.to_string());
+pub fn move_to_bin(src: &Path, bin: &Path, run: &str, slot: &str) -> Result<PathBuf, String> {
+    ensure_bin(bin).map_err(|e| format!("couldn't make the bin: {}; nothing was moved", e))?;
+    let dir = bin.join(run).join(slot);
     std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't make the bin folder {}: {}", dir.display(), e))?;
     let name = src.file_name().ok_or("the folder has no name")?;
     let dst = dir.join(name);
@@ -1127,12 +1156,96 @@ pub fn resolve_on_path(name: &str, path_var: &str, pathext: &str) -> Option<Path
     None
 }
 
+fn find_tool(cmd: &ToolCommand, path_var: Option<&str>) -> Result<PathBuf, String> {
+    let pv = path_var.map(str::to_string).unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+    let pe = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    resolve_on_path(cmd.exe, &pv, &pe).ok_or_else(|| format!("{} isn't installed or isn't on PATH", cmd.exe))
+}
+
+/// How to ask a tool where its cache is: (arguments, how to read the answer).
+fn locate_args(exe: &str) -> Option<&'static [&'static str]> {
+    match exe {
+        "npm" => Some(&["config", "get", "cache"]),
+        "pip" => Some(&["cache", "dir"]),
+        "dotnet" => Some(&["nuget", "locals", "http-cache", "--list"]),
+        _ => None,
+    }
+}
+
+/// The folder a tool's clean command empties, from its answer to `locate_args` (pure). npm's
+/// clean empties `<cache>\_cacache`; pip prints the folder; dotnet prints `http-cache: <folder>`.
+pub fn parse_tool_location(exe: &str, out: &str) -> Option<String> {
+    let line = |s: &str| s.lines().map(str::trim).filter(|l| !l.is_empty()).last().map(str::to_string);
+    let p = match exe {
+        "npm" => line(out).map(|c| format!("{}\\_cacache", c.trim_end_matches(['\\', '/']))),
+        "pip" => line(out),
+        "dotnet" => out.lines().find_map(|l| l.trim().split_once("http-cache:").map(|(_, p)| p.trim().to_string())),
+        _ => None,
+    }?;
+    let p = p.trim().trim_matches('"').to_string();
+    (Path::new(&p).is_absolute()).then_some(p)
+}
+
+/// Ask the tool where its cache is (30 s limit).
+pub fn tool_location(cmd: &ToolCommand, path_var: Option<&str>) -> Result<String, String> {
+    let exe = find_tool(cmd, path_var)?;
+    let args = locate_args(cmd.exe).ok_or_else(|| format!("Ather MemGuard can't ask {} where its cache is", cmd.exe))?;
+    match run_with_timeout(&exe, args, Duration::from_secs(30)) {
+        Ok((0, out)) => parse_tool_location(cmd.exe, &String::from_utf8_lossy(&out)).ok_or_else(|| format!("{} didn't say where its cache is", cmd.exe)),
+        Ok((code, _)) => Err(format!("{} {} stopped with exit code {}", cmd.exe, args.join(" "), code)),
+        Err(RunError::TimedOut) => Err(format!("{} {} didn't answer within 30 seconds", cmd.exe, args.join(" "))),
+        Err(RunError::NotFound) => Err(format!("{} isn't installed", cmd.exe)),
+        Err(RunError::Other(e)) => Err(e),
+    }
+}
+
+/// What a tool clean did to the checked item.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolClean {
+    /// "done", "partial", "failed" or "refused".
+    pub result: String,
+    pub message: String,
+    /// The prediction for what went: the item's own number, scaled down when part stayed.
+    pub predicted: u64,
+}
+
+/// Run a tool's clean on the checked item only: first ask the tool where its cache is and refuse
+/// when that isn't the item's folder (it would clean somewhere else); afterwards size the item
+/// again and report what was actually removed, even when the tool said it succeeded.
+pub fn tool_clean(cmd: &ToolCommand, path_var: Option<&str>, paths: &[String], frees_alone: Option<u64>) -> ToolClean {
+    let refuse = |m: String| ToolClean { result: "refused".into(), message: m, predicted: 0 };
+    let loc = match tool_location(cmd, path_var) {
+        Ok(l) => l,
+        Err(e) => return refuse(format!("Ather MemGuard couldn't ask {} where its cache is ({}), so nothing was run.", cmd.exe, e)),
+    };
+    if paths.len() != 1 || norm(&paths[0]) != norm(&loc) {
+        return refuse(format!("{} cleans {}, not the checked folder {}, so nothing was run.", cmd.exe, loc, paths.join("; ")));
+    }
+    let before: u64 = paths.iter().map(|p| dir_size(Path::new(p))).sum();
+    match run_tool(cmd, path_var) {
+        Err(e) => ToolClean { result: "failed".into(), message: e, predicted: 0 },
+        Ok(msg) => {
+            let left: u64 = paths.iter().map(|p| dir_size(Path::new(p))).sum();
+            let removed = before.saturating_sub(left);
+            if removed == 0 && before > 0 {
+                ToolClean { result: "failed".into(), message: format!("{}, but nothing in {} was removed.", msg, paths.join("; ")), predicted: 0 }
+            } else if left > 0 {
+                ToolClean {
+                    result: "partial".into(),
+                    message: format!("{}. It removed {}; {} is still there. This can't be undone.", msg, size_words(removed), size_words(left)),
+                    predicted: scaled_prediction(frees_alone, removed, left),
+                }
+            } else {
+                ToolClean { result: "done".into(), message: format!("{}. It removed {}. This can't be undone.", msg, size_words(removed)), predicted: frees_alone.unwrap_or(0) }
+            }
+        }
+    }
+}
+
 /// Run a tool's own clean command (2 minute limit). `path_var` overrides PATH for the lookup
 /// (tests put a fake tool first).
 pub fn run_tool(cmd: &ToolCommand, path_var: Option<&str>) -> Result<String, String> {
-    let pv = path_var.map(str::to_string).unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
-    let pe = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
-    let exe = resolve_on_path(cmd.exe, &pv, &pe).ok_or_else(|| format!("{} isn't installed or isn't on PATH", cmd.exe))?;
+    let exe = find_tool(cmd, path_var)?;
     match run_with_timeout(&exe, cmd.args, Duration::from_secs(120)) {
         Ok((0, _)) => Ok(format!("Ran {}", cmd.display())),
         Ok((code, _)) => Err(format!("{} stopped with exit code {}", cmd.display(), code)),
@@ -1283,8 +1396,11 @@ pub fn undo(files: &DiskFiles, id: Option<&str>) -> Vec<Outcome> {
         let mut back = 0;
         for m in moves {
             let (from, to) = (Path::new(&m.from), Path::new(&m.to));
-            if !to.exists() {
-                problems.push(format!("{} is no longer in the bin (it was emptied)", m.from));
+            if !to.exists() && from.exists() {
+                // Put back by an earlier try (a retry after a partial undo).
+                back += 1;
+            } else if !to.exists() {
+                problems.push(format!("{} is no longer in the bin and isn't back at its place (the bin was emptied, or it was removed)", m.from));
             } else if from.exists() {
                 problems.push(format!("something is at {} again (rebuilt?), so the moved copy stays in the bin at {}", m.from, m.to));
             } else {
@@ -1314,7 +1430,9 @@ pub fn undo(files: &DiskFiles, id: Option<&str>) -> Vec<Outcome> {
             if back > 0 && back == moves.len() {
                 log.runs[r].entries[e].undone = true;
             }
+            let still: Vec<&str> = moves.iter().filter(|m| Path::new(&m.to).exists()).map(|m| m.to.as_str()).collect();
             o.message = problems.join("; ");
+            o.message.push_str(&if still.is_empty() { ". Nothing of it is in the bin now.".to_string() } else { format!(". Still in the bin: {}.", still.join(", ")) });
         }
         out.push(o);
     }
@@ -1969,11 +2087,15 @@ pub fn item_check(p: &PlannedItem, s: &crate::config::DiskSettings, files: &Disk
         min_age_hours: s.min_age_hours,
         busy: busy.0.clone(),
         busy_unknown: busy.1,
+        keep: s.keep.iter().filter(|k| !k.trim().is_empty()).map(|k| norm(k)).collect(),
         ..Default::default()
     };
     match &info {
         Some(i) if i.global => {
             c.global = true;
+            if let Some(r) = files.relocate_record().filter(|r| !r.undone) {
+                c.relocated = r.entries.iter().map(|e| norm(&e.new_value)).collect();
+            }
             if let Some(base) = crate::disk_scan::expand_global(&i.path) {
                 if i.older_than_days.is_some() {
                     c.allowed_parent = Some(norm(&base.display().to_string()));
@@ -2139,7 +2261,8 @@ pub fn clean(cfg: &crate::config::Config, files: &DiskFiles, plan: &PlanRecord, 
                 let mut moves = Vec::new();
                 let mut err = None;
                 for (j, p) in item.paths.iter().enumerate() {
-                    match move_to_bin(Path::new(p), &bin, &run, n * 1000 + j) {
+                    // "<entry>-<path>": unique for any number of paths.
+                    match move_to_bin(Path::new(p), &bin, &run, &format!("{}-{}", n, j)) {
                         Ok(dst) => moves.push(BinMove { from: p.clone(), to: dst.display().to_string() }),
                         Err(e) => {
                             err = Some(e);
@@ -2182,17 +2305,10 @@ pub fn clean(cfg: &crate::config::Config, files: &DiskFiles, plan: &PlanRecord, 
                     }
                     Some(c) => {
                         tools_run.push(c.exe.to_string());
-                        match run_tool(&c, opts.tool_path.as_deref()) {
-                            Ok(msg) => {
-                                o.result = "done".into();
-                                o.message = format!("{}. This can't be undone.", msg);
-                                o.predicted_now = item.frees_alone.unwrap_or(0);
-                            }
-                            Err(e) => {
-                                o.result = "failed".into();
-                                o.message = e;
-                            }
-                        }
+                        let t = tool_clean(&c, opts.tool_path.as_deref(), &item.paths, item.frees_alone);
+                        o.result = t.result;
+                        o.message = t.message;
+                        o.predicted_now = t.predicted;
                     }
                     None => {
                         o.result = "refused".into();
@@ -2316,13 +2432,14 @@ pub fn gb_words(bytes: Option<u64>, confidence: &str) -> String {
     match bytes {
         None => "an unknown amount".into(),
         Some(b) => {
-            let q = match confidence {
-                "lower_bound" => "at least ",
-                "estimate" => "about ",
-                "upper_bound" => "at most ",
-                _ => "",
-            };
-            format!("{}{}", q, size_words(b))
+            match confidence {
+                "exact" => size_words(b),
+                "lower_bound" => format!("at least {}", size_words(b)),
+                "estimate" => format!("about {}", size_words(b)),
+                "upper_bound" => format!("at most {}", size_words(b)),
+                // Unknown (or no) confidence: never a bare number.
+                _ => format!("{} (uncertain)", size_words(b)),
+            }
         }
     }
 }
@@ -2422,8 +2539,29 @@ mod tests {
         std::fs::write(tmp.join(r"Engine\Build\Build.version"), b"{}").unwrap();
         assert!(is_recognised_root(&tmp.join("Engine")));
         assert!(!is_recognised_root(&tmp));
+        // Found in review: a stray .uproject made its siblings cleanable. Only a real one counts.
+        std::fs::write(tmp.join("Game.uproject"), b"not json").unwrap();
+        assert!(!is_recognised_root(&tmp), "not json");
         std::fs::write(tmp.join("Game.uproject"), b"{}").unwrap();
+        assert!(!is_recognised_root(&tmp), "{{}}");
+        std::fs::write(tmp.join("Game.uproject"), b"[1, 2]").unwrap();
+        assert!(!is_recognised_root(&tmp));
+        std::fs::write(tmp.join("Game.uproject"), REAL_UPROJECT).unwrap();
         assert!(is_recognised_root(&tmp));
+        std::fs::write(tmp.join("Game.uproject"), b"\xEF\xBB\xBF{ \"EngineAssociation\": \"{1234}\" }").unwrap();
+        assert!(is_recognised_root(&tmp), "a BOM and only EngineAssociation");
+        // Too big to be a real one: not read.
+        let mut big = br#"{ "FileVersion": 3, "x": ""#.to_vec();
+        big.extend(std::iter::repeat_n(b'a', (crate::disk_scan::UPROJECT_MAX_BYTES + 10) as usize));
+        big.extend(br#"" }"#);
+        std::fs::write(tmp.join("Game.uproject"), &big).unwrap();
+        assert!(!is_recognised_root(&tmp), "over the size cap");
+        // A folder named like one isn't a file.
+        std::fs::remove_file(tmp.join("Game.uproject")).unwrap();
+        std::fs::create_dir_all(tmp.join("Dir.uproject")).unwrap();
+        assert!(!is_recognised_root(&tmp));
+        // Any .uproject, real or not, still makes the folder itself a checkout (never deleted).
+        assert!(crate::disk_scan::has_any_uproject(&tmp) && !crate::disk_scan::has_uproject(&tmp));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -2463,6 +2601,28 @@ mod tests {
         assert_eq!(refusal(&it, &[f.clone()]), None);
         f.path = r"C:\Users\me\AppData\Local\Temp\a\b".into();
         assert!(refusal(&it, &[f]).is_some());
+    }
+
+    /// A relocated DDC sits outside the profile: allowed only at exactly the place the relocation
+    /// record says it set, and still only at the catalogue's path.
+    #[test]
+    fn a_cache_relocation_set_is_cleanable_there_only() {
+        let mut it = proj_item("ue:global_ddc", "rebuild_cost", "");
+        it.global = true;
+        it.catalog_rel = None;
+        let new = r"E:\DevCaches\UnrealEngine\DerivedDataCache";
+        it.allowed_paths = vec![norm(new)];
+        let f = PathFacts { path: new.into(), exists: true, in_profile: false, file_id: Some(7), git: Some(GitCheck::NotRepo), ..Default::default() };
+        assert!(refusal(&it, &[f.clone()]).unwrap().contains("outside your user folder"), "no relocation record");
+        it.relocated = vec![norm(new)];
+        assert_eq!(refusal(&it, &[f.clone()]), None);
+        // Another folder on that drive, even one the record names, isn't the catalogue's path.
+        let mut g = f.clone();
+        g.path = r"E:\DevCaches".into();
+        it.relocated.push(norm(r"E:\DevCaches"));
+        assert!(refusal(&it, &[g]).is_some());
+        // Agents never clean it (rebuild_cost).
+        assert!(!agent_may_clean("ue:global_ddc"));
     }
 
     #[test]
@@ -2718,6 +2878,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Found in review: the tool cleaned wherever it pointed (npm_config_cache elsewhere), not
+    /// the checked item, and the prediction was reported even when nothing went.
+    #[test]
+    fn tool_clean_checks_where_the_tool_points_and_resizes_after() {
+        let dir = std::env::temp_dir().join(format!("amg-fake-tool-loc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        let cache = dir.join("npm-cache");
+        let item = cache.join("_cacache");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(item.join("index")).unwrap();
+        std::fs::write(item.join(r"index\a"), vec![1u8; 4000]).unwrap();
+        std::fs::write(item.join("keep"), vec![1u8; 4000]).unwrap();
+        let args = dir.join("args.txt");
+        let fake = |answer: &Path, clean: &str| {
+            std::fs::write(
+                bin.join("npm.cmd"),
+                format!("@echo off\r\nif \"%1\"==\"config\" (\r\necho {}\r\nexit /b 0\r\n)\r\necho %*> \"{}\"\r\n{}\r\nexit /b 0\r\n", answer.display(), args.display(), clean),
+            )
+            .unwrap();
+        };
+        let pv = bin.display().to_string();
+        let npm = tool_command("npm").unwrap();
+        let paths = vec![item.display().to_string()];
+        // npm points somewhere else: refused, nothing run, nothing touched.
+        fake(&dir.join("elsewhere"), "");
+        let t = tool_clean(&npm, Some(&pv), &paths, Some(8192));
+        assert_eq!(t.result, "refused", "{:?}", t);
+        assert!(t.message.contains("not the checked folder"), "{}", t.message);
+        assert!(!args.exists() && item.join("keep").is_file());
+        // npm points here, but its clean removes nothing: failed, nothing predicted.
+        fake(&cache, "");
+        assert_eq!(tool_location(&npm, Some(&pv)).unwrap(), item.display().to_string());
+        let t = tool_clean(&npm, Some(&pv), &paths, Some(8192));
+        assert_eq!((t.result.as_str(), t.predicted), ("failed", 0), "{:?}", t);
+        assert!(t.message.contains("nothing in"), "{}", t.message);
+        assert_eq!(std::fs::read_to_string(&args).unwrap().trim(), "cache clean --force");
+        // It removes part: partial, the prediction scaled to what went.
+        fake(&cache, &format!("del /q \"{}\"", item.join(r"index\a").display()));
+        let t = tool_clean(&npm, Some(&pv), &paths, Some(8192));
+        assert_eq!(t.result, "partial", "{:?}", t);
+        assert_eq!(t.predicted, scaled_prediction(Some(8192), 4000, 4000));
+        // It removes everything: done, with what it removed.
+        fake(&cache, &format!("rmdir /s /q \"{}\"", item.display()));
+        let t = tool_clean(&npm, Some(&pv), &paths, Some(8192));
+        assert_eq!((t.result.as_str(), t.predicted), ("done", 8192), "{:?}", t);
+        assert!(t.message.contains("It removed"), "{}", t.message);
+        let _ = std::fs::remove_dir_all(&dir);
+        // The answers each tool gives.
+        assert_eq!(parse_tool_location("npm", "C:\\Users\\me\\AppData\\Local\\npm-cache\r\n").as_deref(), Some(r"C:\Users\me\AppData\Local\npm-cache\_cacache"));
+        assert_eq!(parse_tool_location("pip", "C:\\Users\\me\\AppData\\Local\\pip\\cache\n").as_deref(), Some(r"C:\Users\me\AppData\Local\pip\cache"));
+        assert_eq!(parse_tool_location("dotnet", "http-cache: C:\\Users\\me\\AppData\\Local\\NuGet\\v3-cache\\\n").as_deref(), Some(r"C:\Users\me\AppData\Local\NuGet\v3-cache\"));
+        assert_eq!(parse_tool_location("pip", "WARNING: cache disabled\n"), None);
+        assert_eq!(parse_tool_location("dotnet", "nothing here"), None);
+    }
+
     #[test]
     fn delete_removes_links_not_their_targets_and_reports_what_remains() {
         let root = std::env::temp_dir().join(format!("amg-clean-del-{}", std::process::id()));
@@ -2755,8 +2971,139 @@ mod tests {
         assert!(rep.remains);
         assert_eq!(rep.files, 1);
         assert_eq!(rep.failed_count, 1);
-        assert!(rep.words().starts_with("Removed 1 file (less than 1 MB)") && rep.words().contains("1 could not be removed"), "{}", rep.words());
+        assert!(rep.words().starts_with("Removed 1 file (less than 1 MB)") && rep.words().contains("1 file or folder could not be removed and is still there"), "{}", rep.words());
         drop(held);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A read-only file hard-linked to a name outside the item: clearing read-only would clear it
+    /// on the outside file too, so it is left alone and reported.
+    #[test]
+    fn delete_leaves_read_only_hard_links_alone() {
+        let root = std::env::temp_dir().join(format!("amg-clean-hardlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let item = root.join("Intermediate");
+        std::fs::create_dir_all(&item).unwrap();
+        std::fs::create_dir_all(root.join("Content")).unwrap();
+        let outside = root.join(r"Content\shared.uasset");
+        std::fs::write(&outside, b"precious").unwrap();
+        let mut p = std::fs::metadata(&outside).unwrap().permissions();
+        p.set_readonly(true);
+        std::fs::set_permissions(&outside, p).unwrap();
+        std::fs::hard_link(&outside, item.join("shared.uasset")).unwrap();
+        std::fs::write(item.join("plain.obj"), b"x").unwrap();
+        assert_eq!(disk_win::link_count(&outside.display().to_string()), Some(2));
+        let rep = delete_tree(&item);
+        assert!(rep.remains && rep.failed_count == 1, "{:?}", rep);
+        assert!(rep.failed[0].1.contains("hard-linked"), "{:?}", rep.failed);
+        assert!(std::fs::metadata(&outside).unwrap().permissions().readonly(), "the outside file keeps read-only");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"precious");
+        assert!(!item.join("plain.obj").exists());
+        assert!(rep.words().contains("1 file or folder could not be removed and is still there"), "{}", rep.words());
+        let three = DeleteReport { failed_count: 3, ..Default::default() };
+        assert!(three.words().contains("3 files or folders could not be removed and are still there"), "{}", three.words());
+        // Clean up the test's own read-only files.
+        for f in [&outside, &item.join("shared.uasset")] {
+            if let Ok(m) = std::fs::metadata(f) {
+                let mut p = m.permissions();
+                #[allow(clippy::permissions_set_readonly_false)]
+                p.set_readonly(false);
+                let _ = std::fs::set_permissions(f, p);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bin_slots_never_collide_and_the_bin_is_private() {
+        let root = std::env::temp_dir().join(format!("amg-clean-slots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        let bin = root.join(BIN_DIR);
+        // n*1000+j gave 2000 for both (1, 1000) and (2, 0).
+        let x = move_to_bin(&root.join("a"), &bin, "run", &format!("{}-{}", 1, 1000)).unwrap();
+        let y = move_to_bin(&root.join("b"), &bin, "run", &format!("{}-{}", 2, 0)).unwrap();
+        assert_ne!(x.parent(), y.parent());
+        // The bin folder has its own ACL: no inherited entries, no Users or Everyone.
+        let out = std::process::Command::new("icacls").arg(&bin).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(!text.contains("(I)"), "nothing inherited: {}", text);
+        for who in ["Everyone", "BUILTIN\\Users", "Authenticated Users"] {
+            assert!(!text.contains(who), "{} must not have access: {}", who, text);
+        }
+        assert!(text.contains("NT AUTHORITY\\SYSTEM:(OI)(CI)(F)"), "{}", text);
+        assert!(disk_win::create_private_dir(&bin.display().to_string()).is_err(), "never over an existing folder");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An undo retried after a partial restore says what is still in the bin, not "emptied".
+    #[test]
+    fn undo_after_a_partial_restore_reports_what_is_left() {
+        let root = std::env::temp_dir().join(format!("amg-clean-undo2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (a, b) = (root.join(r"p\Saved\Logs"), root.join(r"p\Saved\Crashes"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let bin = root.join(BIN_DIR);
+        let ta = move_to_bin(&a, &bin, "r", "1-0").unwrap();
+        let tb = move_to_bin(&b, &bin, "r", "1-1").unwrap();
+        let files = DiskFiles::in_dir(root.join("data"));
+        let mut log = UndoLog::default();
+        let moves = vec![BinMove { from: a.display().to_string(), to: ta.display().to_string() }, BinMove { from: b.display().to_string(), to: tb.display().to_string() }];
+        log.push_run(UndoRun { id: "r".into(), time: String::new(), unix: 1, entries: vec![UndoEntry { id: "r-1".into(), finding_id: "d1".into(), title: "x".into(), action: CleanAction::Bin,
+            step: UndoStep::FromBin { volume_root: root.display().to_string(), moves, frees_alone: None }, undone: false }] });
+        files.save_undo_log(&log).unwrap();
+        // The first went back earlier; the second is blocked by a rebuilt folder.
+        std::fs::rename(&ta, &a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let o = undo(&files, Some("r-1"));
+        assert!(!o[0].message.contains("emptied") || o[0].message.contains("Still in the bin"), "{}", o[0].message);
+        assert!(o[0].message.contains(&format!("Still in the bin: {}", tb.display())), "{}", o[0].message);
+        // Once the second is free to go back, a retry finishes the entry.
+        std::fs::remove_dir(&b).unwrap();
+        let o = undo(&files, Some("r-1"));
+        assert_eq!(o[0].result, "undone", "{:?}", o);
+        assert!(a.is_dir() && b.is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Bin expiry end to end with a fake clock: only runs past hold_hours go, and the others can
+    /// still be put back.
+    #[test]
+    fn bin_expiry_end_to_end_with_a_fake_clock() {
+        let root = std::env::temp_dir().join(format!("amg-clean-expiry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (old, new) = (root.join(r"p\Saved\Logs"), root.join(r"p\Saved\Cooked"));
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(old.join("a.log"), b"old").unwrap();
+        std::fs::write(new.join("b.bin"), b"new").unwrap();
+        let bin = root.join(BIN_DIR);
+        let to_old = move_to_bin(&old, &bin, "run-old", "1-0").unwrap();
+        let to_new = move_to_bin(&new, &bin, "run-new", "1-0").unwrap();
+        let files = DiskFiles::in_dir(root.join("data"));
+        let vr = root.display().to_string();
+        let entry = |run: &str, from: &Path, to: &Path| UndoEntry { id: format!("{}-1", run), finding_id: "d1".into(), title: run.into(), action: CleanAction::Bin,
+            step: UndoStep::FromBin { volume_root: vr.clone(), moves: vec![BinMove { from: from.display().to_string(), to: to.display().to_string() }], frees_alone: Some(3) }, undone: false };
+        let mut log = UndoLog::default();
+        log.push_run(UndoRun { id: "run-old".into(), time: String::new(), unix: 1_000, entries: vec![entry("run-old", &old, &to_old)] });
+        log.push_run(UndoRun { id: "run-new".into(), time: String::new(), unix: 1_000 + 20 * 3600, entries: vec![entry("run-new", &new, &to_new)] });
+        files.save_undo_log(&log).unwrap();
+        let runs = bin_runs(&files, std::slice::from_ref(&vr));
+        assert_eq!(runs.len(), 2);
+        let now = 1_000 + 24 * 3600; // the fake clock: 24 hours after the old move
+        assert!(expired(&runs, 24.0, now - 1).is_empty());
+        let due = expired(&runs, 24.0, now);
+        assert_eq!(due.iter().map(|r| r.run_id.as_str()).collect::<Vec<_>>(), ["run-old"]);
+        let done = empty_runs(&files, &due);
+        assert!(!done[0].1.remains);
+        assert!(!to_old.exists() && to_new.join("b.bin").is_file());
+        let log = files.undo_log();
+        assert_eq!(log.runs[0].entries[0].step, UndoStep::Nothing, "emptied: can't be undone");
+        assert_eq!(undo(&files, Some("run-new-1"))[0].result, "undone");
+        assert!(new.join("b.bin").is_file());
+        assert!(expired(&bin_runs(&files, &[vr]), 24.0, now + 100 * 3600).is_empty(), "nothing left to expire");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2787,7 +3134,7 @@ mod tests {
         std::fs::create_dir_all(&logs).unwrap();
         std::fs::write(logs.join("a.log"), b"log").unwrap();
         let bin = root.join(BIN_DIR);
-        let dst = move_to_bin(&logs, &bin, "run1", 1).unwrap();
+        let dst = move_to_bin(&logs, &bin, "run1", "1").unwrap();
         assert!(!logs.exists() && dst.join("a.log").is_file());
         let files = DiskFiles::in_dir(root.join("data"));
         let mut log = UndoLog::default();
@@ -2817,7 +3164,7 @@ mod tests {
         assert!(logs.join("a.log").is_file());
         assert!(!files.undo_log().can_undo());
         // Undo when something is back at the old place: the moved copy stays.
-        let dst = move_to_bin(&logs, &bin, "run2", 1).unwrap();
+        let dst = move_to_bin(&logs, &bin, "run2", "1").unwrap();
         std::fs::create_dir_all(&logs).unwrap();
         let mut log = files.undo_log();
         log.push_run(UndoRun { id: "run2".into(), time: "t".into(), unix: 2, entries: vec![UndoEntry { id: "run2-1".into(), finding_id: "d2".into(), title: "Logs".into(), action: CleanAction::Bin,
@@ -2944,6 +3291,42 @@ mod tests {
         assert_eq!(scaled_prediction(None, 5, 5), 0);
         assert_eq!(scaled_prediction(Some(100), 0, 0), 0);
         assert_eq!(scaled_prediction(Some(100), 50, 50), 50);
+    }
+
+    /// Found in review: `[disk] keep` was only checked at checkup, so a plan (or an agent's plan)
+    /// made before the keep was added still cleaned the folder.
+    #[test]
+    fn keep_is_checked_again_at_clean_time() {
+        let mut it = proj_item("ue:intermediate", "regenerable", "Intermediate");
+        it.keep = vec![norm(r"D:\proj")];
+        assert!(refusal(&it, &[proj_facts("Intermediate")]).unwrap().contains("[disk] keep"));
+        it.keep = vec![norm(r"D:\proj\Intermediate\Keepme")];
+        assert!(refusal(&it, &[proj_facts("Intermediate")]).is_some(), "a kept folder inside the item");
+        it.keep = vec![norm(r"D:\project2")];
+        assert_eq!(refusal(&it, &[proj_facts("Intermediate")]), None, "a sibling with a longer name isn't inside");
+        // End to end, through clean() as the CLI and the agent path call it.
+        let root = std::env::temp_dir().join(format!("amg-clean-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let game = root.join("Game");
+        let item = game.join("Intermediate");
+        std::fs::create_dir_all(&item).unwrap();
+        std::fs::write(game.join("Game.uproject"), REAL_UPROJECT).unwrap();
+        std::fs::write(item.join("a.obj"), vec![1u8; 5000]).unwrap();
+        age_tree(&root, 3 * 3600);
+        let plan = plan_one("ue:intermediate", "Build files", std::slice::from_ref(&item), 8192);
+        let mut cfg = crate::config::Config::builtin();
+        let mut d = cfg.disk();
+        d.keep = vec![game.display().to_string()];
+        cfg.disk = Some(d);
+        let files = DiskFiles::in_dir(root.join("data"));
+        for agent in [false, true] {
+            let opts = CleanOpts { agent, ..test_opts() };
+            let r = clean(&cfg, &files, &plan, &[("d1".into(), Some(CleanAction::Now))], &opts);
+            assert_eq!(r.outcomes[0].result, "refused", "{:?}", r.outcomes);
+            assert!(r.outcomes[0].message.contains("[disk] keep"), "{}", r.outcomes[0].message);
+            assert!(item.join("a.obj").is_file());
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     pub(crate) fn snapshot(id: &str, items: &[(&str, &str, u128)]) -> crate::disk_scan::CachedCheckup {
@@ -3159,5 +3542,9 @@ mod tests {
         assert_eq!(size_words(16 << 30), "16.0 GB");
         assert_eq!(size_words(0), "0.0 GB");
         assert_eq!(gb_words(Some(30 << 20), "lower_bound"), "at least 30 MB");
+        assert_eq!(gb_words(Some(30 << 20), "exact"), "30 MB");
+        for c in ["unknown", "none", "", "weird"] {
+            assert_eq!(gb_words(Some(30 << 20), c), "30 MB (uncertain)", "never a bare number for {:?}", c);
+        }
     }
 }

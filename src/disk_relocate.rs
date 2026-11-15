@@ -219,6 +219,8 @@ pub struct DestVolume {
     pub total: u64,
     /// A fixed, local, non-rotating disk.
     pub suitable: bool,
+    /// A fixed local disk (not removable, not a network or optical drive).
+    pub fixed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -274,21 +276,37 @@ pub fn plan(vars: &[VarState], system: Option<&str>, vols: &[DestVolume], to: Op
     let mut notes: Vec<String> = NEVER.iter().map(|(n, why)| format!("{} is never moved: {}.", n, why)).collect();
     notes.push("Zen's cache isn't moved: its data path setting isn't confirmed yet.".into());
     notes.push("Nothing is copied or deleted. The old caches stay where they are until you remove them, so total use goes up at first.".into());
+    notes.push("NuGet needs a restore afterwards (dotnet restore, or a build in Visual Studio), which downloads the packages again over the network.".into());
+    notes.push("vcpkg, npm, pip, NuGet and Unreal fail or start over if the new drive is missing (unplugged, or its letter changed): keep it connected, or undo with memguard disk relocate --undo.".into());
+    notes.push("A cache moved here can still be cleaned: the disk checkup lists Unreal's shared cache at its new place (the place recorded by this relocation), under the same safety rules.".into());
     let mut p = RelocatePlan { destination: None, entries, need, need_partial, dest_free_now: None, dest_free_after: None, refused: None, notes };
     if !p.entries.iter().any(|e| e.action == "set") {
         p.refused = Some("Nothing to move: no cache this covers is on the system drive.".into());
         return p;
     }
-    let fits = |v: &DestVolume| v.avail > need && crate::disk::level_for(v.avail - need, v.total, s) == Level::Normal;
+    // A size that is only a lower bound must not pass the room check silently: the destination
+    // has to keep the "normal" level with room for twice the counted size.
+    let room = if p.need_partial { need.saturating_mul(2) } else { need };
+    if p.need_partial {
+        p.notes.push(format!(
+            "Some caches were too big to count in time, so they hold at least {:.1} GB; the destination must stay above the \"getting full\" level with room for twice that ({:.1} GB).",
+            gb2(need),
+            gb2(room)
+        ));
+    }
+    let fits = |v: &DestVolume| v.avail > room && crate::disk::level_for(v.avail - room, v.total, s) == Level::Normal;
     let dest: Result<(&DestVolume, String), String> = match to {
+        Some((folder, _)) if to_path_problem(folder).is_some() => Err(to_path_problem(folder).unwrap_or_default()),
         Some((folder, guid)) => match vols.iter().find(|v| v.guid.eq_ignore_ascii_case(guid)) {
             None => Err(format!("{} isn't on a drive Ather MemGuard can see.", folder)),
+            Some(v) if !v.fixed => Err(format!("{} is on a removable or network drive. Pick a folder on a fixed drive inside this PC.", folder)),
             Some(v) if system.is_some_and(|sy| sy.eq_ignore_ascii_case(&v.guid)) => Err(format!("{} is on the system drive, where the caches already are.", folder)),
             Some(v) if !fits(v) => Err(format!(
-                "{} has {:.0} GB free; the caches hold {:.0} GB, which would leave it below {:.0} GB (the \"getting full\" level). Pick another drive.",
+                "{} has {:.0} GB free; the caches need room for {}{:.0} GB, which would leave it below {:.0} GB (the \"getting full\" level). Pick another drive.",
                 v.name,
                 gb2(v.avail),
-                gb2(need),
+                if p.need_partial { "at least " } else { "" },
+                gb2(room),
                 gb2(crate::disk::threshold(s.elevated_free_gb, s.elevated_free_pct, v.total))
             )),
             Some(v) => Ok((v, folder.trim_end_matches('\\').to_string())),
@@ -299,7 +317,13 @@ pub fn plan(vars: &[VarState], system: Option<&str>, vols: &[DestVolume], to: Op
             .filter(|v| fits(v))
             .max_by_key(|v| v.avail)
             .map(|v| (v, format!("{}{}", v.root.trim_end_matches('\\').to_string() + "\\", DEST_DIR)))
-            .ok_or_else(|| "No other drive has room for these caches and enough left over (it would drop below the \"getting full\" level).".to_string()),
+            .ok_or_else(|| {
+                if p.need_partial {
+                    format!("No other drive has room for twice the counted size ({:.1} GB; some caches were too big to count in time) and enough left over (it would drop below the \"getting full\" level).", gb2(room))
+                } else {
+                    "No other drive has room for these caches and enough left over (it would drop below the \"getting full\" level).".to_string()
+                }
+            }),
     };
     match dest {
         Err(why) => p.refused = Some(why),
@@ -317,6 +341,20 @@ pub fn plan(vars: &[VarState], system: Option<&str>, vols: &[DestVolume], to: Op
         }
     }
     p
+}
+
+/// What is wrong with a `--to` folder, if anything: it must be an absolute path with a drive
+/// letter (`E:\Caches`), never relative, a network path (`\server\share`) or a device path.
+pub fn to_path_problem(folder: &str) -> Option<String> {
+    let b = folder.as_bytes();
+    let lettered = b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/');
+    if folder.starts_with(r"\\") || folder.starts_with("//") {
+        return Some(format!(r"{} is a network or device path. Pick a folder on a fixed drive inside this PC, like E:\DevCaches.", folder));
+    }
+    if !lettered || folder.contains("..") {
+        return Some(format!(r"{} isn't a full path. Give the whole path with its drive letter, like E:\DevCaches.", folder));
+    }
+    None
 }
 
 /// Read this PC: every variable's current value (from `store`), where its cache is, how big.
@@ -357,6 +395,7 @@ pub fn dest_volumes() -> Vec<DestVolume> {
             let name = f.paths.iter().find(|p| p.len() <= 3).cloned().unwrap_or_else(|| f.paths[0].clone());
             DestVolume {
                 suitable: f.drive_type == 3 && f.seek_penalty != Some(true),
+                fixed: f.drive_type == 3,
                 guid: f.guid.clone(),
                 name: name.trim_end_matches('\\').to_string(),
                 root: name,
@@ -574,7 +613,7 @@ mod tests {
     }
 
     fn vol(guid: &str, avail_gb: u64, total_gb: u64, suitable: bool) -> DestVolume {
-        DestVolume { guid: guid.into(), name: format!("{}:", guid), root: format!("{}:\\", guid), avail: avail_gb * G, total: total_gb * G, suitable }
+        DestVolume { guid: guid.into(), name: format!("{}:", guid), root: format!("{}:\\", guid), avail: avail_gb * G, total: total_gb * G, suitable, fixed: true }
     }
 
     #[test]
@@ -632,6 +671,50 @@ mod tests {
         assert!(p.refused.unwrap().contains("system drive"));
         // An HDD is never picked on its own.
         let p = plan(&vars, Some("C"), &[vol("C", 298, 1903, true), vol("G", 6172, 7451, false)], None, &s);
+        assert!(p.refused.is_some());
+    }
+
+    /// Found in review: with a size that is only a lower bound, the room check passed silently.
+    #[test]
+    fn a_lower_bound_size_needs_twice_the_room() {
+        let s = DiskSettings::default();
+        let mut ddc = var("UE-LocalDataCachePath", r"C:\u\ddc", "C", 100, true);
+        ddc.size_partial = true;
+        // D: has 320 GB free of 1907: 100 GB counted would leave 220 (fits), twice leaves 120 (< 150).
+        let vols = vec![vol("C", 298, 1903, true), vol("D", 320, 1907, true)];
+        let p = plan(std::slice::from_ref(&ddc), Some("C"), &vols, None, &s);
+        assert!(p.destination.is_none(), "{:?}", p);
+        assert!(p.refused.as_deref().unwrap().contains("twice the counted size"), "{:?}", p.refused);
+        assert!(p.notes.iter().any(|n| n.contains("room for twice that")));
+        let p = plan(std::slice::from_ref(&ddc), Some("C"), &vols, Some((r"D:\Caches", "D")), &s);
+        assert!(p.refused.as_deref().unwrap().contains("at least 200 GB"), "{:?}", p.refused);
+        // A complete count of the same size fits.
+        ddc.size_partial = false;
+        let p = plan(&[ddc], Some("C"), &vols, None, &s);
+        assert_eq!(p.destination.as_deref(), Some(r"D:\DevCaches"));
+    }
+
+    #[test]
+    fn to_must_be_a_full_path_on_a_fixed_local_drive() {
+        let s = DiskSettings::default();
+        let vars = vec![var("npm_config_cache", r"C:\u\npm", "C", 3, true)];
+        let mut usb = vol("F", 900, 1000, false);
+        usb.fixed = false;
+        let vols = vec![vol("C", 298, 1903, true), vol("E", 1739, 1863, true), usb];
+        for bad in ["Caches", r"..\Caches", r"E:Caches", r"\\server\share\caches", r"\\?\E:\caches", r"E:\x\..\..\y"] {
+            let p = plan(&vars, Some("C"), &vols, Some((bad, "E")), &s);
+            assert!(p.refused.is_some() && p.destination.is_none(), "{} must be refused: {:?}", bad, p);
+        }
+        assert!(plan(&vars, Some("C"), &vols, Some((r"F:\Caches", "F")), &s).refused.unwrap().contains("removable or network"));
+        assert!(plan(&vars, Some("C"), &vols, Some((r"C:\Caches", "C")), &s).refused.unwrap().contains("system drive"));
+        let ok = plan(&vars, Some("C"), &vols, Some((r"E:\Caches", "E")), &s);
+        assert_eq!(ok.refused, None);
+        assert_eq!(ok.destination.as_deref(), Some(r"E:\Caches"));
+        // The notes say what moving costs.
+        assert!(ok.notes.iter().any(|n| n.contains("NuGet needs a restore")));
+        assert!(ok.notes.iter().any(|n| n.contains("new drive is missing")));
+        // Removable drives are never picked on their own either.
+        let p = plan(&vars, Some("C"), &[vol("C", 298, 1903, true), { let mut u = vol("F", 900, 1000, false); u.fixed = false; u }], None, &s);
         assert!(p.refused.is_some());
     }
 
