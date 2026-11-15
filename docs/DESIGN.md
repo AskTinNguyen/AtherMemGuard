@@ -505,8 +505,14 @@ proposal section 4 E/F with the product owner's decisions, which override it whe
   each result once as a toast, and the watcher writes the log line. `memguard_disk` and
   `memguard disk` list the last five (`recent_cleanups`). No disk history CSV or chart (out of scope).
 - **The tray never walks or deletes:** the checkup window's drive rows come from the cached checkup,
-  and CLEAN UP on them runs `memguard disk clean --yes --json` in a hidden child. A drive action can
-  never map onto a memory action (`action_to_real` returns `None`).
+  and CLEAN UP on them runs `memguard disk clean --yes --json --checkup <id> --expect dN=<fingerprint>
+  --fix ...` in a hidden child. Ids like `d3` are positions in a replaceable cache, so every clean
+  carries what was seen: the checkup's id (`c<run id>`, saved with it) and, per item, a fingerprint of
+  its key, paths and root file ids (`item_fingerprint`). The CLI refuses on any mismatch ("The checkup
+  changed since you confirmed; nothing was deleted. Check again."), and again when the fresh plan's
+  file ids aren't the ones the checkup counted. `--yes` without `--checkup` is refused; without `--yes`
+  the CLI lists the resolved paths and asks. A drive action can never map onto a memory action
+  (`action_to_real` returns `None`).
 - **Relocation:** `UE-LocalDataCachePath`, `NUGET_PACKAGES`, `npm_config_cache`, `PIP_CACHE_DIR`,
   `VCPKG_DEFAULT_BINARY_CACHE`; never `CARGO_HOME`, `GRADLE_USER_HOME`, `TEMP` or Zen (its variable is
   unconfirmed). The destination is the fixed, local, non-rotating drive with most room that stays

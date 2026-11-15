@@ -770,6 +770,10 @@ pub struct Checkup {
 /// What the cache keeps: the report, and what `plan` needs to find the items again.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedCheckup {
+    /// Names this checkup: a clean confirmed on it carries the id, so ids like `d3` can't
+    /// silently mean another item after a newer checkup replaced this one.
+    #[serde(default)]
+    pub id: String,
     pub scope: String,
     pub unix: u64,
     pub time: String,
@@ -777,6 +781,22 @@ pub struct CachedCheckup {
     pub root_ids: Vec<Vec<u128>>,
     pub last_writes: Vec<u64>,
     pub report: Checkup,
+}
+
+impl CachedCheckup {
+    /// The checkup's id (`c<run id>`; older saved checkups: from their time).
+    pub fn ident(&self) -> String {
+        if self.id.is_empty() {
+            format!("u{}", self.unix)
+        } else {
+            self.id.clone()
+        }
+    }
+
+    /// The index of item `d<n>`.
+    pub fn index_of(&self, id: &str) -> Option<usize> {
+        id.trim().strip_prefix('d').and_then(|n| n.parse::<usize>().ok()).filter(|n| *n >= 1 && *n <= self.items.len()).map(|n| n - 1)
+    }
 }
 
 static CACHE_WRITES: AtomicBool = AtomicBool::new(false);
@@ -1072,6 +1092,7 @@ pub fn checkup(cfg: &Config, path: Option<&str>, refresh: bool, budget_sec: Opti
             if still {
                 let age = unix_now().saturating_sub(c.unix);
                 let mut rep = c.report.clone();
+                rep.scan["checkup_id"] = json!(c.ident());
                 rep.scan["age_sec"] = json!(age);
                 rep.scan["from_cache"] = json!(true);
                 if age > s.fresh_sec {
@@ -1105,7 +1126,11 @@ pub fn checkup(cfg: &Config, path: Option<&str>, refresh: bool, budget_sec: Opti
     if path.is_none() {
         record_system_caches(&items, &out, &time);
     }
+    let id = format!("c{}", crate::disk_clean::run_id());
+    let mut rep = rep;
+    rep.scan["checkup_id"] = json!(id);
     save_cache(&CachedCheckup {
+        id,
         scope,
         unix: unix_now(),
         time,
@@ -1377,6 +1402,9 @@ pub fn render_checkup(c: &Checkup) -> String {
     if !c.items.is_empty() {
         s.push_str("Next: memguard disk plan <ids>   fresh numbers for exactly the items you pick.\n");
         s.push_str("Then: memguard disk clean --fix <id>[:now|bin|tool] ...   asks first; bin moves can be undone, deletes can't.\n");
+        if let Some(id) = c.scan["checkup_id"].as_str() {
+            s.push_str(&format!("Scripts: add --yes --checkup {}, so a newer checkup can't change what the ids mean.\n", id));
+        }
     } else {
         s.push_str("Nothing to list here.\n");
     }
@@ -1474,7 +1502,7 @@ mod tests {
         assert_eq!(rep.totals[0]["set"], "regenerable");
         assert_eq!(rep.totals[0]["frees_basis"], "predicted");
         // A plan over the same items, from a cache record.
-        let cached = CachedCheckup { scope: "x".into(), unix: 0, time: String::new(), items: items.clone(), root_ids: vec![], last_writes: vec![], report: rep };
+        let cached = CachedCheckup { id: "c1".into(), scope: "x".into(), unix: 0, time: String::new(), items: items.clone(), root_ids: vec![], last_writes: vec![], report: rep };
         let run = |j: &ScanJob, p: Progress| Ok(run_job(j, p));
         let plan = plan_from(&cfg, &cached, &["d1".into(), "d9".into()], &run, &mut |_, _| {}).unwrap();
         assert_eq!(plan["plans"][0]["item_ids"], json!(["d1"]));

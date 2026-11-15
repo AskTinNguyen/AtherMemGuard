@@ -300,9 +300,11 @@ memguard disk [--json] [--refresh]  drives, how full they are, Dev Drive health 
 memguard disk checkup [--path D:\s2] [--refresh] [--budget-sec 60] [--json]
                                   what could go and what removing it frees (predicted; deletes nothing)
 memguard disk plan d7 d9 [--json]   fresh numbers for exactly these checkup items
-memguard disk clean --fix d1 d3:bin d9:tool [--dry-run] [--yes] [--wait] [--json]
+memguard disk clean --fix d1 d3:bin d9:tool [--dry-run] [--yes --checkup <id>] [--wait] [--json]
                                   clean them (now = delete, bin = move to the bin, tool = the tool's
-                                  own clean); lists what goes and asks first; --wait stays for the
+                                  own clean); lists what goes and asks first; --yes needs the
+                                  checkup id the ids come from (the checkup prints it) and refuses
+                                  if a newer checkup changed what they mean; --wait stays for the
                                   measured result
 memguard disk undo [<undo id>]      put back what the last cleanup moved to the bin
 memguard disk bin [--empty | --expired] [--volume D:] [--yes]

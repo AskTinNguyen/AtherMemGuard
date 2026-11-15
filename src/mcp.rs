@@ -1045,7 +1045,7 @@ mod tests {
         let job = crate::disk_scan::ScanJob { items: items.iter().map(|i| i.paths.clone()).collect(), sets: vec![], threads: 2, budget_sec: 30, stop_on_build: false };
         let out = crate::disk_scan::run_job(&job, &mut |_, _| {});
         let rep = crate::disk_scan::build_checkup(&items, &out, &[], &cfg.disk(), 0, false, &[], "now");
-        let cached = crate::disk_scan::CachedCheckup { scope: "t".into(), unix: 0, time: String::new(), items: items.clone(), root_ids: vec![], last_writes: vec![], report: rep };
+        let cached = crate::disk_scan::CachedCheckup { id: "c1".into(), scope: "t".into(), unix: 0, time: String::new(), items: items.clone(), root_ids: vec![], last_writes: vec![], report: rep };
         let files = DiskFiles::in_dir(root.join("data"));
         let srv = server()
             .with_disk(Box::new(|job, p| Ok(crate::disk_scan::run_job(job, p))), Box::new(move || Some(cached.clone())))

@@ -338,6 +338,90 @@ pub fn plan_for_agent<'a>(plans: &'a [PlanRecord], plan_id: &str, ids: &[String]
     Ok(p)
 }
 
+/// What a clean says when what the person or agent saw is not what the ids name now.
+pub const CHECKUP_CHANGED: &str = "The checkup changed since you confirmed; nothing was deleted. Check again.";
+
+/// A short, stable name for one checkup item as it was seen: its key, its paths and the file
+/// ids of its roots (FNV-1a, 64 bits, hex). The checkup window passes it with each pick, so a
+/// clean can tell that `d3` still means the folder the person confirmed.
+pub fn item_fingerprint(key: &str, paths: &[String], root_ids: &[u128]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |b: &[u8]| {
+        for x in b {
+            h ^= *x as u64;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        h ^= 0xff;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    };
+    eat(key.as_bytes());
+    for p in paths {
+        eat(norm(p).as_bytes());
+    }
+    let mut ids = root_ids.to_vec();
+    ids.sort_unstable();
+    for id in ids {
+        eat(&id.to_le_bytes());
+    }
+    format!("{:016x}", h)
+}
+
+/// The fingerprint of item `id` (`d3`) of a saved checkup.
+pub fn checkup_item_fingerprint(c: &crate::disk_scan::CachedCheckup, id: &str) -> Option<String> {
+    let k = c.index_of(id)?;
+    let it = &c.items[k];
+    Some(item_fingerprint(&it.key, &it.paths, c.root_ids.get(k).map(Vec::as_slice).unwrap_or(&[])))
+}
+
+/// `d3=0123abcd...` from `--expect`.
+pub fn parse_expect(s: &str) -> Result<(String, String), String> {
+    let (id, fp) = s.trim().split_once('=').ok_or_else(|| format!("\"{}\": --expect takes <id>=<fingerprint>, like d3=0f1e2d3c4b5a6978.", s))?;
+    parse_pick(id)?;
+    if fp.len() != 16 || !fp.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("\"{}\": the fingerprint is 16 hex digits.", s));
+    }
+    Ok((id.trim().to_ascii_lowercase(), fp.to_ascii_lowercase()))
+}
+
+/// Does the saved checkup `c` still name what was seen? `checkup_id` is the checkup the person
+/// (or the window) confirmed on, `expects` the fingerprints of the picked items as seen.
+/// Every picked id needs a matching fingerprint when any is given.
+pub fn check_identity(c: &crate::disk_scan::CachedCheckup, checkup_id: &str, expects: &[(String, String)], ids: &[String]) -> Result<(), String> {
+    if !c.ident().eq_ignore_ascii_case(checkup_id.trim()) {
+        return Err(CHECKUP_CHANGED.into());
+    }
+    for (id, fp) in expects {
+        if !ids.iter().any(|i| i.eq_ignore_ascii_case(id)) {
+            return Err(format!("--expect names {}, which isn't one of the items to clean.", id));
+        }
+        if checkup_item_fingerprint(c, id).as_deref() != Some(fp.as_str()) {
+            return Err(CHECKUP_CHANGED.into());
+        }
+    }
+    if !expects.is_empty() {
+        if let Some(missing) = ids.iter().find(|i| !expects.iter().any(|(e, _)| e.eq_ignore_ascii_case(i))) {
+            return Err(format!("{} has no --expect; pass one for every item, or none.", missing));
+        }
+    }
+    Ok(())
+}
+
+/// The folders a fresh plan found must be the ones the checkup counted (their file ids): a
+/// folder deleted and made again in between is not what the person saw.
+pub fn check_live_ids(c: &crate::disk_scan::CachedCheckup, plan: &PlanRecord) -> Result<(), String> {
+    for it in &plan.items {
+        let Some(k) = c.index_of(&it.id) else { return Err(CHECKUP_CHANGED.into()) };
+        let seen = c.root_ids.get(k).cloned().unwrap_or_default();
+        if seen.is_empty() {
+            continue;
+        }
+        if c.items[k].paths != it.paths || it.path_ids.iter().any(|id| !id.is_some_and(|id| seen.contains(&id))) {
+            return Err(CHECKUP_CHANGED.into());
+        }
+    }
+    Ok(())
+}
+
 /// What the cleanup allows for an item key, from the embedded catalogue (never from a plan or a
 /// cache file): (class, tool). `cache:old` is the relocation's old caches (disposable); lanes
 /// and the bin are `review`. `None`: not a key Ather MemGuard cleans.
@@ -2704,6 +2788,55 @@ mod tests {
         assert!(plan_for_agent(&plans, "p1", &["d3".into()], 1000).is_err());
         assert!(plan_for_agent(&plans, "p9", &["d1".into()], 1000).unwrap_err().contains("no plan p9"));
         assert!(plan_for_agent(&plans, "p1", &["d1".into(), "d3".into()], 1000).unwrap_err().contains("d3 is not in plan"));
+    }
+
+    pub(crate) fn snapshot(id: &str, items: &[(&str, &str, u128)]) -> crate::disk_scan::CachedCheckup {
+        crate::disk_scan::CachedCheckup {
+            id: id.into(),
+            scope: "*".into(),
+            unix: 1,
+            time: String::new(),
+            items: items.iter().map(|(k, p, _)| crate::disk_scan::CatItem { key: k.to_string(), class: "regenerable".into(), title: k.to_string(), paths: vec![p.to_string()], lane: None }).collect(),
+            root_ids: items.iter().map(|(_, _, f)| vec![*f]).collect(),
+            last_writes: vec![],
+            report: crate::disk_scan::Checkup { scan: json!({}), volumes: vec![], items: vec![], sharing_groups: vec![], totals: vec![], basis: "predicted".into(), do_not_sum: String::new() },
+        }
+    }
+
+    /// Found in review: the window confirmed d1 on its snapshot, another checkup ran, and the
+    /// clean deleted whatever d1 named then, without listing it.
+    #[test]
+    fn a_checkup_replaced_between_confirm_and_clean_refuses() {
+        let a = snapshot("cA", &[("ue:intermediate", r"D:\s2\Intermediate", 11), ("ue:ddc", r"D:\s2\DerivedDataCache", 12)]);
+        let b = snapshot("cB", &[("ue:crashes", r"D:\other\Saved\Crashes", 21), ("ue:intermediate", r"D:\s2\Intermediate", 11)]);
+        let fp = checkup_item_fingerprint(&a, "d1").unwrap();
+        let expects = vec![("d1".to_string(), fp.clone())];
+        let ids = vec!["d1".to_string()];
+        assert_eq!(check_identity(&a, "cA", &expects, &ids), Ok(()));
+        assert_eq!(check_identity(&b, "cA", &expects, &ids).unwrap_err(), CHECKUP_CHANGED, "another checkup replaced it");
+        assert_eq!(check_identity(&b, "cA", &[], &ids).unwrap_err(), CHECKUP_CHANGED);
+        // Same checkup id, but d1 is something else (or its folder id changed): refused too.
+        let mut a2 = a.clone();
+        a2.items.swap(0, 1);
+        a2.root_ids.swap(0, 1);
+        assert_eq!(check_identity(&a2, "cA", &expects, &ids).unwrap_err(), CHECKUP_CHANGED);
+        let mut a3 = a.clone();
+        a3.root_ids[0] = vec![99];
+        assert_eq!(check_identity(&a3, "cA", &expects, &ids).unwrap_err(), CHECKUP_CHANGED);
+        // Every picked id needs its fingerprint once any is given.
+        assert!(check_identity(&a, "cA", &expects, &["d1".into(), "d2".into()]).unwrap_err().contains("d2 has no --expect"));
+        assert_eq!(parse_expect(&format!("d1={}", fp)).unwrap(), ("d1".into(), fp));
+        assert!(parse_expect("d1").is_err() && parse_expect("d1=xyz").is_err() && parse_expect("D:=0123456789abcdef").is_err());
+        // The fresh plan must find the folders the checkup counted.
+        let item = |id: &str, p: &str, fid: u128| PlannedItem { id: id.into(), key: "ue:intermediate".into(), class: "regenerable".into(), title: "x".into(), paths: vec![p.into()], path_ids: vec![Some(fid)], last_write: 0, volume: None, volume_root: None, frees_alone: Some(1), confidence: "exact".into(), tool: None, unmeasurable: None };
+        let plan = |it: PlannedItem| PlanRecord { id: "p".into(), unix: 0, time: String::new(), items: vec![it], volumes: vec![] };
+        assert_eq!(check_live_ids(&a, &plan(item("d1", r"D:\s2\Intermediate", 11))), Ok(()));
+        assert_eq!(check_live_ids(&a, &plan(item("d1", r"D:\s2\Intermediate", 77))).unwrap_err(), CHECKUP_CHANGED, "made again since the checkup");
+        assert_eq!(check_live_ids(&a, &plan(item("d1", r"D:\s2\Content", 11))).unwrap_err(), CHECKUP_CHANGED);
+        // Fingerprints ignore the case and slashes of paths, never the key or the ids.
+        assert_eq!(item_fingerprint("k", &[r"D:\S2\x".into()], &[1]), item_fingerprint("k", &["d:/s2/x".into()], &[1]));
+        assert_ne!(item_fingerprint("k", &[r"D:\s2\x".into()], &[1]), item_fingerprint("k", &[r"D:\s2\x".into()], &[2]));
+        assert_ne!(item_fingerprint("k", &[r"D:\s2\x".into()], &[1]), item_fingerprint("j", &[r"D:\s2\x".into()], &[1]));
     }
 
     #[test]

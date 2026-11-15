@@ -204,6 +204,12 @@ enum DiskCmd {
         /// Stay and watch the drive until the space shows up (up to 30 minutes), then print it
         #[arg(long)]
         wait: bool,
+        /// The checkup the ids come from (memguard disk checkup prints it). Required with --yes
+        #[arg(long, value_name = "CHECKUP_ID")]
+        checkup: Option<String>,
+        /// What each item was when you saw it: <id>=<fingerprint> (the checkup window passes these)
+        #[arg(long, value_name = "ID=FINGERPRINT")]
+        expect: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -271,7 +277,7 @@ fn confirm(question: &str, yes: bool) -> Result<bool, String> {
     Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
-fn disk_clean_cmd(fix: Vec<String>, dry_run: bool, yes: bool, wait: bool, json: bool) -> ExitCode {
+fn disk_clean_cmd(fix: Vec<String>, dry_run: bool, yes: bool, wait: bool, checkup: Option<String>, expect: Vec<String>, json: bool) -> ExitCode {
     use athermemguard::disk_clean::{self as dc, CleanAction, DiskFiles};
     use athermemguard::disk_scan;
     let fail = |e: String| {
@@ -301,6 +307,30 @@ fn disk_clean_cmd(fix: Vec<String>, dry_run: bool, yes: bool, wait: bool, json: 
         }
     }
     let ids: Vec<String> = picks.iter().map(|(i, _)| i.clone()).collect();
+    // What the person (or the checkup window) saw: without it, --yes could act on ids that a
+    // newer checkup gave to other folders.
+    let mut expects = Vec::new();
+    for e in &expect {
+        match dc::parse_expect(e) {
+            Ok(x) => expects.push(x),
+            Err(e) => return fail(e),
+        }
+    }
+    match &checkup {
+        Some(cid) => {
+            if let Err(e) = dc::check_identity(&cache, cid, &expects, &ids) {
+                return fail(e);
+            }
+        }
+        None if !expects.is_empty() => return fail("--expect goes with --checkup <id>. Nothing was changed.".into()),
+        None if yes && !dry_run => {
+            return fail(format!(
+                "Nothing was changed: with --yes, also pass --checkup {} (the checkup these ids come from), so a newer checkup can't change what they mean.",
+                cache.ident()
+            ))
+        }
+        None => {}
+    }
     let mut p = |files: u64, secs: f64| {
         if !json {
             eprintln!("counting: {} files, {:.0} s", files, secs);
@@ -310,6 +340,11 @@ fn disk_clean_cmd(fix: Vec<String>, dry_run: bool, yes: bool, wait: bool, json: 
         Ok(x) => x,
         Err(e) => return fail(e),
     };
+    if checkup.is_some() {
+        if let Err(e) = dc::check_live_ids(&cache, &rec) {
+            return fail(e);
+        }
+    }
     let files = DiskFiles::default();
     let _ = files.save_plan(&rec);
     if !json {
@@ -584,7 +619,7 @@ fn disk_cmd(json: bool, refresh: bool, action: Option<DiskCmd>) -> ExitCode {
             athermemguard::disk_clean::watch(&athermemguard::disk_clean::DiskFiles::default(), &id, &mut |_| {});
             ExitCode::SUCCESS
         }
-        Some(DiskCmd::Clean { fix, dry_run, yes, wait, json }) => disk_clean_cmd(fix, dry_run, yes, wait, json),
+        Some(DiskCmd::Clean { fix, dry_run, yes, wait, checkup, expect, json }) => disk_clean_cmd(fix, dry_run, yes, wait, checkup, expect, json),
         Some(DiskCmd::Bin { empty, expired, volume, yes, json }) => disk_bin_cmd(empty, expired, volume, yes, json),
         Some(DiskCmd::Relocate { to, apply, undo, yes, json }) => disk_relocate_cmd(to, apply, undo, yes, json),
         Some(DiskCmd::Undo { undo_id, json }) => {

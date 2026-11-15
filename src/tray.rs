@@ -553,11 +553,14 @@ pub struct RealDoctor {
     after_apply: std::sync::Mutex<Option<f64>>,
     /// The tray window, for the "Checkup done" toast. 0 = no toast, no rescan (tests).
     tray: isize,
+    /// The disk checkup the drive rows were built from: a clean confirmed on them carries its
+    /// id and each item's fingerprint, so a newer checkup can't change what `d3` means.
+    disk_seen: std::sync::Mutex<Option<crate::disk_scan::CachedCheckup>>,
 }
 
 impl RealDoctor {
     pub fn new(tray: isize) -> RealDoctor {
-        RealDoctor { last: std::sync::Mutex::new(None), after_apply: std::sync::Mutex::new(None), tray }
+        RealDoctor { last: std::sync::Mutex::new(None), after_apply: std::sync::Mutex::new(None), tray, disk_seen: std::sync::Mutex::new(None) }
     }
 
     /// Start from a report built elsewhere (tests).
@@ -592,29 +595,23 @@ impl RealDoctor {
         let summary = doctor_map::cleanup_summary(&report, &outs);
         let mut view: Vec<crate::ui::doctor::Outcome> = outs.iter().map(doctor_map::outcome_view).collect();
         if !disk.is_empty() {
-            view.extend(Self::clean_disk(&disk));
+            let seen = self.disk_seen.lock().unwrap().clone();
+            view.extend(Self::clean_disk(seen.as_ref(), &disk));
         }
         (view, summary)
     }
 
     /// Drive rows: `memguard disk clean` in a hidden child (fresh plan, every rule checked
     /// again, the measured watch), so the tray process never walks or deletes files.
-    fn clean_disk(picks: &[(String, crate::ui::doctor::ActionKind)]) -> Vec<crate::ui::doctor::Outcome> {
-        use crate::ui::doctor::{ActionKind as K, Outcome, OutcomeStatus};
-        let fix: Vec<String> = picks
-            .iter()
-            .map(|(id, k)| {
-                let a = match k {
-                    K::DiskBin => "bin",
-                    K::DiskTool => "tool",
-                    _ => "now",
-                };
-                format!("{}:{}", id.trim_start_matches("disk:"), a)
-            })
-            .collect();
-        let mut args: Vec<&str> = vec!["disk", "clean", "--yes", "--json", "--fix"];
-        args.extend(fix.iter().map(String::as_str));
-        let res = crate::disk_clean::run_cli_json(&args, Duration::from_secs(900));
+    fn clean_disk(seen: Option<&crate::disk_scan::CachedCheckup>, picks: &[(String, crate::ui::doctor::ActionKind)]) -> Vec<crate::ui::doctor::Outcome> {
+        use crate::ui::doctor::{Outcome, OutcomeStatus};
+        let res = match seen.ok_or_else(|| "Check again first".to_string()).and_then(|c| doctor_map::disk_clean_args(c, picks)) {
+            Ok(args) => {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                crate::disk_clean::run_cli_json(&args, Duration::from_secs(900))
+            }
+            Err(e) => Err(e),
+        };
         picks
             .iter()
             .map(|(id, k)| {
@@ -637,10 +634,12 @@ impl crate::ui::doctor::DoctorSource for RealDoctor {
         let r = Self::fresh_scan();
         let mut view = doctor_map::report_view(&r);
         // Drive rows from the last disk checkup (counting never runs in the tray).
-        if let Some(c) = crate::disk_scan::load_cache() {
+        let seen = crate::disk_scan::load_cache();
+        if let Some(c) = &seen {
             let cfg = crate::doctor::load_config_readonly();
-            view.findings.extend(doctor_map::disk_rows(&c, cfg.disk().fresh_sec, crate::disk_clean::unix_now()));
+            view.findings.extend(doctor_map::disk_rows(c, cfg.disk().fresh_sec, crate::disk_clean::unix_now()));
         }
+        *self.disk_seen.lock().unwrap() = seen;
         *self.last.lock().unwrap() = Some(r);
         view
     }
@@ -833,6 +832,29 @@ pub mod doctor_map {
             });
         }
         out
+    }
+
+    /// `memguard disk clean` for drive rows picked in the window: the checkup the rows came
+    /// from and each item's fingerprint go along, so the CLI refuses if the ids now name
+    /// something else (another checkup ran in between).
+    pub fn disk_clean_args(seen: &crate::disk_scan::CachedCheckup, picks: &[(String, vm::ActionKind)]) -> Result<Vec<String>, String> {
+        let mut args: Vec<String> = vec!["disk".into(), "clean".into(), "--yes".into(), "--json".into(), "--checkup".into(), seen.ident()];
+        let mut fix = Vec::new();
+        for (id, k) in picks {
+            let short = id.trim_start_matches("disk:");
+            let fp = crate::disk_clean::checkup_item_fingerprint(seen, short).ok_or_else(|| "Check again first".to_string())?;
+            args.push("--expect".into());
+            args.push(format!("{}={}", short, fp));
+            let a = match k {
+                vm::ActionKind::DiskBin => "bin",
+                vm::ActionKind::DiskTool => "tool",
+                _ => "now",
+            };
+            fix.push(format!("{}:{}", short, a));
+        }
+        args.push("--fix".into());
+        args.extend(fix);
+        Ok(args)
     }
 
     /// A drive row's result, from one `memguard disk clean --json` outcome.
@@ -2500,6 +2522,7 @@ mod disk_row_tests {
 
     fn cached(items: Vec<serde_json::Value>, unix: u64) -> crate::disk_scan::CachedCheckup {
         crate::disk_scan::CachedCheckup {
+            id: "c1".into(),
             scope: "*".into(),
             unix,
             time: String::new(),
@@ -2529,6 +2552,29 @@ mod disk_row_tests {
         // An old checkup: "about".
         let old = doctor_map::disk_rows(&cached(items, 1000), 300, 5000);
         assert_eq!(old[0].disk.as_ref().unwrap().frees_words(), "about 16.4 GB");
+    }
+
+    /// The window confirms on its snapshot (checkup A); another checkup (B) replaces the saved
+    /// one before the clean runs: the arguments the window passes make the CLI refuse.
+    #[test]
+    fn drive_cleanup_carries_what_the_window_showed() {
+        let mut a = cached(vec![], 1000);
+        a.id = "cA".into();
+        a.items = vec![crate::disk_scan::CatItem { key: "ue:intermediate".into(), class: "regenerable".into(), title: "Build files".into(), paths: vec![r"D:\s2\Intermediate".into()], lane: None }];
+        a.root_ids = vec![vec![42]];
+        let args = doctor_map::disk_clean_args(&a, &[("disk:d1".into(), vm::ActionKind::DiskNow)]).unwrap();
+        let fp = crate::disk_clean::checkup_item_fingerprint(&a, "d1").unwrap();
+        assert_eq!(args, ["disk", "clean", "--yes", "--json", "--checkup", "cA", "--expect", &format!("d1={}", fp), "--fix", "d1:now"]);
+        let expects = vec![crate::disk_clean::parse_expect(&args[7]).unwrap()];
+        let ids = vec!["d1".to_string()];
+        assert_eq!(crate::disk_clean::check_identity(&a, &args[5], &expects, &ids), Ok(()));
+        let mut b = a.clone();
+        b.id = "cB".into();
+        b.items[0].paths = vec![r"D:\other\Intermediate".into()];
+        b.root_ids = vec![vec![7]];
+        assert_eq!(crate::disk_clean::check_identity(&b, &args[5], &expects, &ids).unwrap_err(), crate::disk_clean::CHECKUP_CHANGED);
+        // An id the snapshot doesn't have: nothing runs.
+        assert!(doctor_map::disk_clean_args(&a, &[("disk:d5".into(), vm::ActionKind::DiskNow)]).is_err());
     }
 
     #[test]
