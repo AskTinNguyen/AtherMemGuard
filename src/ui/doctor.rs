@@ -160,13 +160,21 @@ pub struct DiskRow {
     pub frees_gb: Option<f64>,
     /// exact, lower_bound, estimate, upper_bound, unknown.
     pub confidence: String,
+    /// The most it could free, for words only (never summed): "up to 23.7 GB" where the lower
+    /// bound is about nothing because the clusters weren't counted in time.
+    pub frees_max_gb: Option<f64>,
 }
 
 impl DiskRow {
-    /// "16.4 GB", "at least 16.4 GB", "about 16.4 GB".
+    /// "16.4 GB", "at least 16.4 GB", "about 16.4 GB", "up to 23.7 GB", "an amount not counted
+    /// in time".
     pub fn frees_words(&self) -> String {
         match self.frees_gb {
-            None => "an unknown amount".into(),
+            None => "an amount not counted".into(),
+            Some(g) if self.confidence == "lower_bound" && g < 0.05 => match self.frees_max_gb {
+                Some(m) if m >= 0.05 => format!("up to {}", format_gb(m)),
+                _ => format!("at least {}", format_gb(g)),
+            },
             Some(g) => {
                 let q = match self.confidence.as_str() {
                     "lower_bound" => "at least ",
@@ -612,6 +620,12 @@ impl DoctorModel {
         self.sections(tab).iter().map(|s| s.rows.len()).sum()
     }
 
+    /// What `tab`'s title counts: its rows you can act on (a notice isn't counted), so the
+    /// Disk space count is the hero's "N ITEMS COULD GO".
+    pub fn actionable(&self, tab: Tab) -> usize {
+        self.sections(tab).iter().flat_map(|s| s.rows.iter()).filter(|&&i| !choices(&self.report.findings[i]).is_empty()).count()
+    }
+
     /// Nothing proposed on `tab`: no finding with an action there.
     pub fn all_clear(&self, tab: Tab) -> bool {
         self.report.findings.iter().filter(|f| tab_of(f) == tab).all(|f| section_of(f).is_none() || choices(f).is_empty())
@@ -635,30 +649,37 @@ pub fn disk_footer_words(sel: &[(ActionKind, DiskRow)]) -> String {
     if sel.is_empty() {
         return "Selected: nothing yet".into();
     }
-    // (drive, known GB, some unknown)
-    let mut vols: Vec<(String, f64, bool)> = Vec::new();
+    // (drive, known GB, some unknown, some only a lower bound, the most it could free)
+    let mut vols: Vec<(String, f64, bool, bool, f64)> = Vec::new();
     for (_, row) in sel.iter().filter(|(k, _)| *k != ActionKind::DiskBin) {
         let v = row.volume.trim().to_ascii_uppercase();
         let v = if v.is_empty() { "your drives".to_string() } else { v };
         let at = match vols.iter().position(|e| e.0 == v) {
             Some(at) => at,
             None => {
-                vols.push((v, 0.0, false));
+                vols.push((v, 0.0, false, false, 0.0));
                 vols.len() - 1
             }
         };
         match row.frees_gb {
-            Some(g) => vols[at].1 += g,
+            Some(g) => {
+                vols[at].1 += g;
+                vols[at].4 += row.frees_max_gb.unwrap_or(g).max(g);
+                vols[at].3 |= row.confidence == "lower_bound";
+            }
             None => vols[at].2 = true,
         }
     }
     vols.sort_by(|a, b| a.0.cmp(&b.0));
     let parts: Vec<String> = vols
         .iter()
-        .map(|(v, gb, unknown)| match (*gb > 0.0, *unknown) {
-            (_, false) => format!("about {} on {}", format_gb(*gb), v),
-            (true, true) => format!("at least {} on {}", format_gb(*gb), v),
-            (false, true) => format!("an unknown amount on {}", v),
+        .map(|(v, gb, unknown, lower, most)| match (*gb >= 0.05, *unknown, *lower) {
+            // Only sized on a Dev Drive: the lower bound is about nothing, the ceiling is real.
+            (false, false, true) if *most >= 0.05 => format!("up to {} on {}", format_gb(*most), v),
+            (_, false, true) => format!("at least {} on {}", format_gb(*gb), v),
+            (_, false, false) => format!("about {} on {}", format_gb(*gb), v),
+            (true, true, _) => format!("at least {} on {}", format_gb(*gb), v),
+            (false, true, _) => format!("an amount not counted on {}", v),
         })
         .collect();
     let bins = sel.iter().filter(|(k, _)| *k == ActionKind::DiskBin).count();
@@ -806,12 +827,12 @@ impl FakeDoctor {
         findings.push(perf);
         if disk_checked {
             let mut build = f("disk:d1", K::Disk, V::Review, "Build files for S2", r"D:\s2\Intermediate", 0, 0, &[A::DiskNow, A::DiskBin], false);
-            build.disk = Some(DiskRow { volume: "D:".into(), frees_gb: Some(16.4), confidence: "exact".into() });
+            build.disk = Some(DiskRow { volume: "D:".into(), frees_gb: Some(16.4), confidence: "exact".into(), frees_max_gb: None });
             let mut logs = f("disk:d2", K::Disk, V::Review, "Logs for S2", r"D:\s2\Saved\Logs", 0, 0, &[A::DiskBin, A::DiskNow], false);
-            logs.disk = Some(DiskRow { volume: "D:".into(), frees_gb: Some(0.4), confidence: "exact".into() });
+            logs.disk = Some(DiskRow { volume: "D:".into(), frees_gb: Some(0.4), confidence: "exact".into(), frees_max_gb: None });
             let mut npm = f("disk:d3", K::Disk, V::Review, "npm cache", r"C:\Users\you\AppData\Local\npm-cache\_cacache", 0, 0, &[A::DiskNow, A::DiskBin, A::DiskTool], false);
             npm.actions[2].detail = "Clean with npm".into();
-            npm.disk = Some(DiskRow { volume: "C:".into(), frees_gb: Some(3.1), confidence: "estimate".into() });
+            npm.disk = Some(DiskRow { volume: "C:".into(), frees_gb: Some(3.1), confidence: "estimate".into(), frees_max_gb: None });
             findings.insert(13, npm);
             findings.insert(13, logs);
             findings.insert(13, build);
@@ -1436,7 +1457,7 @@ impl DoctorWindow {
         let tab_h = c.s(38.0);
         let mut x = left;
         for t in Tab::ALL {
-            let count = self.model.as_ref().filter(|_| !self.scanning || self.scan_scope.is_some_and(|s| s != t)).map(|m| m.count(t)).filter(|n| *n > 0);
+            let count = self.model.as_ref().filter(|_| !self.scanning || self.scan_scope.is_some_and(|s| s != t)).map(|m| m.actionable(t)).filter(|n| *n > 0);
             let tw = tab_width(c, t.title(), count);
             items.push(Item::new(Rect::new(x, y, tw, tab_h), Paint::Tab { label: t.title().into(), count, active: t == self.tab }).act(Act::Tab(t)));
             x += tw + c.s(8.0);
@@ -2190,6 +2211,22 @@ pub fn render(win: &mut DoctorWindow, scale: Scale, w: i32, h: Option<i32>) -> C
 }
 
 #[cfg(test)]
+mod frees_words_tests {
+    use super::DiskRow;
+    fn row(gb: Option<f64>, conf: &str, max: Option<f64>) -> DiskRow {
+        DiskRow { volume: "D:".into(), frees_gb: gb, confidence: conf.into(), frees_max_gb: max }
+    }
+    #[test]
+    fn a_lower_bound_of_nothing_says_up_to_and_not_counted_says_so() {
+        assert_eq!(row(Some(0.0), "lower_bound", Some(23.7)).frees_words(), "up to 23.7 GB");
+        assert_eq!(row(Some(5.0), "lower_bound", Some(23.7)).frees_words(), "at least 5.0 GB");
+        assert_eq!(row(Some(0.0), "lower_bound", None).frees_words(), "at least 0 MB");
+        assert_eq!(row(None, "unknown", None).frees_words(), "an amount not counted");
+        assert_eq!(row(Some(3.0), "estimate", Some(3.0)).frees_words(), "about 3.0 GB");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2288,10 +2325,19 @@ mod tests {
     }
 
     #[test]
+    fn footer_words_for_rows_only_sized_on_a_dev_drive() {
+        let lb = |v: &str, g: f64, m: f64| DiskRow { volume: v.into(), frees_gb: Some(g), confidence: "lower_bound".into(), frees_max_gb: Some(m) };
+        assert_eq!(disk_footer_words(&[(ActionKind::DiskNow, lb("D:", 0.0, 14.9)), (ActionKind::DiskNow, lb("D:", 0.0, 24.0))]), "Selected: frees up to 38.9 GB on D: (predicted)");
+        assert_eq!(disk_footer_words(&[(ActionKind::DiskNow, lb("D:", 5.0, 24.0))]), "Selected: frees at least 5.0 GB on D: (predicted)");
+        let unk = DiskRow { volume: "D:".into(), frees_gb: None, confidence: "unknown".into(), frees_max_gb: None };
+        assert_eq!(disk_footer_words(&[(ActionKind::DiskNow, unk)]), "Selected: frees an amount not counted on D: (predicted)");
+    }
+
+    #[test]
     fn footer_words_per_tab() {
         assert_eq!(memory_footer_words(1680.0 / 1024.0), "Selected: frees about 1.6 GB of RAM");
         assert_eq!(memory_footer_words(0.0), "Selected: frees about 0.0 GB of RAM");
-        let row = |v: &str, gb: Option<f64>| DiskRow { volume: v.into(), frees_gb: gb, confidence: "exact".into() };
+        let row = |v: &str, gb: Option<f64>| DiskRow { volume: v.into(), frees_gb: gb, confidence: "exact".into(), frees_max_gb: None };
         assert_eq!(disk_footer_words(&[]), "Selected: nothing yet");
         assert_eq!(disk_footer_words(&[(ActionKind::DiskNow, row("D:", Some(16.4)))]), "Selected: frees about 16.4 GB on D: (predicted)");
         // Per drive, drives in letter order; a tool's clean counts, bin moves don't.
@@ -2312,7 +2358,7 @@ mod tests {
             "Selected: 2 items to the bin (frees nothing until it's emptied)"
         );
         // Not measured: never a made-up number.
-        assert_eq!(disk_footer_words(&[(ActionKind::DiskNow, row("E:", None))]), "Selected: frees an unknown amount on E: (predicted)");
+        assert_eq!(disk_footer_words(&[(ActionKind::DiskNow, row("E:", None))]), "Selected: frees an amount not counted on E: (predicted)");
         assert_eq!(
             disk_footer_words(&[(ActionKind::DiskNow, row("E:", None)), (ActionKind::DiskNow, row("E:", Some(2.0)))]),
             "Selected: frees at least 2.0 GB on E: (predicted)"
@@ -2713,10 +2759,13 @@ mod tests {
         assert_eq!(
             tabs,
             [
-                Paint::Tab { label: "Memory".into(), count: Some(m.count(Tab::Memory)), active: true },
-                Paint::Tab { label: "Disk space".into(), count: Some(5), active: false },
+                Paint::Tab { label: "Memory".into(), count: Some(m.actionable(Tab::Memory)), active: true },
+                Paint::Tab { label: "Disk space".into(), count: Some(3), active: false },
             ]
         );
+        // A title counts what can be acted on, not notices: Disk space's 5 rows include 2 notices.
+        assert_eq!(m.count(Tab::Disk), 5);
+        assert!(m.actionable(Tab::Memory) < m.count(Tab::Memory));
         // Clicking the tab.
         w.size = (760, 720);
         let r = w.items().iter().find(|it| it.act == Some(Act::Tab(Tab::Disk))).unwrap().rect;

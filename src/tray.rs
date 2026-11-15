@@ -848,7 +848,7 @@ pub mod doctor_map {
                 continue;
             }
             let mut conf = it["frees_confidence"].as_str().unwrap_or("unknown").to_string();
-            if stale && (conf == "exact" || conf == "lower_bound") {
+            if stale && crate::disk_scan::ages_to_estimate(it, "frees_alone_gb") {
                 conf = "estimate".into();
             }
             let (title, detail) = match agreeing_item(c, it) {
@@ -880,7 +880,7 @@ pub mod doctor_map {
                 company: String::new(),
                 help_url: None,
                 help_command: None,
-                disk: Some(vm::DiskRow { volume: it["volume"].as_str().unwrap_or("").to_string(), frees_gb: it["frees_alone_gb"].as_f64(), confidence: conf }),
+                disk: Some(vm::DiskRow { volume: it["volume"].as_str().unwrap_or("").to_string(), frees_gb: it["frees_alone_gb"].as_f64(), confidence: conf, frees_max_gb: it["frees_max_gb"].as_f64() }),
                 drive_notice: false,
             });
         }
