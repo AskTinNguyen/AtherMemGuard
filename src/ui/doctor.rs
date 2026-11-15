@@ -58,6 +58,8 @@ pub enum FindingKind {
     Startup,
     Unreal,
     System,
+    /// Addition: an item of the last disk checkup that can be cleaned.
+    Disk,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +80,41 @@ pub enum ActionKind {
     BlockWhileUnreal,
     /// Addition: "Leave it" on a WORTH A LOOK row adds the app to `[doctor] keep`.
     Keep,
+    /// Addition, drive items: delete for good.
+    DiskNow,
+    /// Addition, drive items: move into Ather MemGuard's bin (undoable; frees nothing yet).
+    DiskBin,
+    /// Addition, drive items: the tool's own clean command (can't be undone).
+    DiskTool,
+}
+
+/// Addition: what a drive row knows (from the last disk checkup).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DiskRow {
+    /// "D:".
+    pub volume: String,
+    /// Predicted to free if deleted alone; `None` = not measured.
+    pub frees_gb: Option<f64>,
+    /// exact, lower_bound, estimate, upper_bound, unknown.
+    pub confidence: String,
+}
+
+impl DiskRow {
+    /// "16.4 GB", "at least 16.4 GB", "about 16.4 GB".
+    pub fn frees_words(&self) -> String {
+        match self.frees_gb {
+            None => "an unknown amount".into(),
+            Some(g) => {
+                let q = match self.confidence.as_str() {
+                    "lower_bound" => "at least ",
+                    "estimate" => "about ",
+                    "upper_bound" => "at most ",
+                    _ => "",
+                };
+                format!("{}{}", q, format_gb(g))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -116,6 +153,8 @@ pub struct Finding {
     /// Addition: a THIS PC row whose link runs a command instead ("Show me how" on the RAM
     /// check rows writes and opens the RAM report). Wins over `help_url`.
     pub help_command: Option<Command>,
+    /// Addition: set on drive rows.
+    pub disk: Option<DiskRow>,
 }
 
 /// The link a THIS PC row shows, if any.
@@ -176,7 +215,15 @@ pub fn choices(f: &Finding) -> Vec<Choice> {
     let close_first = |i: usize| f.actions[..i].iter().any(|a| a.kind == ActionKind::Close);
     let mut out = Vec::new();
     for (ai, a) in f.actions.iter().enumerate() {
+        if a.kind == ActionKind::DiskTool {
+            let label = if a.detail.is_empty() { "Clean with the tool".to_string() } else { a.detail.clone() };
+            out.push(Choice { label, picks: vec![ActionKind::DiskTool] });
+            continue;
+        }
         let (label, picks): (&str, Vec<ActionKind>) = match (f.kind, f.verdict, a.kind) {
+            (_, _, ActionKind::DiskNow) => ("Delete it", vec![ActionKind::DiskNow]),
+            (_, _, ActionKind::DiskBin) => ("Move to the bin", vec![ActionKind::DiskBin]),
+            (_, _, ActionKind::DiskTool) => ("Clean with the tool", vec![ActionKind::DiskTool]),
             (FindingKind::Startup, _, ActionKind::DisableStartup) => ("Don't start with Windows", vec![ActionKind::DisableStartup]),
             (FindingKind::Unreal, _, ActionKind::End) => ("End them", vec![ActionKind::End]),
             (_, Verdict::HeavyTool, ActionKind::Close) => ("Close if you're not using it", vec![ActionKind::Close]),
@@ -205,12 +252,22 @@ pub enum SectionKind {
     WorthALook,
     HeldBack,
     Unreal,
+    /// Addition: what can go from the drives (from the last disk checkup).
+    Disk,
     ThisPc,
 }
 
 impl SectionKind {
-    pub const ORDER: [SectionKind; 7] =
-        [SectionKind::NotNeeded, SectionKind::Startup, SectionKind::BigTools, SectionKind::WorthALook, SectionKind::HeldBack, SectionKind::Unreal, SectionKind::ThisPc];
+    pub const ORDER: [SectionKind; 8] = [
+        SectionKind::NotNeeded,
+        SectionKind::Startup,
+        SectionKind::BigTools,
+        SectionKind::WorthALook,
+        SectionKind::HeldBack,
+        SectionKind::Unreal,
+        SectionKind::Disk,
+        SectionKind::ThisPc,
+    ];
     pub fn title(self) -> &'static str {
         match self {
             SectionKind::NotNeeded => "NOT NEEDED FOR UNREAL",
@@ -219,6 +276,7 @@ impl SectionKind {
             SectionKind::WorthALook => "WORTH A LOOK",
             SectionKind::HeldBack => "HELD BACK, NOT CLOSED",
             SectionKind::Unreal => "UNREAL",
+            SectionKind::Disk => "ON YOUR DRIVES",
             SectionKind::ThisPc => "THIS PC",
         }
     }
@@ -230,6 +288,7 @@ pub fn section_of(f: &Finding) -> Option<SectionKind> {
         (FindingKind::Startup, _) => Some(SectionKind::Startup),
         (FindingKind::Unreal, _) => Some(SectionKind::Unreal),
         (FindingKind::System, _) => Some(SectionKind::ThisPc),
+        (FindingKind::Disk, _) => Some(SectionKind::Disk),
         (FindingKind::App, Verdict::Close) => Some(SectionKind::NotNeeded),
         (FindingKind::App, Verdict::HeavyTool) => Some(SectionKind::BigTools),
         (FindingKind::App, Verdict::Review) => Some(SectionKind::WorthALook),
@@ -280,7 +339,8 @@ impl DoctorModel {
     /// WORTH A LOOK rows never do.
     fn default_checked(f: &Finding) -> bool {
         match section_of(f) {
-            Some(SectionKind::BigTools | SectionKind::WorthALook) | None => false,
+            // Deleting files is always the person's pick.
+            Some(SectionKind::BigTools | SectionKind::WorthALook | SectionKind::Disk) | None => false,
             Some(SectionKind::HeldBack) => true,
             _ => f.recommended,
         }
@@ -344,6 +404,12 @@ impl DoctorModel {
             .filter(|&i| self.rows[i].checked && self.selectable(i))
             .filter(|&i| self.chosen(i).is_some_and(|c| c.picks.contains(&ActionKind::End)))
             .collect()
+    }
+
+    /// Checked drive rows. CLEAN UP lists them (what goes, how, the predicted frees) and asks
+    /// before anything runs.
+    pub fn disk_rows(&self) -> Vec<usize> {
+        (0..self.rows.len()).filter(|&i| self.rows[i].checked && self.selectable(i) && self.report.findings[i].kind == FindingKind::Disk).collect()
     }
 
     /// Mark the checked rows as running and return their picks.
@@ -425,6 +491,9 @@ pub fn outcome_text(outs: &[Outcome]) -> (String, Rgb) {
                 (_, ActionKind::HoldBack) => "Held back".into(),
                 (_, ActionKind::BlockWhileUnreal) => "Stays closed while Unreal is running".into(),
                 (_, ActionKind::Keep) => "Left as it is".into(),
+                (_, ActionKind::DiskNow) => "Deleted".into(),
+                (_, ActionKind::DiskBin) => "Moved to the bin".into(),
+                (_, ActionKind::DiskTool) => "Cleaned".into(),
             }
         };
         if !parts.contains(&m) {
@@ -473,6 +542,7 @@ impl FakeDoctor {
             company: String::new(),
             help_url: None,
             help_command: None,
+            disk: None,
         };
         use ActionKind as A;
         use FindingKind as K;
@@ -512,6 +582,16 @@ impl FakeDoctor {
         findings[9].company = "Northwind Systems".into();
         findings[13].help_url = Some("https://github.com/AskTinNguyen/AtherMemGuard/blob/main/docs/PAGEFILE.md".into());
         findings[14].help_command = Some(Command::ShowRamReport);
+        let mut build = f("disk:d1", K::Disk, V::Review, "Build files for S2", r"D:\s2\Intermediate", 0, 0, &[A::DiskNow, A::DiskBin], false);
+        build.disk = Some(DiskRow { volume: "D:".into(), frees_gb: Some(16.4), confidence: "exact".into() });
+        let mut logs = f("disk:d2", K::Disk, V::Review, "Logs for S2", r"D:\s2\Saved\Logs", 0, 0, &[A::DiskBin, A::DiskNow], false);
+        logs.disk = Some(DiskRow { volume: "D:".into(), frees_gb: Some(0.4), confidence: "exact".into() });
+        let mut npm = f("disk:d3", K::Disk, V::Review, "npm cache", r"C:\Users\you\AppData\Local\npm-cache\_cacache", 0, 0, &[A::DiskNow, A::DiskBin, A::DiskTool], false);
+        npm.actions[2].detail = "Clean with npm".into();
+        npm.disk = Some(DiskRow { volume: "C:".into(), frees_gb: Some(3.1), confidence: "estimate".into() });
+        findings.insert(13, npm);
+        findings.insert(13, logs);
+        findings.insert(13, build);
         let reclaim: u64 = findings.iter().filter(|f| f.kind == K::App || f.kind == K::Unreal).filter(|f| f.verdict != V::HoldBack).map(|f| f.ram_mb).sum();
         Report { time: "2026-11-14 14:02:11".into(), system, findings, reclaimable_ram_gb: reclaim as f64 / 1024.0, reclaimable_commit_gb: reclaim as f64 * 1.25 / 1024.0 }
     }
@@ -522,6 +602,8 @@ impl FakeDoctor {
             ("app:discord", ActionKind::HoldBack) => (OutcomeStatus::Done, "Added to Chat".to_string()),
             ("app:dropbox", ActionKind::HoldBack) => (OutcomeStatus::Done, "Added to Background".to_string()),
             ("ue:orphans", ActionKind::End) => (OutcomeStatus::Done, "Ended 3 helpers".to_string()),
+            (_, ActionKind::DiskNow) => (OutcomeStatus::Done, "Deleted · frees 16.4 GB (predicted); measured later".to_string()),
+            (_, ActionKind::DiskBin) => (OutcomeStatus::Done, "Moved to the bin · frees nothing until it's emptied".to_string()),
             _ => (OutcomeStatus::Done, String::new()),
         };
         Outcome { finding_id: id.into(), action, status, message }
@@ -639,6 +721,34 @@ pub enum Confirm {
     End(usize),
     /// CLEAN UP with rows that end processes checked: these rows, before anything runs.
     CleanUp(Vec<usize>),
+    /// CLEAN UP with drive rows checked: what goes, how, and the predicted frees.
+    Disk(Vec<usize>),
+}
+
+/// One drive row in the confirmation: (title, the chosen action, what it frees).
+pub type DiskPick<'a> = (&'a str, ActionKind, &'a DiskRow, &'a str);
+
+/// The drive confirmation's words: (title, body, OK button). Lists every item under what
+/// happens to it, with the predicted frees; says what can't be undone and that the space is
+/// measured afterwards. Never adds the items' numbers up (they can overlap).
+pub fn disk_confirm_words(picks: &[DiskPick]) -> (String, String, String) {
+    let mut lines = Vec::new();
+    for (title, kind, row, tool_label) in picks {
+        lines.push(match kind {
+            ActionKind::DiskBin => format!("Move to the bin: {} (frees nothing until the bin is emptied)", title),
+            ActionKind::DiskTool => format!("{}: {} (frees {} predicted; can't be undone)", tool_label, title, row.frees_words()),
+            _ => format!("Delete for good: {} on {} (frees {} predicted)", title, row.volume, row.frees_words()),
+        });
+    }
+    let permanent = picks.iter().any(|p| p.1 != ActionKind::DiskBin);
+    lines.push(if permanent {
+        "Deleting can't be undone. The space is measured afterwards and you'll get a notification.".to_string()
+    } else {
+        "Undo with \"Undo last cleanup\". The bin empties itself after a day.".to_string()
+    });
+    let n = picks.len();
+    let title = if n == 1 { "Clean up 1 item on your drives?".to_string() } else { format!("Clean up {} items on your drives?", n) };
+    (title, lines.join("\n"), if permanent { "Delete".into() } else { "Move to the bin".into() })
 }
 
 /// "Spotify, iCUE and 3 leftover Unreal helpers"
@@ -768,6 +878,11 @@ impl DoctorWindow {
     pub fn clean_up(&mut self, host: Option<&mut Host>) {
         let Some(m) = self.model.as_ref() else { return };
         if self.working || !m.any_checked() {
+            return;
+        }
+        let disk = m.disk_rows();
+        if !disk.is_empty() {
+            self.confirm = Some(Confirm::Disk(disk));
             return;
         }
         let ending = m.ending_rows();
@@ -978,6 +1093,10 @@ impl DoctorWindow {
                 if f.ram_mb > 0 { format!("Starts every time you sign in. Uses about {}.", gb) } else { "Starts every time you sign in.".to_string() },
             ),
             SectionKind::Unreal => (gb.clone(), f.detail.clone()),
+            SectionKind::Disk => (
+                f.disk.as_ref().map(|d| format!("{} · frees {} (predicted)", d.volume, d.frees_words())).unwrap_or_default(),
+                f.detail.clone(),
+            ),
             SectionKind::ThisPc => (String::new(), f.detail.clone()),
         };
         let hint_lines = if hint.is_empty() { Vec::new() } else { wrap_hard(c, &hint, F_HINT, text_w, 2) };
@@ -1088,7 +1207,15 @@ impl DoctorWindow {
 
     fn footer_text(&self) -> String {
         match &self.model {
-            Some(m) if !self.scanning && (0..m.rows.len()).any(|i| m.selectable(i)) => format!("Selected: frees about {:.1} GB", m.selected_gb()),
+            Some(m) if !self.scanning && (0..m.rows.len()).any(|i| m.selectable(i)) => {
+                let drive = m.disk_rows().len();
+                let mem = (0..m.rows.len()).any(|i| m.rows[i].checked && m.selectable(i) && m.report.findings[i].kind != FindingKind::Disk);
+                match (mem || drive == 0, drive) {
+                    (true, 0) => format!("Selected: frees about {:.1} GB", m.selected_gb()),
+                    (true, n) => format!("Selected: frees about {:.1} GB of memory · {} drive item{}", m.selected_gb(), n, if n == 1 { "" } else { "s" }),
+                    (false, n) => format!("Selected: {} drive item{} (frees are listed before anything runs)", n, if n == 1 { "" } else { "s" }),
+                }
+            }
             _ => String::new(),
         }
     }
@@ -1214,6 +1341,19 @@ impl DoctorWindow {
     fn dialog(&self) -> Option<Dialog> {
         let m = self.model.as_ref()?;
         let (title, body, ok) = match self.confirm.as_ref()? {
+            Confirm::Disk(rows) => {
+                let none = DiskRow::default();
+                let picks: Vec<(String, ActionKind, DiskRow, String)> = rows
+                    .iter()
+                    .filter_map(|&i| {
+                        let f = m.report.findings.get(i)?;
+                        let c = m.chosen(i)?;
+                        Some((f.title.clone(), *c.picks.first()?, f.disk.clone().unwrap_or_else(|| none.clone()), c.label.clone()))
+                    })
+                    .collect();
+                let refs: Vec<DiskPick> = picks.iter().map(|(t, k, r, l)| (t.as_str(), *k, r, l.as_str())).collect();
+                disk_confirm_words(&refs)
+            }
             Confirm::End(i) => confirm_words(&[m.report.findings.get(*i)?.title.clone()], false),
             Confirm::CleanUp(rows) => {
                 let names: Vec<String> = rows.iter().filter_map(|&i| m.report.findings.get(i)).map(|f| f.title.clone()).collect();
@@ -1309,6 +1449,15 @@ impl DoctorWindow {
 
     fn confirm_ok(&mut self, host: &mut Host) {
         match self.confirm.take() {
+            Some(Confirm::Disk(_)) => {
+                // Ending processes still gets its own question.
+                let ending = self.model.as_ref().map(|m| m.ending_rows()).unwrap_or_default();
+                if ending.is_empty() {
+                    self.run_clean_up(Some(host));
+                } else {
+                    self.confirm = Some(Confirm::CleanUp(ending));
+                }
+            }
             Some(Confirm::End(i)) => self.end_anyway(i, Some(host)),
             Some(Confirm::CleanUp(_)) => self.run_clean_up(Some(host)),
             None => {}
@@ -1513,7 +1662,10 @@ mod tests {
         let not_needed = &m.sections()[0];
         assert_eq!(not_needed.rows.len(), 5);
         assert_eq!(not_needed.ram_mb, 1270 + 980 + 640 + 410 + 560);
-        assert_eq!(m.sections()[6].ram_mb, 0, "THIS PC shows no memory");
+        assert_eq!(m.sections()[7].kind, SectionKind::ThisPc);
+        assert_eq!(m.sections()[7].ram_mb, 0, "THIS PC shows no memory");
+        assert_eq!(m.sections()[6].kind, SectionKind::Disk);
+        assert_eq!(m.sections()[6].ram_mb, 0, "drive rows show no memory");
         let clear = DoctorModel::new(FakeDoctor::report(true));
         assert!(clear.sections().is_empty());
         assert!(clear.all_clear());
@@ -1714,6 +1866,73 @@ mod tests {
         assert_eq!(outcome_text(&m.rows[orphans].outcomes).0, "Ended 3 helpers");
         assert_eq!(outcome_text(&m.rows[steam].outcomes).0, "Closed");
         assert!(w.can_undo);
+    }
+
+    #[test]
+    fn drive_rows_list_what_goes_and_ask_first() {
+        let mut w = DoctorWindow::new(Box::new(FakeDoctor::new()));
+        let mut host = Host::detached((760, 720), Scale(1.0));
+        w.scan(None);
+        let m = w.model.as_mut().unwrap();
+        let (build, logs, npm) = (idx(m, "disk:d1"), idx(m, "disk:d2"), idx(m, "disk:d3"));
+        assert!(!m.rows[build].checked && !m.rows[logs].checked, "deleting files is never pre-checked");
+        let labels = |m: &DoctorModel, i: usize| choices(&m.report.findings[i]).into_iter().map(|c| c.label).collect::<Vec<_>>();
+        assert_eq!(labels(m, build), ["Delete it", "Move to the bin"], "regenerable: delete first");
+        assert_eq!(labels(m, logs), ["Move to the bin", "Delete it"], "disposable: the bin first");
+        assert_eq!(labels(m, npm), ["Delete it", "Move to the bin", "Clean with npm"]);
+        for r in &mut m.rows {
+            r.checked = false;
+        }
+        m.toggle(build);
+        m.toggle(logs);
+        m.toggle(npm);
+        m.set_choice(npm, 2);
+        w.activate(Act::CleanUp, &mut host);
+        assert_eq!(w.confirm, Some(Confirm::Disk(vec![build, logs, npm])));
+        let d = w.dialog().unwrap();
+        assert_eq!(d.title, "Clean up 3 items on your drives?");
+        assert_eq!(
+            d.body,
+            "Delete for good: Build files for S2 on D: (frees 16.4 GB predicted)\n\
+             Move to the bin: Logs for S2 (frees nothing until the bin is emptied)\n\
+             Clean with npm: npm cache (frees about 3.1 GB predicted; can't be undone)\n\
+             Deleting can't be undone. The space is measured afterwards and you'll get a notification."
+        );
+        assert_eq!(d.ok.label, "Delete");
+        assert!(w.model.as_ref().unwrap().rows.iter().all(|r| r.outcomes.is_empty()), "nothing ran before the answer");
+        // Cancel: nothing ran.
+        w.event(Event::Key(VK_ESCAPE, Default::default()), &mut host);
+        assert!(w.model.as_ref().unwrap().rows.iter().all(|r| r.outcomes.is_empty()));
+        // OK: the rows turn into their results; the bin move can be undone.
+        w.activate(Act::CleanUp, &mut host);
+        w.confirm_ok(&mut host);
+        let m = w.model.as_ref().unwrap();
+        assert_eq!(outcome_text(&m.rows[build].outcomes).0, "Deleted · frees 16.4 GB (predicted); measured later");
+        assert_eq!(outcome_text(&m.rows[logs].outcomes).0, "Moved to the bin · frees nothing until it's emptied");
+        assert!(w.can_undo);
+        // Only bin moves: the confirmation says so and offers the bin.
+        let (t, b, ok) = disk_confirm_words(&[("Logs", ActionKind::DiskBin, &DiskRow::default(), "")]);
+        assert_eq!(t, "Clean up 1 item on your drives?");
+        assert!(b.ends_with("Undo with \"Undo last cleanup\". The bin empties itself after a day."));
+        assert_eq!(ok, "Move to the bin");
+    }
+
+    #[test]
+    fn drive_rows_and_ending_both_ask() {
+        let mut w = DoctorWindow::new(Box::new(FakeDoctor::new()));
+        let mut host = Host::detached((760, 720), Scale(1.0));
+        w.scan(None);
+        let m = w.model.as_mut().unwrap();
+        let (build, orphans) = (idx(m, "disk:d1"), idx(m, "ue:orphans"));
+        m.toggle(build);
+        m.toggle(orphans);
+        w.activate(Act::CleanUp, &mut host);
+        assert_eq!(w.confirm, Some(Confirm::Disk(vec![build])));
+        w.confirm_ok(&mut host);
+        assert_eq!(w.confirm, Some(Confirm::CleanUp(vec![orphans])), "ending still gets its own question");
+        assert!(w.model.as_ref().unwrap().rows.iter().all(|r| r.outcomes.is_empty()));
+        w.confirm_ok(&mut host);
+        assert!(!w.model.as_ref().unwrap().rows[build].outcomes.is_empty());
     }
 
     #[test]

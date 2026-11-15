@@ -89,8 +89,8 @@ fn i64_at(b: &[u8], o: usize) -> i64 {
     i64::from_le_bytes(b[o..o + 8].try_into().unwrap())
 }
 
-/// Open a file or folder without following a reparse point. `access` is attributes-only or
-/// list-directory: nothing here can read or change file contents.
+/// Open a file or folder without following a reparse point. `access` is attributes-only,
+/// list-directory or read-the-owner: nothing here can read or change file contents.
 fn open(path: &str, access: u32) -> Result<Handle, u32> {
     let p = wide(&long(path));
     // SAFETY: `p` is NUL-terminated and outlives the call.
@@ -310,6 +310,114 @@ pub fn identity(path: &str) -> Option<(u64, u128, u32)> {
     Some((u64_at(&id, 0), u128::from_le_bytes(id[8..24].try_into().unwrap()), u32_at(&basic, 32)))
 }
 
+/// The current user's SID as a string (`S-1-5-21-...`).
+pub fn current_user_sid() -> Result<String, String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut tok: HANDLE = null_mut();
+    // SAFETY: valid out pointer; the pseudo handle needs no closing.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok) } == 0 {
+        return Err(format!("couldn't read this user's token ({})", std::io::Error::last_os_error()));
+    }
+    let tok = Handle(tok);
+    // u64 elements keep TOKEN_USER aligned.
+    let mut buf = vec![0u64; 64];
+    let mut ret = 0u32;
+    // SAFETY: `buf` is valid for its length in bytes.
+    if unsafe { GetTokenInformation(tok.0, TokenUser, buf.as_mut_ptr() as *mut c_void, (buf.len() * 8) as u32, &mut ret) } == 0 {
+        return Err(format!("couldn't read this user's SID ({})", std::io::Error::last_os_error()));
+    }
+    // SAFETY: the call filled a TOKEN_USER at the start of `buf`, whose SID points into `buf`.
+    let sid = unsafe { (*(buf.as_ptr() as *const TOKEN_USER)).User.Sid };
+    let mut s: *mut u16 = null_mut();
+    // SAFETY: `sid` is valid while `buf` lives; `s` receives a LocalAlloc'd string.
+    if unsafe { ConvertSidToStringSidW(sid, &mut s) } == 0 || s.is_null() {
+        return Err(format!("couldn't write this user's SID ({})", std::io::Error::last_os_error()));
+    }
+    let mut n = 0;
+    // SAFETY: `s` is NUL-terminated.
+    while unsafe { *s.add(n) } != 0 {
+        n += 1;
+    }
+    // SAFETY: `s` holds `n` units; freed once, after copying.
+    let out = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(s, n) });
+    unsafe { LocalFree(s as *mut c_void) };
+    Ok(out)
+}
+
+/// Is `path` (not followed if it is a link) owned by the current user? `None` when the owner
+/// can't be read.
+pub fn owned_by_current_user(path: &str) -> Option<bool> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
+    const READ_CONTROL: u32 = 0x0002_0000;
+    let me = current_user_sid().ok()?;
+    let h = open(path, READ_CONTROL).ok()?;
+    let mut owner: *mut c_void = null_mut();
+    let mut sd: *mut c_void = null_mut();
+    // SAFETY: `h` is an open handle; `owner` points into `sd`, which the call LocalAllocs.
+    if unsafe { GetSecurityInfo(h.0, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &mut owner, null_mut(), null_mut(), null_mut(), &mut sd) } != 0 {
+        return None;
+    }
+    let mut s: *mut u16 = null_mut();
+    // SAFETY: `owner` is valid while `sd` lives; `s` receives a LocalAlloc'd string.
+    let ok = !owner.is_null() && unsafe { ConvertSidToStringSidW(owner, &mut s) } != 0 && !s.is_null();
+    let mut out = None;
+    if ok {
+        let mut n = 0;
+        // SAFETY: `s` is NUL-terminated.
+        while unsafe { *s.add(n) } != 0 {
+            n += 1;
+        }
+        // SAFETY: `s` holds `n` units; freed once, after copying.
+        out = Some(String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(s, n) }).eq_ignore_ascii_case(&me));
+        unsafe { LocalFree(s as *mut c_void) };
+    }
+    // SAFETY: freed once.
+    unsafe { LocalFree(sd) };
+    out
+}
+
+/// Make the folder `path` (its parent must exist) with an ACL of its own: full control for
+/// this user, SYSTEM and Administrators, nothing inherited from the drive's root, so other
+/// users of the PC can't list or open what is moved into it. Fails if it already exists.
+pub fn create_private_dir(path: &str) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+    let sid = current_user_sid()?;
+    // O: owner this user; D:P protected (inheritance off); OICI: folders and files inside too.
+    let sddl = wide(&format!("O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"));
+    let mut sd: *mut c_void = null_mut();
+    // SAFETY: `sddl` is NUL-terminated; `sd` receives a LocalAlloc'd descriptor.
+    if unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut sd, null_mut()) } == 0 {
+        return Err(format!("couldn't build the folder's permissions ({})", std::io::Error::last_os_error()));
+    }
+    let sa = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: sd, bInheritHandle: 0 };
+    let p = wide(path);
+    // SAFETY: `p` is NUL-terminated; `sa` and the descriptor outlive the call.
+    let ok = unsafe { CreateDirectoryW(p.as_ptr(), &sa) } != 0;
+    let err = std::io::Error::last_os_error();
+    // SAFETY: freed once, after the call.
+    unsafe { LocalFree(sd) };
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("couldn't make {} ({})", path, err))
+    }
+}
+
+/// How many names (hard links) a file has, read without following a reparse point.
+pub fn link_count(path: &str) -> Option<u32> {
+    let h = open(path, FILE_READ_ATTRIBUTES).ok()?;
+    let mut std_info = [0u8; 24];
+    info(h.0, FILE_STANDARD_INFO_CLASS, &mut std_info).then(|| u32_at(&std_info, 16))
+}
+
 /// Volumes holding a page file, from the registry (read-only, no admin): drive letters.
 pub fn pagefile_drives() -> Vec<char> {
     use winreg::enums::HKEY_LOCAL_MACHINE;
@@ -343,6 +451,37 @@ pub fn enter_background_mode() -> bool {
     const PROCESS_MODE_BACKGROUND_BEGIN: u32 = 0x0010_0000;
     // SAFETY: the pseudo handle of this process.
     unsafe { SetPriorityClass(GetCurrentProcess(), PROCESS_MODE_BACKGROUND_BEGIN) != 0 }
+}
+
+/// Tell running programs that the user environment changed (`WM_SETTINGCHANGE` with
+/// "Environment", as the System control panel does), so Explorer starts new programs with the
+/// new variables. Waits at most 5 s for windows that don't answer. Writes nothing.
+pub fn broadcast_environment_change() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE};
+    let what = wide("Environment");
+    let mut result = 0usize;
+    // SAFETY: `what` is NUL-terminated and outlives the call (SendMessageTimeout is synchronous);
+    // `result` is a valid out pointer.
+    unsafe { SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, what.as_ptr() as isize, SMTO_ABORTIFHUNG, 5000, &mut result) };
+}
+
+/// Make this process's stdin, stdout and stderr not inheritable, so a detached child (the
+/// measured watcher) doesn't keep the caller's pipes open: whoever reads our output (a script,
+/// the tray, an MCP client) would otherwise wait for the watcher to exit, up to 30 minutes.
+/// Children that ask to inherit them still get them (std duplicates them for that).
+pub fn stop_std_handle_inheritance() {
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: plain calls on this process's own standard handles; an invalid or null handle
+        // makes SetHandleInformation fail, which is ignored.
+        unsafe {
+            let h = GetStdHandle(which);
+            if !h.is_null() && h != INVALID_HANDLE_VALUE {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
 }
 
 /// A FILETIME as local "YYYY-MM-DD HH:MM", or "" for 0.

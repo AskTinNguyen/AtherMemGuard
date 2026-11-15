@@ -59,11 +59,32 @@ struct CatalogEntry {
     plugins: bool,
     #[serde(default)]
     older_than_days: Option<u64>,
+    /// The tool whose own clean command can empty it (`npm`, `pip`, `dotnet`).
+    #[serde(default)]
+    tool: Option<String>,
 }
 
 fn catalog() -> &'static CatalogFile {
     static C: OnceLock<CatalogFile> = OnceLock::new();
     C.get_or_init(|| toml::from_str(CATALOG_TOML).expect("the built-in disk catalogue is valid"))
+}
+
+/// What the catalogue says about one key: the cleanup's allow-list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatalogInfo {
+    pub class: String,
+    /// Relative to the project root, or (global) starting with a variable like `%LOCALAPPDATA%`.
+    pub path: String,
+    pub plugins: bool,
+    pub global: bool,
+    pub older_than_days: Option<u64>,
+    pub tool: Option<String>,
+}
+
+pub fn catalog_info(key: &str) -> Option<CatalogInfo> {
+    let c = catalog();
+    let f = |e: &CatalogEntry, global: bool| CatalogInfo { class: e.class.clone(), path: e.path.clone(), plugins: e.plugins, global, older_than_days: e.older_than_days, tool: e.tool.clone() };
+    c.project.iter().find(|e| e.key == key).map(|e| f(e, false)).or_else(|| c.global.iter().find(|e| e.key == key).map(|e| f(e, true)))
 }
 
 /// Class order in reports.
@@ -97,13 +118,41 @@ fn is_reparse(p: &Path) -> bool {
     std::fs::symlink_metadata(p).map(|m| m.file_attributes() & disk_win::A_REPARSE != 0).unwrap_or(false)
 }
 
-/// The `.uproject` file names directly in `dir`.
+/// Does `dir` hold a real `.uproject` file directly (see `is_real_uproject`)?
+pub fn has_uproject(dir: &Path) -> bool {
+    !uprojects(dir).is_empty()
+}
+
+/// Does `dir` hold any file named `*.uproject`, real or not? (For refusals: a folder that looks
+/// like a project is never deleted.)
+pub fn has_any_uproject(dir: &Path) -> bool {
+    std::fs::read_dir(dir).map(|rd| rd.flatten().any(|e| e.file_name().to_string_lossy().to_ascii_lowercase().ends_with(".uproject"))).unwrap_or(false)
+}
+
+/// The biggest `.uproject` read (real ones are a few KB).
+pub const UPROJECT_MAX_BYTES: u64 = 1 << 20;
+
+/// Is `path` a real Unreal project file: a regular file of at most 1 MB that parses as a JSON
+/// object with `FileVersion` or `EngineAssociation`? A stray or empty `.uproject` (`{}`, "not
+/// json") would otherwise make its siblings cleanable.
+pub fn is_real_uproject(path: &Path) -> bool {
+    let Ok(m) = std::fs::symlink_metadata(path) else { return false };
+    if !m.is_file() || m.len() > UPROJECT_MAX_BYTES {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(path) else { return false };
+    let text = String::from_utf8_lossy(&bytes);
+    let text = text.trim_start_matches('\u{feff}');
+    serde_json::from_str::<Value>(text).ok().and_then(|v| v.as_object().map(|o| o.contains_key("FileVersion") || o.contains_key("EngineAssociation"))).unwrap_or(false)
+}
+
+/// The real `.uproject` file names directly in `dir`.
 fn uprojects(dir: &Path) -> Vec<String> {
     let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
     rd.flatten()
         .filter_map(|e| {
             let n = e.file_name().to_string_lossy().to_string();
-            n.to_ascii_lowercase().ends_with(".uproject").then_some(n)
+            (n.to_ascii_lowercase().ends_with(".uproject") && is_real_uproject(&e.path())).then_some(n)
         })
         .collect()
 }
@@ -233,7 +282,8 @@ fn plugin_dirs(dir: &Path, leaf: &str, depth: u32, out: &mut Vec<String>) {
     }
 }
 
-fn expand_global(path: &str) -> Option<PathBuf> {
+/// A `[[global]]` catalogue path with its variable filled in.
+pub fn expand_global(path: &str) -> Option<PathBuf> {
     let (ddc, zen) = crate::disk::ue_cache_dirs();
     let s = if let Some(rest) = path.strip_prefix("%DDC%") {
         format!("{}{}", ddc?.display(), rest)
@@ -277,6 +327,29 @@ fn old_entries(dir: &Path, days: u64) -> Vec<String> {
         .filter(|e| e.metadata().and_then(|m| m.modified()).map(|t| t < cutoff).unwrap_or(false))
         .map(|e| e.path().display().to_string())
         .collect()
+}
+
+/// Caches left behind by `memguard disk relocate`, once the new place has been written to.
+fn old_cache_items() -> Vec<CatItem> {
+    let Some(rec) = crate::disk_clean::DiskFiles::default().relocate_record() else { return Vec::new() };
+    crate::disk_relocate::old_caches(&rec)
+        .into_iter()
+        .map(|(name, old)| CatItem { key: "cache:old".into(), class: "disposable".into(), title: format!("Old cache, no longer used ({})", name), paths: vec![old], lane: None })
+        .collect()
+}
+
+/// Ather MemGuard's own bin on each drive: its own item, never part of another.
+fn bin_items() -> Vec<CatItem> {
+    let mut out = Vec::new();
+    for v in disk_win::volumes().iter().filter(|v| v.drive_type == 3) {
+        for root in v.paths.iter().filter(|p| p.len() <= 3) {
+            let b = crate::disk_clean::bin_root(root);
+            if std::fs::read_dir(&b).map(|mut d| d.next().is_some()).unwrap_or(false) {
+                out.push(CatItem { key: "memguard:bin".into(), class: "review".into(), title: format!("Ather MemGuard's bin on {}", root.trim_end_matches('\\')), paths: vec![b.display().to_string()], lane: None });
+            }
+        }
+    }
+    out
 }
 
 /// Everything the checkup lists for `path` (or, without one, the configured project folders,
@@ -343,6 +416,8 @@ pub fn discover(cfg: &Config, path: Option<&str>) -> Vec<CatItem> {
     }
     if path.is_none() {
         items.extend(global_items());
+        items.extend(old_cache_items());
+        items.extend(bin_items());
     }
     let keep: Vec<String> = s.keep.iter().map(|k| norm(k)).collect();
     for it in &mut items {
@@ -718,6 +793,10 @@ pub struct Checkup {
 /// What the cache keeps: the report, and what `plan` needs to find the items again.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedCheckup {
+    /// Names this checkup: a clean confirmed on it carries the id, so ids like `d3` can't
+    /// silently mean another item after a newer checkup replaced this one.
+    #[serde(default)]
+    pub id: String,
     pub scope: String,
     pub unix: u64,
     pub time: String,
@@ -725,6 +804,22 @@ pub struct CachedCheckup {
     pub root_ids: Vec<Vec<u128>>,
     pub last_writes: Vec<u64>,
     pub report: Checkup,
+}
+
+impl CachedCheckup {
+    /// The checkup's id (`c<run id>`; older saved checkups: from their time).
+    pub fn ident(&self) -> String {
+        if self.id.is_empty() {
+            format!("u{}", self.unix)
+        } else {
+            self.id.clone()
+        }
+    }
+
+    /// The index of item `d<n>`.
+    pub fn index_of(&self, id: &str) -> Option<usize> {
+        id.trim().strip_prefix('d').and_then(|n| n.parse::<usize>().ok()).filter(|n| *n >= 1 && *n <= self.items.len()).map(|n| n - 1)
+    }
 }
 
 static CACHE_WRITES: AtomicBool = AtomicBool::new(false);
@@ -771,14 +866,141 @@ pub fn cached_system_caches() -> Option<crate::disk::CachesOnSystem> {
 
 /// The volumes UE processes are working in: project folders named on their command lines.
 fn busy_projects() -> Vec<String> {
+    busy_state().0
+}
+
+/// Project folders an Unreal editor, build or cook is working in (normalised), and, when
+/// some Unreal work can't be tied to a project, the words that say why every cleanup waits.
+pub fn busy_state() -> (Vec<String>, Option<String>) {
     let mut out = Vec::new();
+    let mut unknown: Option<&'static str> = None;
+    // Who this is, read once and only when some command line can't be read.
+    let mut me: Option<(Option<Vec<u8>>, Option<u32>)> = None;
     for p in crate::win::list_processes() {
-        let n = p.name.to_ascii_lowercase();
-        if !(n.starts_with("unrealeditor") || n == "unrealbuildtool" || n == "automationtool" || n.starts_with("unrealpak")) {
+        if !unreal_candidate(&p.name) {
             continue;
         }
-        if let Some(cmd) = crate::win::command_line(p.pid) {
-            out.extend(uproject_dirs_in(&cmd));
+        let u = unreal_use(&p.name, crate::win::command_line(p.pid).as_deref());
+        let own = if u == UnrealUse::Unreadable {
+            let (sid, session) = me.get_or_insert_with(|| (crate::doctor_win::current_user_sid(), crate::doctor_win::current_session()));
+            crate::doctor_win::ownership(p.pid, sid.as_deref(), *session)
+        } else {
+            crate::doctor_win::Ownership::default()
+        };
+        match u {
+            UnrealUse::Projects(dirs) => out.extend(dirs),
+            other => {
+                if let Some(w) = unknown_words(&p.name, &other, own) {
+                    // "Unreal is running" (known) wins over "can't read".
+                    if unknown.is_none() || w == UNREAL_UNKNOWN {
+                        unknown = Some(w);
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    (out, unknown.map(str::to_string))
+}
+
+/// Unreal work whose command line names no project.
+pub const UNREAL_UNKNOWN: &str = "Unreal is running and Ather MemGuard can't tell which project it works in, so it waits.";
+/// A build tool (dotnet, UnrealBuildTool, a cook) whose command line can't be read.
+pub const BUILD_TOOL_UNREADABLE: &str = "A build tool is running and Ather MemGuard can't read which project it works in, so it waits.";
+/// An Unreal editor whose command line can't be read.
+pub const EDITOR_UNREADABLE: &str = "An Unreal editor is running and Ather MemGuard can't read which project it works in, so it waits.";
+
+/// Why one process makes every cleanup wait, or `None` when it doesn't. A process whose
+/// command line can't be read counts only when it runs in this person's session and as this
+/// person (`own`); anything else (a SYSTEM service, another user's build) isn't their Unreal
+/// work. An owner or session that can't be read counts as not theirs.
+pub fn unknown_words(name: &str, u: &UnrealUse, own: crate::doctor_win::Ownership) -> Option<&'static str> {
+    match u {
+        UnrealUse::NotUnreal | UnrealUse::Projects(_) => None,
+        UnrealUse::Unknown => Some(UNREAL_UNKNOWN),
+        UnrealUse::Unreadable if !(own.owned && own.same_session) => None,
+        UnrealUse::Unreadable => Some(if name.to_ascii_lowercase().starts_with("unrealeditor") { EDITOR_UNREADABLE } else { BUILD_TOOL_UNREADABLE }),
+    }
+}
+
+/// What one process means for cleanups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnrealUse {
+    NotUnreal,
+    /// Unreal work in these project folders (normalised).
+    Projects(Vec<String>),
+    /// Unreal work whose command line names no project: every cleanup waits ("busy, unknown
+    /// project").
+    Unknown,
+    /// Could be Unreal work, but its command line couldn't be read: every cleanup waits only
+    /// when it is this person's own process (`unknown_words`).
+    Unreadable,
+}
+
+/// Could this process name be Unreal work (an editor, a build, a cook, a shader compile, a
+/// pak), or `dotnet` running UnrealBuildTool or AutomationTool? `.exe` is optional.
+pub fn unreal_candidate(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    let n = n.strip_suffix(".exe").unwrap_or(&n);
+    n.starts_with("unrealeditor")
+        || n.starts_with("unrealbuildtool")
+        || n.starts_with("automationtool")
+        || n.starts_with("shadercompileworker")
+        || n.starts_with("unrealpak")
+        || n == "dotnet"
+}
+
+/// What a process with this name and command line (`None`: couldn't be read) is doing.
+/// Builds started from a command line run as `dotnet UnrealBuildTool.dll ...` or
+/// `dotnet AutomationTool.dll ...`; any `dotnet` that runs neither is not Unreal work.
+pub fn unreal_use(name: &str, cmd: Option<&str>) -> UnrealUse {
+    if !unreal_candidate(name) {
+        return UnrealUse::NotUnreal;
+    }
+    let n = name.to_ascii_lowercase();
+    let dotnet = n.strip_suffix(".exe").unwrap_or(&n) == "dotnet";
+    let Some(cmd) = cmd else { return UnrealUse::Unreadable };
+    if dotnet {
+        let l = cmd.to_ascii_lowercase();
+        if !(l.contains("unrealbuildtool.dll") || l.contains("automationtool.dll")) {
+            return UnrealUse::NotUnreal;
+        }
+    }
+    let mut dirs = uproject_dirs_in(cmd);
+    dirs.extend(project_args_in(cmd));
+    dirs.sort();
+    dirs.dedup();
+    if dirs.is_empty() {
+        UnrealUse::Unknown
+    } else {
+        UnrealUse::Projects(dirs)
+    }
+}
+
+/// Project folders named by `-project=` or `-ScriptsForProject=` (a `.uproject` or its folder),
+/// quoted or not (normalised).
+pub fn project_args_in(cmd: &str) -> Vec<String> {
+    let lower = cmd.to_ascii_lowercase();
+    let mut out = Vec::new();
+    for key in ["-project=", "-scriptsforproject="] {
+        let mut from = 0;
+        while let Some(k) = lower[from..].find(key) {
+            let start = from + k + key.len();
+            let rest = &cmd[start..];
+            let value = match rest.strip_prefix('"') {
+                Some(q) => q.split('"').next().unwrap_or(""),
+                None => rest.split_whitespace().next().unwrap_or(""),
+            };
+            let v = value.trim().trim_matches('"');
+            if !v.is_empty() {
+                let p = norm(v);
+                let dir = if p.ends_with(".uproject") { Path::new(&p).parent().map(|d| norm(&d.display().to_string())) } else { Some(p) };
+                if let Some(d) = dir.filter(|d| !d.is_empty()) {
+                    out.push(d);
+                }
+            }
+            from = start;
         }
     }
     out
@@ -938,7 +1160,9 @@ pub fn build_checkup(items: &[CatItem], out: &ScanOutput, set_names: &[(String, 
             "shared_outside_scan_gb": if known { json!(gb2(r.shared_outside)) } else { Value::Null },
             "last_write": disk_win::filetime_local(l2.map_or(l1.last_write, |l| l.last_write.max(l1.last_write))),
             "in_use": in_use, "in_flux": j.in_flux, "notes": notes_for(r, in_use),
-            "actions": [], "recommended": false,
+            "actions": crate::disk_clean::actions_json(&it.key, &it.class, catalog_info(&it.key).and_then(|c| c.tool).as_deref(), r.volume.is_some(), j.frees.map(gb2)),
+            "no_action": crate::disk_clean::no_action_reason(&it.key, &it.class),
+            "recommended": false,
         }));
     }
     let mut totals = Vec::new();
@@ -1010,6 +1234,7 @@ pub fn checkup(cfg: &Config, path: Option<&str>, refresh: bool, budget_sec: Opti
             if still {
                 let age = unix_now().saturating_sub(c.unix);
                 let mut rep = c.report.clone();
+                rep.scan["checkup_id"] = json!(c.ident());
                 rep.scan["age_sec"] = json!(age);
                 rep.scan["from_cache"] = json!(true);
                 if age > s.fresh_sec {
@@ -1043,7 +1268,11 @@ pub fn checkup(cfg: &Config, path: Option<&str>, refresh: bool, budget_sec: Opti
     if path.is_none() {
         record_system_caches(&items, &out, &time);
     }
+    let id = format!("c{}", crate::disk_clean::run_id());
+    let mut rep = rep;
+    rep.scan["checkup_id"] = json!(id);
     save_cache(&CachedCheckup {
+        id,
         scope,
         unix: unix_now(),
         time,
@@ -1071,13 +1300,30 @@ fn record_system_caches(items: &[CatItem], out: &ScanOutput, time: &str) {
 }
 
 /// `memguard disk plan`: fresh numbers for exactly these items of the last checkup (all of
-/// them when `ids` is empty). One entry per volume, never a sum across volumes.
+/// them when `ids` is empty). One entry per volume, never a sum across volumes. The plan is
+/// recorded (`disk-plans.json`) so `clean` can check nothing changed since.
 pub fn plan(cfg: &Config, ids: &[String], runner: Runner, progress: Progress) -> Result<Value, String> {
     let c = load_cache().ok_or("Run a disk checkup first (memguard disk checkup, or memguard_disk_checkup): a plan uses its item ids.")?;
     plan_from(cfg, &c, ids, runner, progress)
 }
 
 pub fn plan_from(cfg: &Config, c: &CachedCheckup, ids: &[String], runner: Runner, progress: Progress) -> Result<Value, String> {
+    let (v, rec) = plan_record(cfg, c, ids, None, runner, progress)?;
+    let _ = crate::disk_clean::DiskFiles::default().save_plan(&rec);
+    Ok(v)
+}
+
+/// The plan and its record. `together`: the ids whose `frees_together` is computed (default:
+/// all of them; `clean` passes only the items it deletes, since a bin move frees nothing).
+pub fn plan_record(
+    cfg: &Config,
+    c: &CachedCheckup,
+    ids: &[String],
+    together: Option<&[String]>,
+    runner: Runner,
+    progress: Progress,
+) -> Result<(Value, crate::disk_clean::PlanRecord), String> {
+    use crate::disk_clean::{PlanRecord, PlannedItem, PlannedVolume};
     let s = cfg.disk();
     let mut picked: Vec<usize> = Vec::new();
     let mut refused = Vec::new();
@@ -1097,9 +1343,14 @@ pub fn plan_from(cfg: &Config, c: &CachedCheckup, ids: &[String], runner: Runner
         return Err("None of these ids are in the last disk checkup. Run it again and use its ids (d1, d2, ...).".into());
     }
     let items: Vec<CatItem> = picked.iter().map(|i| c.items[*i].clone()).collect();
+    let id_of = |k: usize| format!("d{}", picked[k] + 1);
+    let set: Vec<usize> = match together {
+        None => (0..items.len()).collect(),
+        Some(t) => (0..items.len()).filter(|k| t.iter().any(|x| x.eq_ignore_ascii_case(&id_of(*k)))).collect(),
+    };
     let job = ScanJob {
         items: items.iter().map(|i| i.paths.clone()).collect(),
-        sets: vec![(0..items.len()).collect()],
+        sets: if set.is_empty() { Vec::new() } else { vec![set] },
         threads: s.scan_threads,
         budget_sec: s.scan_budget_sec.max(300),
         stop_on_build: false,
@@ -1107,18 +1358,40 @@ pub fn plan_from(cfg: &Config, c: &CachedCheckup, ids: &[String], runner: Runner
     let out = runner(&job, progress)?;
     let busy = busy_projects();
     let now = crate::win::local_time_string();
+    let plan_id = format!("p{}", crate::disk_clean::run_id());
+    let mut rec = PlanRecord { id: plan_id.clone(), unix: crate::disk_clean::unix_now(), time: now.clone(), items: Vec::new(), volumes: Vec::new() };
+    let in_use_of = |it: &CatItem| it.paths.iter().any(|p| busy.iter().any(|b| disk_space::is_within(&norm(p), b) || disk_space::is_within(b, &norm(p))));
+    let mut confs_by_item: Vec<Confidence> = Vec::new();
+    for (k, it) in items.iter().enumerate() {
+        let r = &out.items[k];
+        let vol = r.volume.as_ref().and_then(|g| out.volumes.iter().find(|v| v.guid.eq_ignore_ascii_case(g)));
+        let j = judge(r, vol.is_some_and(|v| v.block_cloning), in_use_of(it), false);
+        confs_by_item.push(j.conf);
+        rec.items.push(PlannedItem {
+            id: id_of(k),
+            key: it.key.clone(),
+            class: it.class.clone(),
+            title: it.title.clone(),
+            paths: it.paths.clone(),
+            path_ids: it.paths.iter().map(|p| disk_win::identity(p).map(|(_, f, _)| f)).collect(),
+            last_write: r.level2.as_ref().map_or(r.level1.last_write, |l| l.last_write.max(r.level1.last_write)),
+            volume: r.volume.clone(),
+            volume_root: vol.map(|v| v.root.clone()),
+            frees_alone: j.frees,
+            confidence: j.conf.name().into(),
+            tool: catalog_info(&it.key).and_then(|c| c.tool),
+            unmeasurable: r.unmeasurable.clone(),
+        });
+    }
     let mut plans = Vec::new();
     for sr in &out.sets {
         let vol = out.volumes.iter().find(|v| v.guid.eq_ignore_ascii_case(&sr.volume));
-        let block = vol.is_some_and(|v| v.block_cloning);
         let mut confs = Vec::new();
         let mut per_item = Vec::new();
         for &k in &sr.items {
-            let it = &items[k];
-            let in_use = it.paths.iter().any(|p| busy.iter().any(|b| disk_space::is_within(&norm(p), b) || disk_space::is_within(b, &norm(p))));
-            let j = judge(&out.items[k], block, in_use, false);
-            confs.push(j.conf);
-            per_item.push(json!({ "id": format!("d{}", picked[k] + 1), "title": it.title, "frees_alone_gb": opt_gb(j.frees), "frees_confidence": j.conf.name(), "frees_basis": BASIS, "notes": notes_for(&out.items[k], in_use) }));
+            confs.push(confs_by_item[k]);
+            per_item.push(json!({ "id": id_of(k), "title": items[k].title, "frees_alone_gb": opt_gb(rec.items[k].frees_alone), "frees_confidence": confs_by_item[k].name(),
+                                  "frees_basis": BASIS, "notes": notes_for(&out.items[k], in_use_of(&items[k])) }));
         }
         let tc = total_confidence(&confs);
         let free_now = vol.map_or(0, |v| v.avail);
@@ -1126,9 +1399,17 @@ pub fn plan_from(cfg: &Config, c: &CachedCheckup, ids: &[String], runner: Runner
         if vol.is_some_and(|v| v.fs.eq_ignore_ascii_case("ReFS")) {
             notes.push(REFS_DELAY_NOTE.to_string());
         }
+        rec.volumes.push(PlannedVolume {
+            volume: sr.volume.clone(),
+            root: vol.map(|v| v.root.clone()).unwrap_or_default(),
+            fs: vol.map(|v| v.fs.clone()).unwrap_or_default(),
+            item_ids: sr.items.iter().map(|k| id_of(*k)).collect(),
+            frees_together: tc.map(|_| sr.frees_together),
+            confidence: tc.map_or("none", |c| c.name()).into(),
+        });
         plans.push(json!({
             "volume": vol_name(&sr.volume, &out.volumes),
-            "item_ids": sr.items.iter().map(|k| format!("d{}", picked[*k] + 1)).collect::<Vec<_>>(),
+            "item_ids": sr.items.iter().map(|k| id_of(*k)).collect::<Vec<_>>(),
             "frees_together_gb": tc.map(|_| gb2(sr.frees_together)),
             "frees_confidence": tc.map_or("none", |c| c.name()),
             "frees_basis": BASIS,
@@ -1143,16 +1424,31 @@ pub fn plan_from(cfg: &Config, c: &CachedCheckup, ids: &[String], runner: Runner
     }
     for (k, r) in out.items.iter().enumerate() {
         if let Some(why) = &r.unmeasurable {
-            refused.push(json!({ "id": format!("d{}", picked[k] + 1), "reason": format!("Not counted: {}", why) }));
+            refused.push(json!({ "id": id_of(k), "reason": format!("Not counted: {}", why) }));
         }
     }
-    Ok(json!({
+    let actions: Vec<Value> = rec
+        .items
+        .iter()
+        .map(|it| {
+            let a = crate::disk_clean::actions_json(&it.key, &it.class, it.tool.as_deref(), it.volume_root.is_some(), it.frees_alone.map(gb2));
+            json!({ "id": it.id, "class": it.class, "actions": a, "no_action": crate::disk_clean::no_action_reason(&it.key, &it.class) })
+        })
+        .collect();
+    let cleanable: Vec<String> =
+        rec.items.iter().filter(|it| !crate::disk_clean::offered_actions(&it.key, &it.class, it.tool.as_deref(), true).is_empty()).map(|it| it.id.clone()).collect();
+    let v = json!({
+        "plan_id": plan_id,
         "plans": plans,
+        "items": actions,
         "refused": refused,
         "basis": BASIS,
-        "removing": "Ather MemGuard doesn't delete anything. Remove the folders yourself, or use `git worktree remove` for a lane.",
+        "command": if cleanable.is_empty() { Value::Null } else { json!(format!("memguard disk clean --fix {}", cleanable.join(" "))) },
+        "removing": "To act on it: memguard disk clean --fix <id>[:now|bin|tool] (asks first). An agent may call memguard_disk_clean for regenerable items within 10 minutes of this plan. \
+Ather MemGuard never removes lanes or worktrees: use git worktree remove for those.",
         "do_not_sum": "Plans on different drives are never added together. frees_together_gb is predicted, not measured.",
-    }))
+    });
+    Ok((v, rec))
 }
 
 // ---------------------------------------------------------------- text
@@ -1246,7 +1542,11 @@ pub fn render_checkup(c: &Checkup) -> String {
         }
     }
     if !c.items.is_empty() {
-        s.push_str("Next: memguard disk plan <ids>   fresh numbers for exactly the items you pick. Ather MemGuard deletes nothing.\n");
+        s.push_str("Next: memguard disk plan <ids>   fresh numbers for exactly the items you pick.\n");
+        s.push_str("Then: memguard disk clean --fix <id>[:now|bin|tool] ...   asks first; bin moves can be undone, deletes can't.\n");
+        if let Some(id) = c.scan["checkup_id"].as_str() {
+            s.push_str(&format!("Scripts: add --yes --checkup {}, so a newer checkup can't change what the ids mean.\n", id));
+        }
     } else {
         s.push_str("Nothing to list here.\n");
     }
@@ -1314,6 +1614,58 @@ mod tests {
         assert_eq!(dirs, vec![r"d:\lanes\a".to_string()]);
     }
 
+    /// Found in review: builds started from a command line (dotnet UnrealBuildTool.dll, UAT,
+    /// shader workers) weren't seen as "in use".
+    #[test]
+    fn command_line_builds_are_unreal_work() {
+        use UnrealUse::*;
+        let p = |v: &[&str]| Projects(v.iter().map(|s| s.to_string()).collect());
+        assert_eq!(
+            unreal_use("dotnet", Some(r#""C:\Program Files\dotnet\dotnet.exe" "C:\UE_5.4\Engine\Binaries\DotNET\UnrealBuildTool\UnrealBuildTool.dll" S2Editor Win64 Development -Project="D:\s2\S2.uproject" -WaitMutex"#)),
+            p(&[r"d:\s2"])
+        );
+        assert_eq!(
+            unreal_use("dotnet.exe", Some(r#"dotnet "C:\UE\Engine\Binaries\DotNET\AutomationTool\AutomationTool.dll" BuildCookRun -project=D:\lanes\a\S2.uproject -cook"#)),
+            p(&[r"d:\lanes\a"])
+        );
+        // A folder instead of a .uproject, and ScriptsForProject.
+        assert_eq!(unreal_use("AutomationTool", Some(r#"AutomationTool.exe BuildCookRun -project="D:\s2" -cook"#)), p(&[r"d:\s2"]));
+        assert_eq!(unreal_use("UnrealBuildTool", Some(r#"UnrealBuildTool.exe -Mode=QueryTargets -ScriptsForProject=D:\s2\S2.uproject"#)), p(&[r"d:\s2"]));
+        assert_eq!(unreal_use("UnrealEditor-Cmd", Some(r#""C:\UE\UnrealEditor-Cmd.exe" "D:\s2\S2.uproject" -run=cook -targetplatform=Windows"#)), p(&[r"d:\s2"]));
+        // Running, but no project can be found: busy, unknown project.
+        assert_eq!(unreal_use("ShaderCompileWorker", Some(r#""C:\UE\ShaderCompileWorker.exe" "D:\s2\Intermediate\Shaders\WorkingDirectory\1234\" 4321 7 Worker.in Worker.out"#)), Unknown);
+        assert_eq!(unreal_use("UnrealPak", Some(r#"UnrealPak.exe D:\out\pak.pak -create=list.txt"#)), Unknown);
+        assert_eq!(unreal_use("dotnet", Some(r#"dotnet UnrealBuildTool.dll -Mode=GenerateClangDatabase"#)), Unknown);
+        assert_eq!(unreal_use("UnrealEditor", Some(r#""C:\UE\UnrealEditor.exe""#)), Unknown);
+        assert_eq!(unreal_use("UnrealBuildTool", None), Unreadable, "command line unreadable");
+        assert_eq!(unreal_use("dotnet", None), Unreadable, "an unreadable dotnet could be a build");
+        // Other dotnet work and other programs are not Unreal work.
+        assert_eq!(unreal_use("dotnet", Some(r#"dotnet "C:\Users\me\.vscode\extensions\csharp\Microsoft.CodeAnalysis.LanguageServer.dll""#)), NotUnreal);
+        assert_eq!(unreal_use("devenv", Some("devenv.exe D:\\s2\\S2.sln")), NotUnreal);
+        assert!(unreal_candidate("ShaderCompileWorker.exe") && unreal_candidate("UnrealPak") && !unreal_candidate("node"));
+    }
+
+    /// Found in review: an unreadable dotnet (a SYSTEM service, say) made every cleanup say
+    /// "Unreal is running". Only this person's own process in their session counts, and the
+    /// words say only what is known.
+    #[test]
+    fn unreadable_process_counts_only_when_its_mine() {
+        use crate::doctor_win::Ownership;
+        let mine = Ownership { owned: true, same_session: true };
+        let u = UnrealUse::Unreadable;
+        assert_eq!(unknown_words("dotnet.exe", &u, mine), Some(BUILD_TOOL_UNREADABLE));
+        assert_eq!(unknown_words("UnrealBuildTool", &u, mine), Some(BUILD_TOOL_UNREADABLE));
+        assert_eq!(unknown_words("UnrealEditor", &u, mine), Some(EDITOR_UNREADABLE));
+        // A SYSTEM service (session 0, another owner), another user in this session, this user elsewhere.
+        assert_eq!(unknown_words("dotnet.exe", &u, Ownership { owned: false, same_session: false }), None);
+        assert_eq!(unknown_words("dotnet.exe", &u, Ownership { owned: false, same_session: true }), None);
+        assert_eq!(unknown_words("dotnet.exe", &u, Ownership { owned: true, same_session: false }), None);
+        // Readable but naming no project: waits whoever owns it; not Unreal work never waits.
+        assert_eq!(unknown_words("UnrealEditor", &UnrealUse::Unknown, Ownership::default()), Some(UNREAL_UNKNOWN));
+        assert_eq!(unknown_words("dotnet", &UnrealUse::NotUnreal, mine), None);
+        assert!(!BUILD_TOOL_UNREADABLE.contains("Unreal is running"));
+    }
+
     /// A small tree on this PC's temp drive, scanned in-process: files, nested items and the
     /// set total follow the rules (everything there is exclusive to the test).
     #[test]
@@ -1322,7 +1674,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(r"proj\Intermediate\Build")).unwrap();
         std::fs::create_dir_all(root.join(r"proj\Saved\Logs")).unwrap();
-        std::fs::write(root.join(r"proj\Game.uproject"), b"{}").unwrap();
+        std::fs::write(root.join(r"proj\Game.uproject"), br#"{ "FileVersion": 3 }"#).unwrap();
         std::fs::write(root.join(r"proj\Intermediate\Build\a.bin"), vec![7u8; 300_000]).unwrap();
         std::fs::write(root.join(r"proj\Saved\Logs\Game.log"), vec![1u8; 100_000]).unwrap();
         let cfg = Config::builtin();
@@ -1344,7 +1696,7 @@ mod tests {
         assert_eq!(rep.totals[0]["set"], "regenerable");
         assert_eq!(rep.totals[0]["frees_basis"], "predicted");
         // A plan over the same items, from a cache record.
-        let cached = CachedCheckup { scope: "x".into(), unix: 0, time: String::new(), items: items.clone(), root_ids: vec![], last_writes: vec![], report: rep };
+        let cached = CachedCheckup { id: "c1".into(), scope: "x".into(), unix: 0, time: String::new(), items: items.clone(), root_ids: vec![], last_writes: vec![], report: rep };
         let run = |j: &ScanJob, p: Progress| Ok(run_job(j, p));
         let plan = plan_from(&cfg, &cached, &["d1".into(), "d9".into()], &run, &mut |_, _| {}).unwrap();
         assert_eq!(plan["plans"][0]["item_ids"], json!(["d1"]));

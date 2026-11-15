@@ -1,9 +1,13 @@
-# What the disk checkup looks for. Report only: Ather MemGuard never deletes or moves these.
+# What the disk checkup looks for, and the cleanup's allow-list: Ather MemGuard only ever
+# cleans these folders, at these places, after the person (or an agent, for regenerable
+# items) picks them from a plan.
 #
-# class: regenerable  Unreal or the tool rebuilds it
-#        disposable   not rebuilt, but not needed
-#        rebuild_cost rebuilt, but it takes long (hours of shader or cook work)
-#        review       your call (lanes, worktrees, the git LFS store)
+# class: regenerable  Unreal or the tool rebuilds it          default action: now (delete)
+#        disposable   not rebuilt, but not needed               default action: bin
+#        rebuild_cost rebuilt, but it takes long (hours of shader or cook work)   default: bin
+#        review       your call (lanes, worktrees, the git LFS store): never cleaned
+# tool:  the tool's own clean command is offered too (permanent, "can't be undone").
+# Zen (ue:zen) is never deleted file by file: use Zen's own garbage collection.
 #
 # [[project]] paths are relative to an Unreal project root (the folder with the .uproject).
 # [[global]] paths start with an environment variable.
@@ -87,12 +91,14 @@ key = "cache:npm"
 class = "regenerable"
 title = "npm cache"
 path = '%LOCALAPPDATA%\npm-cache\_cacache'
+tool = "npm"
 
 [[global]]
 key = "cache:pip"
 class = "regenerable"
 title = "pip cache"
 path = '%LOCALAPPDATA%\pip\cache'
+tool = "pip"
 
 [[global]]
 key = "cache:uv"
@@ -105,6 +111,7 @@ key = "cache:nuget_http"
 class = "regenerable"
 title = "NuGet download cache"
 path = '%LOCALAPPDATA%\NuGet\v3-cache'
+tool = "dotnet"
 
 [[global]]
 key = "sys:crashdumps"

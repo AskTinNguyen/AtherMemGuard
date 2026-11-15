@@ -17,11 +17,15 @@
 //! - `disk`    disk headroom, Dev Drive health and the wait gate
 //! - `disk_space` space accounting without double counting (pure)
 //! - `disk_scan` the report-only disk checkup and plan, scanned in a low-priority child
-//! - `disk_win` volumes, FSCTLs and the read-only scanner
+//! - `disk_clean` cleanup with undo: delete, the bin, tool cleans, the measured result (Phase 2)
+//! - `disk_relocate` moving caches off the system drive with user environment variables
+//! - `disk_win` volumes, FSCTLs, the read-only scanner and the environment broadcast
 
 pub mod breakdown;
 pub mod config;
 pub mod disk; // disk headroom and Dev Drive health
+pub mod disk_clean; // cleanup with undo, the bin and the measured result
+pub mod disk_relocate; // moving caches off the system drive
 pub mod disk_scan; // the disk checkup and plan (report only)
 pub mod disk_space; // space accounting without double counting (pure)
 pub mod disk_win;

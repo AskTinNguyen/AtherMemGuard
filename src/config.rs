@@ -200,8 +200,8 @@ preset = "balanced"
 # scan_budget_sec = 60          # how long a disk checkup may count, in seconds
 # scan_threads = 4
 # fresh_sec = 300               # older counts are reported as "about"
-# min_age_hours = 2             # (for cleanup, in a later version)
-# hold_hours = 24               # (for cleanup, in a later version)
+# min_age_hours = 2             # cleanup leaves alone anything written more recently
+# hold_hours = 24               # how long the bin keeps what was moved into it
 # keep = []                     # folders the disk checkup never lists
 # check_dev_drive = true        # Dev Drive health rows in the checkups
 
@@ -509,9 +509,9 @@ pub struct DiskSettings {
     pub scan_budget_sec: u64,
     pub scan_threads: usize,
     pub fresh_sec: u64,
-    /// For cleanup in a later version (items written more recently are refused). Carried now.
+    /// Cleanup refuses a whole item when anything in it was written more recently than this.
     pub min_age_hours: f64,
-    /// For the bin in a later version (how long moved items are kept). Carried now.
+    /// How long the bin keeps what was moved into it before it empties itself.
     pub hold_hours: f64,
     /// Folders the disk checkup never lists.
     pub keep: Vec<String>,

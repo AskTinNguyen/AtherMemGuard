@@ -522,6 +522,19 @@ pub fn show_ram_report() {
     }
 }
 
+/// Empty the bin on `volume` through the CLI and say how it went.
+fn empty_bin_toast(volume: &str) -> crate::ui::toast::Toast {
+    match crate::disk_clean::run_cli_json(&["disk", "bin", "--empty", "--volume", volume, "--yes", "--json"], Duration::from_secs(600)) {
+        Ok(v) => {
+            let problem = v["emptied"].as_array().into_iter().flatten().find(|e| e["removed"]["remains"] == true).map(|_| "Some files in it were in use and are still there.".to_string());
+            let predicted = v["predicted"].as_array().and_then(|a| a.first()).and_then(|p| p["predicted_freed_gb"].as_f64());
+            crate::log::write(&format!("disk: emptied the bin on {} from the toast", volume));
+            catalog::disk_bin_emptied(volume, predicted, problem.as_deref())
+        }
+        Err(e) => catalog::disk_bin_emptied(volume, None, Some(&e)),
+    }
+}
+
 /// "Undo" on the "Checkup done" toast: reverse the last cleanup on a worker thread.
 pub fn undo_doctor() {
     let h = TRAY_HWND.load(Ordering::SeqCst);
@@ -540,11 +553,14 @@ pub struct RealDoctor {
     after_apply: std::sync::Mutex<Option<f64>>,
     /// The tray window, for the "Checkup done" toast. 0 = no toast, no rescan (tests).
     tray: isize,
+    /// The disk checkup the drive rows were built from: a clean confirmed on them carries its
+    /// id and each item's fingerprint, so a newer checkup can't change what `d3` means.
+    disk_seen: std::sync::Mutex<Option<crate::disk_scan::CachedCheckup>>,
 }
 
 impl RealDoctor {
     pub fn new(tray: isize) -> RealDoctor {
-        RealDoctor { last: std::sync::Mutex::new(None), after_apply: std::sync::Mutex::new(None), tray }
+        RealDoctor { last: std::sync::Mutex::new(None), after_apply: std::sync::Mutex::new(None), tray, disk_seen: std::sync::Mutex::new(None) }
     }
 
     /// Start from a report built elsewhere (tests).
@@ -573,17 +589,57 @@ impl RealDoctor {
                 .collect();
             return (outs, None);
         };
-        let real: Vec<(String, crate::doctor::ActionKind)> = picks.iter().map(|(id, k)| (id.clone(), doctor_map::action_to_real(*k))).collect();
-        let outs = crate::doctor::apply(&report, &real, force);
+        let (disk, mem): (Vec<_>, Vec<_>) = picks.iter().cloned().partition(|(id, _)| id.starts_with("disk:"));
+        let real: Vec<(String, crate::doctor::ActionKind)> = mem.iter().filter_map(|(id, k)| doctor_map::action_to_real(*k).map(|a| (id.clone(), a))).collect();
+        let outs = if real.is_empty() { Vec::new() } else { crate::doctor::apply(&report, &real, force) };
         let summary = doctor_map::cleanup_summary(&report, &outs);
-        (outs.iter().map(doctor_map::outcome_view).collect(), summary)
+        let mut view: Vec<crate::ui::doctor::Outcome> = outs.iter().map(doctor_map::outcome_view).collect();
+        if !disk.is_empty() {
+            let seen = self.disk_seen.lock().unwrap().clone();
+            view.extend(Self::clean_disk(seen.as_ref(), &disk));
+        }
+        (view, summary)
+    }
+
+    /// Drive rows: `memguard disk clean` in a hidden child (fresh plan, every rule checked
+    /// again, the measured watch), so the tray process never walks or deletes files.
+    fn clean_disk(seen: Option<&crate::disk_scan::CachedCheckup>, picks: &[(String, crate::ui::doctor::ActionKind)]) -> Vec<crate::ui::doctor::Outcome> {
+        use crate::ui::doctor::{Outcome, OutcomeStatus};
+        let res = match seen.ok_or_else(|| "Check again first".to_string()).and_then(|c| doctor_map::disk_clean_args(c, picks)) {
+            Ok(args) => {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                crate::disk_clean::run_cli_json(&args, Duration::from_secs(900))
+            }
+            Err(e) => Err(e),
+        };
+        picks
+            .iter()
+            .map(|(id, k)| {
+                let short = id.trim_start_matches("disk:");
+                let (status, message) = match &res {
+                    Err(e) => (OutcomeStatus::Failed, format!("Didn't run: {}", e)),
+                    Ok(v) => match v["outcomes"].as_array().into_iter().flatten().find(|o| o["id"] == short) {
+                        None => (OutcomeStatus::Skipped, "Not done".to_string()),
+                        Some(o) => doctor_map::disk_outcome_words(o),
+                    },
+                };
+                Outcome { finding_id: id.clone(), action: *k, status, message }
+            })
+            .collect()
     }
 }
 
 impl crate::ui::doctor::DoctorSource for RealDoctor {
     fn scan(&self) -> crate::ui::doctor::Report {
         let r = Self::fresh_scan();
-        let view = doctor_map::report_view(&r);
+        let mut view = doctor_map::report_view(&r);
+        // Drive rows from the last disk checkup (counting never runs in the tray).
+        let seen = crate::disk_scan::load_cache();
+        if let Some(c) = &seen {
+            let cfg = crate::doctor::load_config_readonly();
+            view.findings.extend(doctor_map::disk_rows(c, cfg.disk().fresh_sec, crate::disk_clean::unix_now()));
+        }
+        *self.disk_seen.lock().unwrap() = seen;
         *self.last.lock().unwrap() = Some(r);
         view
     }
@@ -603,11 +659,27 @@ impl crate::ui::doctor::DoctorSource for RealDoctor {
     }
 
     fn undo_last(&self) -> Vec<crate::ui::doctor::Outcome> {
+        // The newer of the two: the memory cleanup's undo log, or the drive cleanup's bin moves.
+        let files = crate::disk_clean::DiskFiles::default();
+        let disk_run = files.undo_log().latest_undoable_run().map(str::to_string);
+        let mem_log = crate::doctor::UndoLog::load();
+        let mem_run = mem_log.select(true, None).first().map(|(r, _)| mem_log.runs[*r].id.clone());
+        if disk_run.is_some() && disk_run >= mem_run {
+            return crate::disk_clean::undo(&files, None)
+                .iter()
+                .map(|o| crate::ui::doctor::Outcome {
+                    finding_id: format!("disk:{}", o.id),
+                    action: crate::ui::doctor::ActionKind::DiskBin,
+                    status: if o.result == "undone" { crate::ui::doctor::OutcomeStatus::Done } else { crate::ui::doctor::OutcomeStatus::Failed },
+                    message: o.message.clone(),
+                })
+                .collect();
+        }
         crate::doctor::undo(true, None).iter().filter(|o| !o.finding_id.is_empty()).map(doctor_map::outcome_view).collect()
     }
 
     fn can_undo(&self) -> bool {
-        crate::doctor::UndoLog::load().can_undo()
+        crate::doctor::UndoLog::load().can_undo() || crate::disk_clean::DiskFiles::default().undo_log().can_undo()
     }
 
     fn reclaimable_after_apply(&self) -> Option<f64> {
@@ -652,16 +724,20 @@ pub mod doctor_map {
         }
     }
 
-    pub fn action_to_real(k: vm::ActionKind) -> real::ActionKind {
-        match k {
+    /// The memory checkup's action for a window action; `None` for drive actions, which go to
+    /// `memguard disk clean` instead and can never become a memory action.
+    pub fn action_to_real(k: vm::ActionKind) -> Option<real::ActionKind> {
+        Some(match k {
             vm::ActionKind::Close => real::ActionKind::Close,
             vm::ActionKind::End => real::ActionKind::End,
             vm::ActionKind::DisableStartup => real::ActionKind::DisableStartup,
             vm::ActionKind::HoldBack => real::ActionKind::HoldBack,
             vm::ActionKind::BlockWhileUnreal => real::ActionKind::BlockWhileUnreal,
             vm::ActionKind::Keep => real::ActionKind::LeaveIt,
-        }
+            vm::ActionKind::DiskNow | vm::ActionKind::DiskBin | vm::ActionKind::DiskTool => return None,
+        })
     }
+
 
     fn kind_view(k: real::FindingKind) -> vm::FindingKind {
         match k {
@@ -700,6 +776,138 @@ pub mod doctor_map {
             company: f.company.clone(),
             help_url: if f.kind == real::FindingKind::System { help_url(&f.id) } else { None },
             help_command: (f.kind == real::FindingKind::System && real::is_ram_finding(&f.id)).then_some(crate::ui::Command::ShowRamReport),
+            disk: None,
+        }
+    }
+
+    /// Shown on a drive row whose report entry and cleanup entry don't name the same thing.
+    pub const CHECKUP_DOESNT_ADD_UP: &str = "The checkup file doesn't add up; check again";
+
+    /// Does the checkup's report entry `shown` name the same thing as `item`, the entry a
+    /// clean of that id deletes (same key, same set of paths)? A disk-checkup.json edited by
+    /// hand could otherwise show one folder and delete another.
+    pub fn checkup_entry_agrees(shown: &serde_json::Value, item: Option<&crate::disk_scan::CatItem>) -> bool {
+        let Some(item) = item else { return false };
+        if shown["key"].as_str() != Some(item.key.as_str()) {
+            return false;
+        }
+        let Some(arr) = shown["paths"].as_array() else { return false };
+        let set = |v: Vec<String>| -> std::collections::BTreeSet<String> { v.into_iter().map(|p| crate::disk_space::norm(&p)).collect() };
+        let Some(shown_paths) = arr.iter().map(|p| p.as_str().map(str::to_string)).collect::<Option<Vec<String>>>() else { return false };
+        set(shown_paths) == set(item.paths.clone())
+    }
+
+    /// The cleanup entry for report entry `shown`, when the two agree.
+    fn agreeing_item<'a>(c: &'a crate::disk_scan::CachedCheckup, shown: &serde_json::Value) -> Result<&'a crate::disk_scan::CatItem, Option<&'a crate::disk_scan::CatItem>> {
+        let item = shown["id"].as_str().and_then(|id| c.index_of(id)).map(|k| &c.items[k]);
+        if checkup_entry_agrees(shown, item) {
+            Ok(item.unwrap())
+        } else {
+            Err(item)
+        }
+    }
+
+    /// Drive rows from the last disk checkup: every item that offers an action, in its
+    /// default order. Older than `fresh_sec`, exact numbers become "about". Title and paths
+    /// come from the entry a clean deletes; a row whose report entry disagrees with it is
+    /// shown as not cleanable.
+    pub fn disk_rows(c: &crate::disk_scan::CachedCheckup, fresh_sec: u64, now_unix: u64) -> Vec<vm::Finding> {
+        let stale = now_unix.saturating_sub(c.unix) > fresh_sec;
+        let mut out = Vec::new();
+        for it in &c.report.items {
+            let mut actions: Vec<vm::Action> = it["actions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|a| {
+                    let kind = match a["kind"].as_str()? {
+                        "now" => vm::ActionKind::DiskNow,
+                        "bin" => vm::ActionKind::DiskBin,
+                        "tool" => vm::ActionKind::DiskTool,
+                        _ => return None,
+                    };
+                    Some(vm::Action { kind, detail: a["label"].as_str().unwrap_or("").to_string() })
+                })
+                .collect();
+            if actions.is_empty() {
+                continue;
+            }
+            let mut conf = it["frees_confidence"].as_str().unwrap_or("unknown").to_string();
+            if stale && (conf == "exact" || conf == "lower_bound") {
+                conf = "estimate".into();
+            }
+            let (title, detail) = match agreeing_item(c, it) {
+                Ok(item) => {
+                    let detail = match item.paths.len() {
+                        0 => String::new(),
+                        1 => item.paths[0].clone(),
+                        n => format!("{} and {} more", item.paths[0], n - 1),
+                    };
+                    (item.title.clone(), detail)
+                }
+                Err(item) => {
+                    actions.clear();
+                    (item.map(|i| i.title.clone()).unwrap_or_else(|| it["title"].as_str().unwrap_or("").to_string()), CHECKUP_DOESNT_ADD_UP.to_string())
+                }
+            };
+            out.push(vm::Finding {
+                id: format!("disk:{}", it["id"].as_str().unwrap_or("")),
+                kind: vm::FindingKind::Disk,
+                verdict: vm::Verdict::Review,
+                title,
+                detail,
+                processes: 0,
+                ram_mb: 0,
+                committed_mb: 0,
+                actions,
+                recommended: false,
+                needs_admin: false,
+                company: String::new(),
+                help_url: None,
+                help_command: None,
+                disk: Some(vm::DiskRow { volume: it["volume"].as_str().unwrap_or("").to_string(), frees_gb: it["frees_alone_gb"].as_f64(), confidence: conf }),
+            });
+        }
+        out
+    }
+
+    /// `memguard disk clean` for drive rows picked in the window: the checkup the rows came
+    /// from and each item's fingerprint go along, so the CLI refuses if the ids now name
+    /// something else (another checkup ran in between).
+    pub fn disk_clean_args(seen: &crate::disk_scan::CachedCheckup, picks: &[(String, vm::ActionKind)]) -> Result<Vec<String>, String> {
+        let mut args: Vec<String> = vec!["disk".into(), "clean".into(), "--yes".into(), "--json".into(), "--checkup".into(), seen.ident()];
+        let mut fix = Vec::new();
+        for (id, k) in picks {
+            let short = id.trim_start_matches("disk:");
+            let shown = seen.report.items.iter().find(|it| it["id"].as_str().is_some_and(|i| i.eq_ignore_ascii_case(short)));
+            if !shown.is_some_and(|s| agreeing_item(seen, s).is_ok()) {
+                return Err(CHECKUP_DOESNT_ADD_UP.into());
+            }
+            let fp = crate::disk_clean::checkup_item_fingerprint(seen, short).ok_or_else(|| "Check again first".to_string())?;
+            args.push("--expect".into());
+            args.push(format!("{}={}", short, fp));
+            let a = match k {
+                vm::ActionKind::DiskBin => "bin",
+                vm::ActionKind::DiskTool => "tool",
+                _ => "now",
+            };
+            fix.push(format!("{}:{}", short, a));
+        }
+        args.push("--fix".into());
+        args.extend(fix);
+        Ok(args)
+    }
+
+    /// A drive row's result, from one `memguard disk clean --json` outcome.
+    pub fn disk_outcome_words(o: &serde_json::Value) -> (vm::OutcomeStatus, String) {
+        let msg = o["message"].as_str().unwrap_or("").to_string();
+        let gb = o["predicted_freed_gb"].as_f64().unwrap_or(0.0);
+        match (o["result"].as_str().unwrap_or(""), o["action"].as_str().unwrap_or("")) {
+            ("done", "now") => (vm::OutcomeStatus::Done, format!("Deleted · frees {} (predicted); measured later", crate::ui::kit::format_gb(gb))),
+            ("done", "bin") => (vm::OutcomeStatus::Done, "Moved to the bin · frees nothing until it's emptied".into()),
+            ("done", _) => (vm::OutcomeStatus::Done, format!("Cleaned · can't be undone · frees {} (predicted)", crate::ui::kit::format_gb(gb))),
+            ("refused", _) => (vm::OutcomeStatus::Skipped, msg),
+            (_, _) => (vm::OutcomeStatus::Failed, msg),
         }
     }
 
@@ -780,8 +988,9 @@ enum Work {
     Nudge(Option<(f64, Vec<String>)>),
     /// The RAM check a few minutes after start.
     RamChecked(Box<crate::ramcheck::RamReport>),
-    /// The 60-second disk poll: every volume with its level.
-    DiskPolled(Vec<crate::disk::Volume>),
+    /// The 60-second disk poll: every volume with its level, and the cleanup records' part
+    /// (measured results to show, what the bins hold).
+    DiskPolled(Vec<crate::disk::Volume>, crate::disk_clean::Housekeeping),
 }
 
 fn post_work(hwnd: isize, w: Work) {
@@ -844,6 +1053,8 @@ struct App {
     /// When the next disk poll runs, and whether one is running.
     disk_next: Instant,
     disk_polling: bool,
+    /// The drive the "Empty the bin?" toast is about.
+    bin_ask: Option<String>,
 }
 
 thread_local! {
@@ -1035,7 +1246,12 @@ impl App {
             if self.engine.cfg.disk().enabled {
                 self.disk_polling = true;
                 let (cfg, prev) = (self.engine.cfg.clone(), self.disk_watch.clone());
-                spawn_work(self.hwnd, move || Work::DiskPolled(crate::disk::read_volumes(&cfg, &prev)));
+                spawn_work(self.hwnd, move || {
+                    let vols = crate::disk::read_volumes(&cfg, &prev);
+                    let pids: Vec<u32> = win::list_processes().iter().map(|p| p.pid).collect();
+                    let hk = crate::disk_clean::housekeeping(&crate::disk_clean::DiskFiles::default(), cfg.disk().hold_hours, &pids);
+                    Work::DiskPolled(vols, hk)
+                });
             } else {
                 self.engine.set_disk(None);
             }
@@ -1240,7 +1456,7 @@ impl App {
                     }
                 }
             }
-            Work::DiskPolled(vols) => {
+            Work::DiskPolled(vols, hk) => {
                 self.disk_polling = false;
                 let s = self.engine.cfg.disk();
                 let cook = self.engine.cfg.prime.cook.disk_gb;
@@ -1249,6 +1465,17 @@ impl App {
                     if let Some((title, body)) = crate::disk::level_change_words(&v, from, to, cook) {
                         toast::show(catalog::disk_level(&title, &body, to > from, &v.name()));
                     }
+                    // Critical with something in the bin there: ask. Never empty it unasked.
+                    if to == Level::Critical {
+                        if let Some((_, holds)) = hk.bins.iter().find(|(root, b)| *b > 0 && root.eq_ignore_ascii_case(&v.letter_path())) {
+                            crate::log::write(&format!("disk: {} is critical and the bin there holds {:.1} GB: asking", v.name(), *holds as f64 / (1u64 << 30) as f64));
+                            self.bin_ask = Some(v.name());
+                            toast::show(catalog::disk_bin_ask(&v.name(), *holds as f64 / (1u64 << 30) as f64));
+                        }
+                    }
+                }
+                for (title, body) in &hk.measured {
+                    toast::show(catalog::disk_measured(title, body));
                 }
                 self.engine.set_disk(Some(crate::disk::brief(&vols, &s)));
                 if let Some(st) = self.status.borrow_mut().as_mut() {
@@ -1371,6 +1598,12 @@ fn dispatch(hwnd: HWND, cmd: Command) {
         Command::OpenHistory => open_history_window(),
         Command::OpenDoctor => open_doctor_window(),
         Command::UndoDoctor => undo_doctor(),
+        Command::EmptyDiskBin => {
+            // The person said yes on the toast: the CLI empties it (the tray never deletes files).
+            if let Some((h, Some(vol))) = with_app(|a| (a.hwnd, a.bin_ask.take())) {
+                spawn_work(h, move || Work::Toast(empty_bin_toast(&vol)));
+            }
+        }
         Command::AllowGuarded => {
             with_app(|a| {
                 if let Some(app) = a.guard_pending.take() {
@@ -1714,6 +1947,7 @@ fn run_with(after_update: bool, open_settings: bool) {
             disk_watch: crate::disk::DiskWatch::default(),
             disk_next: Instant::now() + Duration::from_secs(5),
             disk_polling: false,
+            bin_ask: None,
         };
         app.add_icon();
         crate::log::write(&format!("Ather MemGuard {} started", env!("CARGO_PKG_VERSION")));
@@ -2119,9 +2353,12 @@ mod tests {
         assert_eq!(mystery.company, "Contoso");
         assert_eq!(vm::choices(mystery).iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), ["Close", "Hold back", "Leave it"]);
         for k in [VA::Close, VA::End, VA::DisableStartup, VA::HoldBack, VA::BlockWhileUnreal, VA::Keep] {
-            assert_eq!(doctor_map::action_view(doctor_map::action_to_real(k)), k);
+            assert_eq!(doctor_map::action_to_real(k).map(doctor_map::action_view), Some(k));
         }
-        assert_eq!(doctor_map::action_to_real(VA::Keep), crate::doctor::ActionKind::LeaveIt);
+        assert_eq!(doctor_map::action_to_real(VA::Keep), Some(crate::doctor::ActionKind::LeaveIt));
+        for k in [VA::DiskNow, VA::DiskBin, VA::DiskTool] {
+            assert_eq!(doctor_map::action_to_real(k), None, "a drive action never becomes a memory action");
+        }
 
         // Machine-wide startup entries need an administrator; the user's own don't.
         assert!(!f("startup:hkcu:Steam").needs_admin);
@@ -2147,7 +2384,8 @@ mod tests {
         // Every section shows, in order, and the window's pre-checks follow `recommended`.
         let m = vm::DoctorModel::new(v.clone());
         let kinds: Vec<SectionKind> = m.sections().iter().map(|s| s.kind).collect();
-        assert_eq!(kinds, SectionKind::ORDER.to_vec());
+        // Drive rows come from the disk checkup, not the memory report.
+        assert_eq!(kinds, SectionKind::ORDER.iter().copied().filter(|k| *k != SectionKind::Disk).collect::<Vec<_>>());
         let picks = m.picks();
         assert!(picks.contains(&("app:steam".to_string(), VA::Close)));
         assert!(picks.contains(&("startup:hkcu:Steam".to_string(), VA::DisableStartup)));
@@ -2314,5 +2552,137 @@ mod tests {
         assert_eq!(clock_plus(23, 50, 30), "00:20");
         assert_eq!(size_words(1_992_294), "1.9 MB");
         assert_eq!(size_words(2_000), "2 KB");
+    }
+}
+
+#[cfg(test)]
+mod disk_row_tests {
+    use super::doctor_map;
+    use crate::ui::doctor as vm;
+    use serde_json::json;
+
+    fn cached(items: Vec<serde_json::Value>, unix: u64) -> crate::disk_scan::CachedCheckup {
+        crate::disk_scan::CachedCheckup {
+            id: "c1".into(),
+            scope: "*".into(),
+            unix,
+            time: String::new(),
+            items: vec![],
+            root_ids: vec![],
+            last_writes: vec![],
+            report: crate::disk_scan::Checkup { scan: json!({}), volumes: vec![], items, sharing_groups: vec![], totals: vec![], basis: "predicted".into(), do_not_sum: String::new() },
+        }
+    }
+
+    fn cat(key: &str, title: &str, paths: &[&str]) -> crate::disk_scan::CatItem {
+        crate::disk_scan::CatItem { key: key.into(), class: "regenerable".into(), title: title.into(), paths: paths.iter().map(|p| p.to_string()).collect(), lane: None }
+    }
+
+    /// The report's entries `d1`..`dN` and the cleanup entries they stand for.
+    fn cached_with(items: Vec<serde_json::Value>, cats: Vec<crate::disk_scan::CatItem>, unix: u64) -> crate::disk_scan::CachedCheckup {
+        let mut c = cached(items, unix);
+        c.root_ids = vec![vec![]; cats.len()];
+        c.items = cats;
+        c
+    }
+
+    fn three_items() -> (Vec<serde_json::Value>, Vec<crate::disk_scan::CatItem>) {
+        let mut filler: Vec<crate::disk_scan::CatItem> = (2..=8).map(|n| cat("ue:saved_logs", "Logs", &[&format!(r"D:\p{}\Saved\Logs", n)])).collect();
+        filler[5] = cat("lane", "Lane a", &[r"D:\lanes\a"]);
+        let mut cats = vec![cat("ue:intermediate", "Build files for S2", &[r"D:\s2\Intermediate"])];
+        cats.extend(filler);
+        cats.push(cat("cache:npm", "npm cache", &["x", "y"]));
+        let items = vec![
+            json!({ "id": "d1", "key": "ue:intermediate", "title": "Build files for S2", "volume": "D:", "paths": [r"D:\s2\Intermediate"], "frees_alone_gb": 16.4, "frees_confidence": "exact",
+                    "actions": [{ "kind": "now", "label": "Delete it" }, { "kind": "bin", "label": "Move to the bin" }] }),
+            json!({ "id": "d7", "key": "lane", "title": "Lane a", "volume": "D:", "paths": [r"D:\lanes\a"], "frees_alone_gb": 91.2, "frees_confidence": "exact", "actions": [] }),
+            json!({ "id": "d9", "key": "cache:npm", "title": "npm cache", "volume": "C:", "paths": ["x", "y"], "frees_alone_gb": 3.0, "frees_confidence": "exact",
+                    "actions": [{ "kind": "now" }, { "kind": "tool", "label": "Clean with npm" }] }),
+        ];
+        (items, cats)
+    }
+
+    #[test]
+    fn checkup_items_with_actions_become_drive_rows() {
+        let (items, cats) = three_items();
+        let rows = doctor_map::disk_rows(&cached_with(items.clone(), cats.clone(), 1000), 300, 1100);
+        assert_eq!(rows.len(), 2, "lanes offer nothing and are not rows");
+        assert_eq!(rows[0].id, "disk:d1");
+        assert_eq!(rows[0].kind, vm::FindingKind::Disk);
+        assert_eq!(rows[0].disk.as_ref().unwrap().frees_words(), "16.4 GB");
+        assert_eq!(vm::choices(&rows[1]).iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), ["Delete it", "Clean with npm"]);
+        assert_eq!(rows[1].detail, "x and 1 more");
+        // An old checkup: "about".
+        let old = doctor_map::disk_rows(&cached_with(items, cats, 1000), 300, 5000);
+        assert_eq!(old[0].disk.as_ref().unwrap().frees_words(), "about 16.4 GB");
+    }
+
+    /// Found in review: the rows showed title and path from the report while the pick deleted
+    /// the cleanup entry. Both must name the same thing, or the row offers nothing.
+    #[test]
+    fn report_and_cleanup_entries_must_agree() {
+        use doctor_map::checkup_entry_agrees as agrees;
+        let it = cat("ue:intermediate", "Build files", &[r"D:\s2\Intermediate", r"D:\s2\Plugins\X\Intermediate"]);
+        let shown = |key: &str, paths: serde_json::Value| json!({ "id": "d1", "key": key, "title": "Build files", "paths": paths });
+        // Same key and set of paths, in any order and case.
+        assert!(agrees(&shown("ue:intermediate", json!([r"d:\s2\plugins\x\intermediate", r"D:/s2/Intermediate"])), Some(&it)));
+        assert!(!agrees(&shown("ue:saved_logs", json!([r"D:\s2\Intermediate", r"D:\s2\Plugins\X\Intermediate"])), Some(&it)), "key differs");
+        assert!(!agrees(&shown("ue:intermediate", json!([r"D:\s2\Intermediate"])), Some(&it)), "a path is missing");
+        assert!(!agrees(&shown("ue:intermediate", json!([r"D:\s2\Intermediate", r"C:\Users\me\Documents"])), Some(&it)), "a path differs");
+        assert!(!agrees(&shown("ue:intermediate", json!("D:\\s2")), Some(&it)), "paths not a list");
+        assert!(!agrees(&json!({ "id": "d1", "paths": [r"D:\s2\Intermediate", r"D:\s2\Plugins\X\Intermediate"] }), Some(&it)), "no key");
+        assert!(!agrees(&shown("ue:intermediate", json!([])), None), "no cleanup entry for the id");
+
+        // A forged report: d1 shows "Build files" at the Intermediate folder, but the cleanup
+        // entry d1 is the npm cache. The row shows what would be deleted and offers nothing.
+        let (mut items, mut cats) = three_items();
+        cats[0] = cat("cache:npm", "npm cache", &[r"C:\Users\me\AppData\Local\npm-cache"]);
+        let c = cached_with(items.clone(), cats.clone(), 1000);
+        let rows = doctor_map::disk_rows(&c, 300, 1100);
+        assert_eq!(rows[0].id, "disk:d1");
+        assert_eq!(rows[0].title, "npm cache");
+        assert_eq!(rows[0].detail, doctor_map::CHECKUP_DOESNT_ADD_UP);
+        assert!(rows[0].actions.is_empty() && vm::choices(&rows[0]).is_empty(), "not cleanable");
+        assert!(!rows[1].actions.is_empty(), "an agreeing row still offers its actions");
+        assert_eq!(doctor_map::disk_clean_args(&c, &[("disk:d1".into(), vm::ActionKind::DiskNow)]).unwrap_err(), doctor_map::CHECKUP_DOESNT_ADD_UP);
+        assert!(doctor_map::disk_clean_args(&c, &[("disk:d9".into(), vm::ActionKind::DiskNow)]).is_ok());
+        // The title comes from the cleanup entry even when the report's title is changed.
+        items[2]["title"] = json!("Something harmless");
+        let rows = doctor_map::disk_rows(&cached_with(items, cats, 1000), 300, 1100);
+        assert_eq!((rows[1].title.as_str(), rows[1].detail.as_str()), ("npm cache", "x and 1 more"));
+    }
+
+    /// The window confirms on its snapshot (checkup A); another checkup (B) replaces the saved
+    /// one before the clean runs: the arguments the window passes make the CLI refuse.
+    #[test]
+    fn drive_cleanup_carries_what_the_window_showed() {
+        let mut a = cached(vec![json!({ "id": "d1", "key": "ue:intermediate", "paths": [r"D:\s2\Intermediate"] })], 1000);
+        a.id = "cA".into();
+        a.items = vec![crate::disk_scan::CatItem { key: "ue:intermediate".into(), class: "regenerable".into(), title: "Build files".into(), paths: vec![r"D:\s2\Intermediate".into()], lane: None }];
+        a.root_ids = vec![vec![42]];
+        let args = doctor_map::disk_clean_args(&a, &[("disk:d1".into(), vm::ActionKind::DiskNow)]).unwrap();
+        let fp = crate::disk_clean::checkup_item_fingerprint(&a, "d1").unwrap();
+        assert_eq!(args, ["disk", "clean", "--yes", "--json", "--checkup", "cA", "--expect", &format!("d1={}", fp), "--fix", "d1:now"]);
+        let expects = vec![crate::disk_clean::parse_expect(&args[7]).unwrap()];
+        let ids = vec!["d1".to_string()];
+        assert_eq!(crate::disk_clean::check_identity(&a, &args[5], &expects, &ids), Ok(()));
+        let mut b = a.clone();
+        b.id = "cB".into();
+        b.items[0].paths = vec![r"D:\other\Intermediate".into()];
+        b.root_ids = vec![vec![7]];
+        assert_eq!(crate::disk_clean::check_identity(&b, &args[5], &expects, &ids).unwrap_err(), crate::disk_clean::CHECKUP_CHANGED);
+        // An id the snapshot doesn't have: nothing runs.
+        assert!(doctor_map::disk_clean_args(&a, &[("disk:d5".into(), vm::ActionKind::DiskNow)]).is_err());
+    }
+
+    #[test]
+    fn clean_outcomes_say_predicted_and_bin_frees_nothing() {
+        let (s, m) = doctor_map::disk_outcome_words(&json!({ "result": "done", "action": "now", "predicted_freed_gb": 16.4 }));
+        assert_eq!((s, m.as_str()), (vm::OutcomeStatus::Done, "Deleted · frees 16.4 GB (predicted); measured later"));
+        let (_, m) = doctor_map::disk_outcome_words(&json!({ "result": "done", "action": "bin" }));
+        assert_eq!(m, "Moved to the bin · frees nothing until it's emptied");
+        let (s, m) = doctor_map::disk_outcome_words(&json!({ "result": "refused", "action": "now", "message": "Something in it was written in the last 2 hours" }));
+        assert_eq!(s, vm::OutcomeStatus::Skipped);
+        assert!(m.contains("2 hours"));
     }
 }

@@ -190,9 +190,412 @@ enum DiskCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Clean items of the last checkup: <id>[:now|bin|tool]. Makes a fresh plan, lists what goes, asks first
+    Clean {
+        /// Item ids from the checkup, each with an optional action: d1 d3:bin d7:tool
+        #[arg(long, num_args = 1.., value_name = "ID[:ACTION]", required = true)]
+        fix: Vec<String>,
+        /// Check everything and show what would happen, without doing it
+        #[arg(long)]
+        dry_run: bool,
+        /// Don't ask (scripts)
+        #[arg(long)]
+        yes: bool,
+        /// Stay and watch the drive until the space shows up (up to 30 minutes), then print it
+        #[arg(long)]
+        wait: bool,
+        /// The checkup the ids come from (memguard disk checkup prints it). Required with --yes
+        #[arg(long, value_name = "CHECKUP_ID")]
+        checkup: Option<String>,
+        /// What each item was when you saw it: <id>=<fingerprint> (the checkup window passes these)
+        #[arg(long, value_name = "ID=FINGERPRINT")]
+        expect: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Put back what the last cleanup moved to the bin (or one entry by its undo id)
+    Undo {
+        undo_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show what is in Ather MemGuard's bin; --empty empties it for good
+    Bin {
+        /// Empty the bin (everything in it, or only on --volume)
+        #[arg(long)]
+        empty: bool,
+        /// Empty only what has been in the bin longer than [disk] hold_hours
+        #[arg(long, conflicts_with = "empty")]
+        expired: bool,
+        /// Only this drive, like D:
+        #[arg(long)]
+        volume: Option<String>,
+        /// Don't ask (scripts)
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Move caches off the system drive by setting user environment variables (prints the plan)
+    Relocate {
+        /// Put them under this folder instead of the drive Ather MemGuard picks
+        #[arg(long)]
+        to: Option<String>,
+        /// Set the variables (asks first)
+        #[arg(long, conflicts_with = "undo")]
+        apply: bool,
+        /// Put the previous values back
+        #[arg(long)]
+        undo: bool,
+        /// Don't ask (scripts)
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Internal: count a scan job from stdin at background priority
     #[command(hide = true)]
     ScanChild,
+    /// Internal: watch a drive's free space after a cleanup and record what came back
+    #[command(hide = true)]
+    WatchChild { id: String },
+}
+
+/// Ask on the console. Without a console, only `--yes` goes ahead.
+fn confirm(question: &str, yes: bool) -> Result<bool, String> {
+    use std::io::{IsTerminal, Write};
+    if yes {
+        return Ok(true);
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err("Nothing was changed: add --yes to go ahead without a prompt.".into());
+    }
+    print!("{} [y/N] ", question);
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).map_err(|e| e.to_string())?;
+    Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+fn disk_clean_cmd(fix: Vec<String>, dry_run: bool, yes: bool, wait: bool, checkup: Option<String>, expect: Vec<String>, json: bool) -> ExitCode {
+    use athermemguard::disk_clean::{self as dc, CleanAction, DiskFiles};
+    use athermemguard::disk_scan;
+    let fail = |e: String| {
+        eprintln!("{}", e);
+        ExitCode::from(1)
+    };
+    let cfg = load_config();
+    let Some(cache) = disk_scan::load_cache() else {
+        return fail("Run memguard disk checkup first: clean uses its item ids.".into());
+    };
+    let mut picks: Vec<(String, Option<CleanAction>)> = Vec::new();
+    for f in &fix {
+        match dc::parse_pick(f) {
+            Ok(p) => picks.push(p),
+            Err(e) => return fail(e),
+        }
+    }
+    // What each pick will do, so the plan totals only what frees space now.
+    let mut together = Vec::new();
+    for (id, a) in &picks {
+        let it = id[1..].parse::<usize>().ok().and_then(|n| cache.items.get(n.wrapping_sub(1)));
+        let Some(it) = it else { return fail(format!("{} is not an item of the last disk checkup.", id)) };
+        let tool = disk_scan::catalog_info(&it.key).and_then(|c| c.tool);
+        let act = a.or_else(|| dc::offered_actions(&it.key, &it.class, tool.as_deref(), true).first().copied());
+        if matches!(act, Some(CleanAction::Now) | Some(CleanAction::Tool)) {
+            together.push(id.clone());
+        }
+    }
+    let ids: Vec<String> = picks.iter().map(|(i, _)| i.clone()).collect();
+    // What the person (or the checkup window) saw: without it, --yes could act on ids that a
+    // newer checkup gave to other folders.
+    let mut expects = Vec::new();
+    for e in &expect {
+        match dc::parse_expect(e) {
+            Ok(x) => expects.push(x),
+            Err(e) => return fail(e),
+        }
+    }
+    match &checkup {
+        Some(cid) => {
+            if let Err(e) = dc::check_identity(&cache, cid, &expects, &ids) {
+                return fail(e);
+            }
+        }
+        None if !expects.is_empty() => return fail("--expect goes with --checkup <id>. Nothing was changed.".into()),
+        None if yes && !dry_run => {
+            return fail(format!(
+                "Nothing was changed: with --yes, also pass --checkup {} (the checkup these ids come from), so a newer checkup can't change what they mean.",
+                cache.ident()
+            ))
+        }
+        None => {}
+    }
+    let mut p = |files: u64, secs: f64| {
+        if !json {
+            eprintln!("counting: {} files, {:.0} s", files, secs);
+        }
+    };
+    let (_, rec) = match disk_scan::plan_record(&cfg, &cache, &ids, Some(&together), &disk_scan::run_child, &mut p) {
+        Ok(x) => x,
+        Err(e) => return fail(e),
+    };
+    if checkup.is_some() {
+        if let Err(e) = dc::check_live_ids(&cache, &rec) {
+            return fail(e);
+        }
+    }
+    let files = DiskFiles::default();
+    let _ = files.save_plan(&rec);
+    if !json {
+        print!("{}", clean_listing(&rec, &picks));
+    }
+    if !dry_run {
+        if json && !yes {
+            return fail("Nothing was changed: with --json, add --yes (there is no prompt).".into());
+        }
+        match confirm("Go ahead?", yes) {
+            Ok(true) => {}
+            Ok(false) => {
+                println!("Nothing was changed.");
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => return fail(e),
+        }
+    }
+    let opts = dc::CleanOpts { dry_run, presample_secs: 5, start_watcher: !wait && !dry_run, ..Default::default() };
+    let r = dc::clean(&cfg, &files, &rec, &picks, &opts);
+    if json && !wait {
+        print_json(&r.to_json());
+    } else if !json {
+        println!();
+        print!("{}", dc::render_clean(&r));
+    }
+    let mut measured = Vec::new();
+    if wait {
+        for v in r.volumes.iter().filter(|v| v.watch_id.is_some()) {
+            if !json {
+                println!("Watching {} for up to 30 minutes...", v.volume_root.trim_end_matches('\\'));
+            }
+            let m = dc::watch(&files, v.watch_id.as_deref().unwrap_or(""), &mut |line| {
+                if !json {
+                    println!("  {}", line);
+                }
+            });
+            measured.push(serde_json::json!({ "volume": v.volume_root.trim_end_matches('\\'), "predicted_freed_gb": athermemguard::disk_space::gb2(v.predicted_freed), "measured": m }));
+        }
+        if json {
+            let mut j = r.to_json();
+            j["measured_results"] = serde_json::json!(measured);
+            print_json(&j);
+        }
+    }
+    let bad = r.outcomes.iter().any(|o| matches!(o.result.as_str(), "refused" | "failed" | "partial"));
+    if bad {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// The confirmation's listing: what goes, how, and the predicted frees.
+fn clean_listing(rec: &athermemguard::disk_clean::PlanRecord, picks: &[(String, Option<athermemguard::disk_clean::CleanAction>)]) -> String {
+    use athermemguard::disk_clean::{self as dc, CleanAction};
+    let mut groups: [(CleanAction, &str, Vec<String>); 3] = [
+        (CleanAction::Now, "Delete for good (can't be undone):", Vec::new()),
+        (CleanAction::Bin, "Move to Ather MemGuard's bin (frees nothing until the bin is emptied; undo with memguard disk undo):", Vec::new()),
+        (CleanAction::Tool, "Clean with the tool's own command (can't be undone):", Vec::new()),
+    ];
+    for (id, a) in picks {
+        let Some(it) = rec.item(id) else { continue };
+        let Some(act) = a.or_else(|| dc::offered_actions(&it.key, &it.class, it.tool.as_deref(), true).first().copied()) else {
+            continue;
+        };
+        let frees = if act == CleanAction::Bin { "0 GB now".to_string() } else { format!("frees {} predicted", dc::gb_words(it.frees_alone, &it.confidence)) };
+        let extra = if act == CleanAction::Tool { format!(" (runs {})", it.tool.as_deref().and_then(dc::tool_command).map(|c| c.display()).unwrap_or_default()) } else { String::new() };
+        if let Some(g) = groups.iter_mut().find(|g| g.0 == act) {
+            g.2.push(format!("  {:<4}{:<40} {}{}\n      {}", it.id, it.title, frees, extra, it.paths.join("\n      ")));
+        }
+    }
+    let mut s = String::new();
+    for (_, head, lines) in &groups {
+        if !lines.is_empty() {
+            s.push_str(head);
+            s.push('\n');
+            for l in lines {
+                s.push_str(l);
+                s.push('\n');
+            }
+        }
+    }
+    for v in &rec.volumes {
+        s.push_str(&format!(
+            "Predicted to free {} on {} ({}, counted once). It is measured after the delete.\n",
+            dc::gb_words(v.frees_together, &v.confidence),
+            v.root.trim_end_matches('\\'),
+            v.confidence
+        ));
+        if v.fs.eq_ignore_ascii_case("ReFS") {
+            s.push_str(&format!("  {}\n", athermemguard::disk_scan::REFS_DELAY_NOTE));
+        }
+    }
+    s
+}
+
+fn disk_bin_cmd(empty: bool, expired: bool, volume: Option<String>, yes: bool, json: bool) -> ExitCode {
+    use athermemguard::disk_clean::{self as dc, DiskFiles};
+    let files = DiskFiles::default();
+    let cfg = load_config();
+    let mut roots = dc::fixed_roots();
+    if let Some(v) = &volume {
+        let want = v.trim_end_matches('\\').trim_end_matches(':').to_ascii_uppercase();
+        roots.retain(|r| r.trim_end_matches('\\').trim_end_matches(':').eq_ignore_ascii_case(&want));
+    }
+    let runs = dc::bin_runs(&files, &roots);
+    let pick = if expired { dc::expired(&runs, cfg.disk().hold_hours, dc::unix_now()) } else { runs.clone() };
+    if !empty && !expired {
+        if json {
+            print_json(&serde_json::json!({ "runs": runs, "hold_hours": cfg.disk().hold_hours }));
+        } else if runs.is_empty() {
+            println!("Ather MemGuard's bin is empty.");
+        } else {
+            for r in &runs {
+                let left = (r.moved_unix as f64 + cfg.disk().hold_hours * 3600.0 - dc::unix_now() as f64).max(0.0) / 3600.0;
+                println!(
+                    "{}  {}  holds {:.1} GB of files; frees {} when emptied (predicted). Emptied in about {:.0} h.\n    {}",
+                    r.volume_root.trim_end_matches('\\'),
+                    r.run_id,
+                    athermemguard::disk_space::gb2(r.holds),
+                    dc::gb_words(Some(r.frees_alone), "lower_bound"),
+                    left,
+                    if r.titles.is_empty() { r.path.clone() } else { r.titles.join(", ") }
+                );
+            }
+            println!("Put it back: memguard disk undo    Empty it for good: memguard disk bin --empty");
+        }
+        return ExitCode::SUCCESS;
+    }
+    if pick.is_empty() {
+        if json {
+            print_json(&serde_json::json!({ "emptied": [] }));
+        } else {
+            println!("Nothing to empty.");
+        }
+        return ExitCode::SUCCESS;
+    }
+    if !json {
+        for r in &pick {
+            println!("Empty for good: {} {} ({:.1} GB of files)", r.volume_root.trim_end_matches('\\'), r.run_id, athermemguard::disk_space::gb2(r.holds));
+        }
+    }
+    match confirm("Empty these for good? They can't be put back afterwards.", yes) {
+        Ok(true) => {}
+        Ok(false) => {
+            println!("Nothing was changed.");
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("{}", e);
+            return ExitCode::from(1);
+        }
+    }
+    let (done, watches) = dc::empty_bins(&files, &pick, 3, true);
+    if json {
+        print_json(&serde_json::json!({
+            "emptied": done.iter().map(|(r, d)| serde_json::json!({ "run_id": r.run_id, "volume": r.volume_root, "removed": d })).collect::<Vec<_>>(),
+            "predicted": watches.iter().map(|w| serde_json::json!({ "volume": w.volume_root, "predicted_freed_gb": athermemguard::disk_space::gb2(w.predicted), "frees_confidence": w.predicted_confidence, "measured": "later" })).collect::<Vec<_>>(),
+        }));
+    } else {
+        for (r, d) in &done {
+            println!("{} {}: {}", r.volume_root.trim_end_matches('\\'), r.run_id, d.words());
+        }
+        for w in &watches {
+            println!("Predicted to free {} on {}; the measured result comes in a notification and the log.", dc::gb_words(Some(w.predicted), "lower_bound"), w.volume_root.trim_end_matches('\\'));
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn disk_relocate_cmd(to: Option<String>, apply: bool, undo: bool, yes: bool, json: bool) -> ExitCode {
+    use athermemguard::disk_clean::DiskFiles;
+    use athermemguard::disk_relocate::{self as dr, EnvStore};
+    let fail = |e: String| {
+        eprintln!("{}", e);
+        ExitCode::from(1)
+    };
+    let store = match dr::RegistryEnv::from_env() {
+        Ok(s) => s,
+        Err(e) => return fail(e),
+    };
+    let files = DiskFiles::default();
+    if undo {
+        return match dr::undo(&store, &files) {
+            Ok(said) => {
+                if json {
+                    print_json(&serde_json::json!({ "undone": true, "store": store.describe(), "messages": said }));
+                } else {
+                    for l in said {
+                        println!("{}", l);
+                    }
+                    println!("Restart open terminals and Unreal to pick the old places up again.");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(e),
+        };
+    }
+    if let Some(why) = to.as_deref().and_then(dr::to_path_problem) {
+        return fail(format!("Nothing was set: {}", why));
+    }
+    let cfg = load_config();
+    let vars = dr::read_vars(&store, &dr::quick_size);
+    let sys = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+    let system = athermemguard::disk_win::volume_of(&format!("{}\\", sys)).map(|(_, g)| g);
+    let vols = dr::dest_volumes();
+    let to_vol = to.as_deref().and_then(|t| {
+        let e = std::path::Path::new(t).ancestors().find(|a| a.exists())?.display().to_string();
+        athermemguard::disk_win::volume_of(&e).map(|(_, g)| g)
+    });
+    let p = dr::plan(&vars, system.as_deref(), &vols, to.as_deref().zip(to_vol.as_deref()), &cfg.disk());
+    if to.is_some() && to_vol.is_none() {
+        return fail(format!("{} isn't on a drive this PC has.", to.unwrap_or_default()));
+    }
+    if json && !apply {
+        print_json(&dr::plan_json(&p, &store.describe()));
+        return ExitCode::SUCCESS;
+    }
+    if !json {
+        print!("{}", dr::render_plan(&p));
+        if !store.is_real() {
+            println!("(Test store: {})", store.describe());
+        }
+    }
+    if !apply {
+        return ExitCode::SUCCESS;
+    }
+    if let Some(r) = &p.refused {
+        return fail(format!("Nothing was set: {}", r));
+    }
+    match confirm(&format!("Set these user environment variables in {}?", store.describe()), yes) {
+        Ok(true) => {}
+        Ok(false) => {
+            println!("Nothing was changed.");
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => return fail(e),
+    }
+    match dr::apply(&p, &store, &files) {
+        Ok(rec) => {
+            if json {
+                print_json(&serde_json::json!({ "applied": true, "store": rec.store, "entries": rec.entries }));
+            } else {
+                println!("Set {} variable{} in {}. Undo with memguard disk relocate --undo.", rec.entries.len(), if rec.entries.len() == 1 { "" } else { "s" }, rec.store);
+                println!("Nothing was moved: the old caches stay until you remove them. Once the new places have been used, the disk checkup lists them as \"Old cache, no longer used\".");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(e),
+    }
 }
 
 fn disk_cmd(json: bool, refresh: bool, action: Option<DiskCmd>) -> ExitCode {
@@ -215,6 +618,28 @@ fn disk_cmd(json: bool, refresh: bool, action: Option<DiskCmd>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(DiskCmd::ScanChild) => ExitCode::from(disk_scan::child_main() as u8),
+        Some(DiskCmd::WatchChild { id }) => {
+            athermemguard::disk_clean::watch(&athermemguard::disk_clean::DiskFiles::default(), &id, &mut |_| {});
+            ExitCode::SUCCESS
+        }
+        Some(DiskCmd::Clean { fix, dry_run, yes, wait, checkup, expect, json }) => disk_clean_cmd(fix, dry_run, yes, wait, checkup, expect, json),
+        Some(DiskCmd::Bin { empty, expired, volume, yes, json }) => disk_bin_cmd(empty, expired, volume, yes, json),
+        Some(DiskCmd::Relocate { to, apply, undo, yes, json }) => disk_relocate_cmd(to, apply, undo, yes, json),
+        Some(DiskCmd::Undo { undo_id, json }) => {
+            let outs = athermemguard::disk_clean::undo(&athermemguard::disk_clean::DiskFiles::default(), undo_id.as_deref());
+            if json {
+                print_json(&serde_json::json!({ "outcomes": outs }));
+            } else {
+                for o in &outs {
+                    println!("{} {}: {}", o.id, o.title, if o.message.is_empty() { o.result.clone() } else { o.message.clone() });
+                }
+            }
+            if outs.iter().any(|o| o.result != "undone") {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
         Some(DiskCmd::Checkup { path, refresh, budget_sec, json }) => {
             let mut p = progress(json);
             match disk_scan::checkup(&load_config(), path.as_deref(), refresh, budget_sec, &disk_scan::run_child, &mut p) {
@@ -395,8 +820,8 @@ enum Cmd {
         undo: Option<Option<String>>,
     },
 
-    // ---- Disk and Dev Drive (report only)
-    /// Show your drives, how full they are and Dev Drive health (changes nothing)
+    // ---- Disk and Dev Drive (cleanup asks first; see `disk clean`)
+    /// Show your drives, how full they are and Dev Drive health; clean, undo, bin and relocate act
     #[command(args_conflicts_with_subcommands = true)]
     Disk {
         /// Machine-readable output
@@ -801,7 +1226,7 @@ fn main() -> ExitCode {
         // ---- Part F: doctor
         Cmd::Doctor { json, fix, force, dry_run, undo } => run_doctor(json, fix, force, dry_run, undo),
 
-        // ---- Disk and Dev Drive (report only)
+        // ---- Disk and Dev Drive
         Cmd::Disk { json, refresh, action } => disk_cmd(json, refresh, action),
 
         // ---- Part G: RAM and BIOS check
