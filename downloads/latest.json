@@ -1,9 +1,9 @@
 {
     "windows":  {
-                    "version":  "0.2.4",
-                    "url":  "https://github.com/AskTinNguyen/AtherMemGuard/releases/download/v0.2.4/AtherMemGuard-Setup-0.2.4.exe",
-                    "sha256":  "c3b8c9ccc849c4532098558ccf0df55a22f7ce8c18b6d0cf1b4478f4dd65adec",
-                    "size":  8367104,
-                    "notes":  "Clean what the disk checkup found, with undo and measured results; move caches off C:; agents can clean regenerable build output."
+                    "version":  "0.2.5",
+                    "url":  "https://github.com/AskTinNguyen/AtherMemGuard/releases/download/v0.2.5/AtherMemGuard-Setup-0.2.5.exe",
+                    "sha256":  "54734c209202311760049e99f9f8d60e17c83102a8e1a7b5144bf807b68f3d96",
+                    "size":  8422400,
+                    "notes":  "Separate Memory and Disk space tabs in the Checkup window, and the disk checkup no longer says \"frees 0\" for what it didn't count."
                 }
 }
