@@ -6,20 +6,25 @@
 //! `canvas.s(n)` to scale 96-DPI lengths.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::mem::{size_of, zeroed};
+#[cfg(any(test, feature = "ui-snapshots"))]
 use std::path::Path;
 use std::ptr::{null, null_mut};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows_sys::Win32::Foundation::{LPARAM, RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::*;
+#[cfg(any(test, feature = "ui-snapshots"))]
+use windows_sys::Win32::Graphics::GdiPlus::GdipSaveImageToFile;
 use windows_sys::Win32::Graphics::GdiPlus::{
     CombineModeReplace, DashStyleDash, FillModeAlternate, GdipAddPathArc, GdipAddPathPolygon, GdipClosePathFigure,
     GdipCreateBitmapFromScan0, GdipCreatePath, GdipCreatePen1, GdipCreateSolidFill, GdipDeleteBrush, GdipDeleteGraphics,
-    GdipDeletePath, GdipDeletePen, GdipDisposeImage, GdipDrawLine, GdipDrawPath, GdipFillEllipse, GdipFillPath,
-    GdipGetImageGraphicsContext, GdipResetClip, GdipSaveImageToFile, GdipSetClipRectI, GdipSetPenDashStyle,
-    GdipSetPixelOffsetMode, GdipSetSmoothingMode, GdiplusStartup, GdiplusStartupInput, GpBitmap, GpBrush, GpGraphics,
-    GpImage, GpPath, GpPen, GpSolidFill, PixelOffsetModeHalf, PointF, SmoothingModeAntiAlias8x8, UnitPixel,
+    GdipDeletePath, GdipDeletePen, GdipDisposeImage, GdipDrawLine, GdipDrawLines, GdipDrawPath, GdipFillEllipse, GdipFillPath,
+    GdipGetImageGraphicsContext, GdipResetClip, GdipSetClipRectI, GdipSetPenDashArray,
+    GdipSetPenDashStyle, GdipSetPixelOffsetMode, GdipSetSmoothingMode, GdiplusShutdown, GdiplusStartup,
+    GdiplusStartupInput, GdiplusStartupOutput, GpBitmap, GpBrush, GpGraphics, GpImage, GpPath, GpPen, GpSolidFill,
+    PixelOffsetModeHalf, PointF, SmoothingModeAntiAlias8x8, UnitPixel,
 };
 
 use super::geom::{Pt, Rect};
@@ -27,17 +32,58 @@ use super::theme::{Face, Font, Rgb, Scale};
 use crate::win::wide;
 
 const PIXEL_FORMAT_32BPP_RGB: i32 = 0x0002_2009;
+#[cfg(any(test, feature = "ui-snapshots"))]
 const PIXEL_FORMAT_32BPP_ARGB: i32 = 0x0026_200A;
 
-/// Start GDI+ once per process; it is never shut down.
-pub(crate) fn gdiplus() {
-    static TOKEN: OnceLock<usize> = OnceLock::new();
-    TOKEN.get_or_init(|| {
+struct GdiPlusState {
+    refs: usize,
+    token: usize,
+}
+
+static GDIPLUS: Mutex<GdiPlusState> = Mutex::new(GdiPlusState { refs: 0, token: 0 });
+
+/// Acquire a refcounted GDI+ session (starting GDI+ with `SuppressBackgroundThread: 1`).
+fn gdiplus_acquire() {
+    let mut st = GDIPLUS.lock().unwrap_or_else(|e| e.into_inner());
+    if st.refs == 0 && st.token == 0 {
         let mut token = 0usize;
-        let input = GdiplusStartupInput { GdiplusVersion: 1, DebugEventCallback: 0, SuppressBackgroundThread: 0, SuppressExternalCodecs: 0 };
-        unsafe { GdiplusStartup(&mut token, &input, null_mut()) };
-        token
-    });
+        let input = GdiplusStartupInput { GdiplusVersion: 1, DebugEventCallback: 0, SuppressBackgroundThread: 1, SuppressExternalCodecs: 0 };
+        let mut output: GdiplusStartupOutput = unsafe { zeroed() };
+        let status = unsafe { GdiplusStartup(&mut token, &input, &mut output) };
+        if status == 0 {
+            st.token = token;
+        }
+    }
+    st.refs += 1;
+}
+
+/// Release a refcounted GDI+ session, shutting down GDI+ once `refs` reaches 0.
+fn gdiplus_release() {
+    let mut st = GDIPLUS.lock().unwrap_or_else(|e| e.into_inner());
+    st.refs = st.refs.saturating_sub(1);
+    if st.refs == 0 && st.token != 0 {
+        let token = std::mem::replace(&mut st.token, 0);
+        unsafe { GdiplusShutdown(token) };
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn gdiplus_state() -> (usize, bool) {
+    let st = GDIPLUS.lock().unwrap_or_else(|e| e.into_inner());
+    (st.refs, st.token != 0)
+}
+
+static LOGO_CACHE: OnceLock<Mutex<BTreeMap<(usize, crate::engine::Level), Arc<Vec<u8>>>>> = OnceLock::new();
+
+fn cached_logo(size: usize, level: crate::engine::Level) -> Arc<Vec<u8>> {
+    let cache = LOGO_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(buf) = map.get(&(size, level)) {
+        return Arc::clone(buf);
+    }
+    let buf = Arc::new(crate::logo::render(size, level));
+    map.insert((size, level), Arc::clone(&buf));
+    buf
 }
 
 unsafe extern "system" fn font_found(_: *const LOGFONTW, _: *const TEXTMETRICW, _: u32, found: LPARAM) -> i32 {
@@ -109,17 +155,17 @@ pub struct Canvas {
     h: i32,
     gp_bitmap: *mut GpBitmap,
     gfx: *mut GpGraphics,
+    gp_ref: bool,
     pub scale: Scale,
-    fonts: RefCell<Vec<((Face, i32, u16), HFONT)>>,
+    fonts: RefCell<Vec<((Face, i32, u16), HFONT, i32)>>,
     fade: Option<(Rgb, f32)>,
     clips: Vec<Rect>,
 }
 
 impl Canvas {
-    /// An off-screen canvas of `w` x `h` device pixels at `scale`.
-    pub fn new(w: i32, h: i32, scale: Scale) -> Canvas {
-        gdiplus();
-        let mut c = Canvas {
+    /// An unbacked measurement-only canvas (GDI+ and DIB allocation are deferred until `resize`).
+    pub(crate) fn probe(scale: Scale) -> Canvas {
+        Canvas {
             dc: unsafe { CreateCompatibleDC(null_mut()) },
             bmp: null_mut(),
             old_bmp: null_mut(),
@@ -128,11 +174,17 @@ impl Canvas {
             h: 0,
             gp_bitmap: null_mut(),
             gfx: null_mut(),
+            gp_ref: false,
             scale,
             fonts: RefCell::new(Vec::new()),
             fade: None,
             clips: Vec::new(),
-        };
+        }
+    }
+
+    /// An off-screen canvas of `w` x `h` device pixels at `scale`.
+    pub fn new(w: i32, h: i32, scale: Scale) -> Canvas {
+        let mut c = Canvas::probe(scale);
         c.resize(w, h);
         c
     }
@@ -161,6 +213,10 @@ impl Canvas {
         let (w, h) = (w.max(1), h.max(1));
         if w == self.w && h == self.h && !self.bmp.is_null() {
             return;
+        }
+        if !self.gp_ref {
+            gdiplus_acquire();
+            self.gp_ref = true;
         }
         unsafe {
             self.free_bitmap();
@@ -217,7 +273,7 @@ impl Canvas {
     }
 
     fn free_fonts(&mut self) {
-        for (_, f) in self.fonts.borrow_mut().drain(..) {
+        for (_, f, _) in self.fonts.borrow_mut().drain(..) {
             unsafe { DeleteObject(f) };
         }
     }
@@ -414,6 +470,37 @@ impl Canvas {
         }
     }
 
+    /// Batched anti-aliased polylines using a single GDI+ pen across all `runs` of `len >= 2`.
+    pub(crate) fn polylines(&mut self, runs: &[Vec<(f32, f32)>], c: Rgb, width: f32, dash_px: Option<f32>) {
+        if self.gfx.is_null() || runs.is_empty() || !runs.iter().any(|r| r.len() >= 2) {
+            return;
+        }
+        let width = width.max(0.5);
+        unsafe {
+            GdiFlush();
+            let mut pen: *mut GpPen = null_mut();
+            GdipCreatePen1(self.col(c).argb(255), width, UnitPixel, &mut pen);
+            if pen.is_null() {
+                return;
+            }
+            if let Some(d) = dash_px {
+                let unit = (d / width).max(1.0);
+                let pat = [unit, unit];
+                GdipSetPenDashArray(pen, pat.as_ptr(), 2);
+            }
+            let mut pts: Vec<PointF> = Vec::new();
+            for r in runs {
+                if r.len() < 2 {
+                    continue;
+                }
+                pts.clear();
+                pts.extend(r.iter().map(|&(x, y)| PointF { X: x, Y: y }));
+                GdipDrawLines(self.gfx, pen, pts.as_ptr(), pts.len() as i32);
+            }
+            GdipDeletePen(pen);
+        }
+    }
+
     /// Horizontal hairline across `r`'s top edge, one scaled pixel high.
     pub fn hline(&mut self, x: i32, y: i32, w: i32, c: Rgb) {
         let h = self.px1(1.0);
@@ -422,15 +509,22 @@ impl Canvas {
 
     // ------------------------------------------------------------ text
 
-    fn font(&self, f: Font) -> HFONT {
+    fn font_entry(&self, f: Font) -> (HFONT, i32) {
         let px = self.scale.s(f.px).max(1);
         let key = (f.face, px, f.weight);
-        if let Some((_, h)) = self.fonts.borrow().iter().find(|(k, _)| *k == key) {
-            return *h;
+        if let Some(&(_, h, tm_h)) = self.fonts.borrow().iter().find(|(k, _, _)| *k == key) {
+            return (h, tm_h);
         }
         let h = create_hfont(f, self.scale);
-        self.fonts.borrow_mut().push((key, h));
-        h
+        let tm_h = unsafe {
+            let old = SelectObject(self.dc, h);
+            let mut tm: TEXTMETRICW = zeroed();
+            GetTextMetricsW(self.dc, &mut tm);
+            SelectObject(self.dc, old);
+            tm.tmHeight
+        };
+        self.fonts.borrow_mut().push((key, h, tm_h));
+        (h, tm_h)
     }
 
     /// Width and height in device pixels of one line of `s`.
@@ -440,27 +534,43 @@ impl Canvas {
 
     /// Like `measure`, with `extra` pixels added after every character.
     pub fn measure_spaced(&self, s: &str, f: Font, extra: i32) -> (i32, i32) {
-        // NUL-terminated so the pointer is valid even for an empty string.
-        let w: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
-        let n = (w.len() - 1) as i32;
+        let (hfont, tm_h) = self.font_entry(f);
+        if s.is_empty() {
+            return (0, tm_h);
+        }
+        let mut stack = [0u16; 128];
+        let mut heap = Vec::new();
+        let mut len = 0usize;
+        for u in s.encode_utf16() {
+            if heap.is_empty() {
+                if len < stack.len() {
+                    stack[len] = u;
+                    len += 1;
+                } else {
+                    heap.extend_from_slice(&stack[..len]);
+                    heap.push(u);
+                }
+            } else {
+                heap.push(u);
+            }
+        }
+        let (ptr, n) = if heap.is_empty() { (stack.as_ptr(), len as i32) } else { (heap.as_ptr(), heap.len() as i32) };
         unsafe {
-            let old = SelectObject(self.dc, self.font(f));
+            let old = SelectObject(self.dc, hfont);
             let prev = SetTextCharacterExtra(self.dc, extra);
             let mut sz = SIZE { cx: 0, cy: 0 };
             if n > 0 {
-                GetTextExtentPoint32W(self.dc, w.as_ptr(), n, &mut sz);
+                GetTextExtentPoint32W(self.dc, ptr, n, &mut sz);
             }
-            let mut tm: TEXTMETRICW = zeroed();
-            GetTextMetricsW(self.dc, &mut tm);
             SetTextCharacterExtra(self.dc, prev);
             SelectObject(self.dc, old);
-            (sz.cx, tm.tmHeight)
+            (sz.cx, tm_h)
         }
     }
 
     /// Line height of a font in device pixels.
     pub fn line_height(&self, f: Font) -> i32 {
-        self.measure("Ag", f).1
+        self.font_entry(f).1
     }
 
     unsafe fn draw(&self, r: Rect, s: &str, f: Font, c: Rgb, flags: u32, extra: i32) {
@@ -471,7 +581,7 @@ impl Canvas {
         }
         let w: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
         let n = (w.len() - 1) as i32;
-        let old = SelectObject(self.dc, self.font(f));
+        let old = SelectObject(self.dc, self.font_entry(f).0);
         let prev = SetTextCharacterExtra(self.dc, extra);
         SetTextColor(self.dc, self.col(c).colorref());
         let mut rc: RECT = r.to_win();
@@ -587,25 +697,37 @@ impl Canvas {
 
     /// The Ather mark on its tile, filling `r` (square).
     pub fn logo(&mut self, r: Rect) {
+        self.logo_level(r, crate::engine::Level::Normal);
+    }
+
+    /// The Ather mark for `level`, cached by `(size, level)` and clipped up front.
+    pub fn logo_level(&mut self, r: Rect, level: crate::engine::Level) {
         let size = r.w.min(r.h).max(1) as usize;
-        let src = crate::logo::render(size, crate::engine::Level::Normal);
+        let src = cached_logo(size, level);
         unsafe { GdiFlush() };
         if self.bits.is_null() {
             return;
         }
         let clip = self.clips.last().copied().unwrap_or(self.bounds());
-        for y in 0..size as i32 {
-            for x in 0..size as i32 {
-                let (dx, dy) = (r.x + x, r.y + y);
-                if !clip.contains(Pt::new(dx, dy)) || dx < 0 || dy < 0 || dx >= self.w || dy >= self.h {
-                    continue;
-                }
-                let i = (y as usize * size + x as usize) * 4;
+        let x0 = (clip.x.max(0) - r.x).max(0);
+        let y0 = (clip.y.max(0) - r.y).max(0);
+        let x1 = (clip.right().min(self.w) - r.x).min(size as i32);
+        let y1 = (clip.bottom().min(self.h) - r.y).min(size as i32);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        for y in y0..y1 {
+            let dy = r.y + y;
+            let row_src = y as usize * size;
+            let row_dst = (dy * self.w) as usize;
+            for x in x0..x1 {
+                let dx = r.x + x;
+                let i = (row_src + x as usize) * 4;
                 let a = src[i + 3] as u32;
                 if a == 0 {
                     continue;
                 }
-                let px = unsafe { &mut *self.bits.add((dy * self.w + dx) as usize) };
+                let px = unsafe { &mut *self.bits.add(row_dst + dx as usize) };
                 let (db, dg, dr) = (*px & 0xFF, (*px >> 8) & 0xFF, (*px >> 16) & 0xFF);
                 let blend = |s: u32, d: u32| (s * a + d * (255 - a)) / 255;
                 let (b, g, rr) = (src[i] as u32, src[i + 1] as u32, src[i + 2] as u32);
@@ -618,18 +740,52 @@ impl Canvas {
 
     /// Copy the canvas to a device context at (x, y).
     pub fn blit(&self, hdc: HDC, x: i32, y: i32) {
+        if self.bmp.is_null() || self.w <= 0 || self.h <= 0 {
+            return;
+        }
         unsafe {
             GdiFlush();
             BitBlt(hdc, x, y, self.w, self.h, self.dc, 0, 0, SRCCOPY);
         }
     }
 
+    /// Copy only `r` (clamped to `[0..w, 0..h]`) to a device context at matching coordinates.
+    pub fn blit_rect(&self, hdc: HDC, r: Rect) {
+        if self.bmp.is_null() {
+            return;
+        }
+        let x0 = r.x.max(0);
+        let y0 = r.y.max(0);
+        let x1 = r.right().min(self.w);
+        let y1 = r.bottom().min(self.h);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        unsafe {
+            GdiFlush();
+            BitBlt(hdc, x0, y0, x1 - x0, y1 - y0, self.dc, x0, y0, SRCCOPY);
+        }
+    }
+
+    /// Blit another `Canvas` onto `self` at `(x, y)`.
+    pub(crate) fn blit_canvas(&mut self, src: &Canvas, x: i32, y: i32) {
+        if src.bmp.is_null() || self.bmp.is_null() || src.w <= 0 || src.h <= 0 {
+            return;
+        }
+        unsafe {
+            GdiFlush();
+            BitBlt(self.dc, x, y, src.w, src.h, src.dc, 0, 0, SRCCOPY);
+        }
+    }
+
     /// The memory DC (window captures).
+    #[cfg(any(test, feature = "ui-snapshots"))]
     pub(crate) fn dc(&self) -> HDC {
         self.dc
     }
 
     /// The pixel at (x, y) as RGB (tests).
+    #[cfg(any(test, feature = "ui-snapshots"))]
     pub fn pixel(&self, x: i32, y: i32) -> Rgb {
         unsafe { GdiFlush() };
         if self.bits.is_null() || x < 0 || y < 0 || x >= self.w || y >= self.h {
@@ -640,9 +796,10 @@ impl Canvas {
     }
 
     /// Save as an opaque PNG.
+    #[cfg(any(test, feature = "ui-snapshots"))]
     pub fn save_png(&self, path: &Path) -> Result<(), String> {
         unsafe { GdiFlush() };
-        if self.bits.is_null() {
+        if self.bits.is_null() || self.w <= 0 || self.h <= 0 || !self.gp_ref {
             return Err("nothing to save".into());
         }
         let n = (self.w * self.h) as usize;
@@ -678,6 +835,10 @@ impl Drop for Canvas {
         unsafe {
             self.free_bitmap();
             DeleteDC(self.dc);
+        }
+        if self.gp_ref {
+            self.gp_ref = false;
+            gdiplus_release();
         }
     }
 }
@@ -731,5 +892,88 @@ mod tests {
             assert!(c.measure(l, F_HINT).0 <= 200, "{l}");
         }
         assert_eq!(c.wrap_lines("short", F_HINT, 200, 2), vec!["short".to_string()]);
+    }
+
+    #[test]
+    fn probe_defers_gdiplus_and_save_png_reinitializes() {
+        let dir = std::env::temp_dir().join(format!("amg_canvas_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let probe = Canvas::probe(Scale(1.0));
+        assert!(!probe.gp_ref);
+        assert!(probe.measure("Hello", F_BODY).0 > 0);
+        assert!(probe.save_png(&dir.join("empty.png")).is_err());
+        drop(probe);
+
+        // Two sequential Canvas lifecycles verify SuppressBackgroundThread + save_png + Drop cleanup.
+        for i in 0..2 {
+            let mut c = Canvas::new(40, 30, Scale(1.0));
+            assert!(c.gp_ref);
+            assert!(gdiplus_state().0 >= 1);
+            assert!(gdiplus_state().1);
+            c.fill_rect(c.bounds(), BG);
+            c.fill_round_rect(Rect::new(4, 4, 32, 22), 4, ACCENT);
+            assert_eq!(c.pixel(20, 15), ACCENT);
+            let p = dir.join(format!("cycle_{i}.png"));
+            c.save_png(&p).unwrap();
+            assert!(p.exists());
+            let _ = std::fs::remove_file(&p);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn logo_cache_reuses_buffer_and_clips() {
+        let a = cached_logo(32, crate::engine::Level::Normal);
+        let b = cached_logo(32, crate::engine::Level::Normal);
+        assert!(Arc::ptr_eq(&a, &b));
+
+        let mut c1 = Canvas::new(64, 64, Scale(1.0));
+        let mut c2 = Canvas::new(64, 64, Scale(1.0));
+        c1.fill_rect(c1.bounds(), BG);
+        c2.fill_rect(c2.bounds(), BG);
+        c1.logo(Rect::new(8, 8, 32, 32));
+        c2.push_clip(Rect::new(8, 8, 16, 32));
+        c2.logo(Rect::new(8, 8, 32, 32));
+        c2.pop_clip();
+        assert_eq!(c1.pixel(16, 20), c2.pixel(16, 20));
+        assert_eq!(c2.pixel(30, 20), BG, "pixels outside clip must remain untouched");
+    }
+
+    #[test]
+    fn line_height_is_cached_with_hfont() {
+        let c = Canvas::new(20, 20, Scale(1.5));
+        let lh = c.line_height(F_BODY);
+        assert_eq!(lh, c.measure("Ag", F_BODY).1);
+        assert_eq!(c.fonts.borrow().len(), 1);
+        assert_eq!(c.measure("Hello", F_BODY).1, lh);
+        assert_eq!(c.fonts.borrow().len(), 1);
+    }
+
+    #[test]
+    fn blit_canvas_blit_rect_and_polylines() {
+        let mut src = Canvas::new(24, 24, Scale(1.0));
+        src.fill_rect(src.bounds(), ACCENT);
+        let mut dst = Canvas::new(60, 60, Scale(1.0));
+        dst.fill_rect(dst.bounds(), BG);
+        dst.blit_canvas(&src, 10, 10);
+        assert_eq!(dst.pixel(12, 12), ACCENT);
+        assert_eq!(dst.pixel(5, 5), BG);
+
+        // blit_rect clamps out-of-bounds and empty rects without panicking.
+        let tgt = Canvas::new(30, 30, Scale(1.0));
+        dst.blit_rect(tgt.dc(), Rect::new(-5, -5, 100, 100));
+        assert_eq!(tgt.pixel(12, 12), ACCENT);
+        dst.blit_rect(tgt.dc(), Rect::new(0, 0, 0, 10));
+
+        // polylines skips <2 runs and draws >=2 runs (solid + dashed).
+        let mut lines = Canvas::new(100, 40, Scale(1.0));
+        lines.fill_rect(lines.bounds(), BG);
+        lines.polylines(&[vec![(10.0, 10.0)], vec![(10.0, 20.0), (90.0, 20.0)]], ACCENT, 2.0, None);
+        assert_eq!(lines.pixel(50, 20), ACCENT);
+        assert_eq!(lines.pixel(10, 10), BG);
+        lines.polylines(&[vec![(10.0, 30.0), (90.0, 30.0)]], ACCENT, 2.0, Some(4.0));
+        let has_accent = (12..88).any(|x| lines.pixel(x, 30) == ACCENT);
+        let has_bg = (12..88).any(|x| lines.pixel(x, 30) == BG);
+        assert!(has_accent && has_bg, "dashed polyline should alternate painted and background pixels");
     }
 }

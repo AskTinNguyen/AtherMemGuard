@@ -7,16 +7,14 @@
 //!
 //! Switching an entry off never deletes it. It writes the same 12-byte `StartupApproved`
 //! value Task Manager writes, so it shows as "Disabled" there and can be switched back on
-//! from either place. No `unsafe` here: registry access goes through `winreg`.
+//! from either place. No `unsafe` here: registry access goes through `crate::win`.
 
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, REG_BINARY};
-use winreg::types::FromRegValue;
-use winreg::{RegKey, RegValue};
+
+use crate::win::{reg_value_to_string, RegError, RegHive, RegKey};
 
 pub const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 pub const RUN32_KEY: &str = r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run";
@@ -74,13 +72,13 @@ impl Location {
     }
 
     /// The `StartupApproved` key (and its hive) that holds this location's on/off switches.
-    fn approved_key(self) -> (RegKey, &'static str) {
+    fn approved_key(self) -> (RegHive, &'static str) {
         match self {
-            Location::HkcuRun => (RegKey::predef(HKEY_CURRENT_USER), APPROVED_RUN),
-            Location::HklmRun => (RegKey::predef(HKEY_LOCAL_MACHINE), APPROVED_RUN),
-            Location::HklmRun32 => (RegKey::predef(HKEY_LOCAL_MACHINE), APPROVED_RUN32),
-            Location::UserFolder => (RegKey::predef(HKEY_CURRENT_USER), APPROVED_FOLDER),
-            Location::CommonFolder => (RegKey::predef(HKEY_LOCAL_MACHINE), APPROVED_FOLDER),
+            Location::HkcuRun => (RegHive::Hkcu, APPROVED_RUN),
+            Location::HklmRun => (RegHive::Hklm, APPROVED_RUN),
+            Location::HklmRun32 => (RegHive::Hklm, APPROVED_RUN32),
+            Location::UserFolder => (RegHive::Hkcu, APPROVED_FOLDER),
+            Location::CommonFolder => (RegHive::Hklm, APPROVED_FOLDER),
         }
     }
 }
@@ -249,8 +247,8 @@ pub fn lnk_target(b: &[u8]) -> Option<String> {
 
 fn approved_values(location: Location) -> Vec<(String, Vec<u8>)> {
     let (hive, path) = location.approved_key();
-    let Ok(key) = hive.open_subkey(path) else { return Vec::new() };
-    key.enum_values().filter_map(Result::ok).map(|(name, v)| (name, v.bytes)).collect()
+    let Ok(key) = RegKey::open_read(hive, path) else { return Vec::new() };
+    key.enum_values().unwrap_or_default().into_iter().map(|(name, _, bytes)| (name, bytes)).collect()
 }
 
 fn enabled_in(approved: &[(String, Vec<u8>)], name: &str) -> bool {
@@ -261,11 +259,11 @@ fn enabled_in(approved: &[(String, Vec<u8>)], name: &str) -> bool {
         .unwrap_or(true)
 }
 
-fn run_entries(location: Location, hive: RegKey, path: &str, out: &mut Vec<Entry>) {
-    let Ok(key) = hive.open_subkey(path) else { return };
+fn run_entries(location: Location, hive: RegHive, path: &str, out: &mut Vec<Entry>) {
+    let Ok(key) = RegKey::open_read(hive, path) else { return };
     let approved = approved_values(location);
-    for (name, value) in key.enum_values().filter_map(Result::ok) {
-        let Ok(command) = String::from_reg_value(&value) else { continue };
+    for (name, vtype, bytes) in key.enum_values().unwrap_or_default() {
+        let Some(command) = reg_value_to_string(vtype, &bytes) else { continue };
         if name.is_empty() {
             continue; // the key's (Default) value
         }
@@ -314,9 +312,9 @@ fn folder_entries(location: Location, dir: Option<PathBuf>, out: &mut Vec<Entry>
 /// Every startup entry this user has, with its on/off state. Read-only.
 pub fn list() -> Vec<Entry> {
     let mut out = Vec::new();
-    run_entries(Location::HkcuRun, RegKey::predef(HKEY_CURRENT_USER), RUN_KEY, &mut out);
-    run_entries(Location::HklmRun, RegKey::predef(HKEY_LOCAL_MACHINE), RUN_KEY, &mut out);
-    run_entries(Location::HklmRun32, RegKey::predef(HKEY_LOCAL_MACHINE), RUN32_KEY, &mut out);
+    run_entries(Location::HkcuRun, RegHive::Hkcu, RUN_KEY, &mut out);
+    run_entries(Location::HklmRun, RegHive::Hklm, RUN_KEY, &mut out);
+    run_entries(Location::HklmRun32, RegHive::Hklm, RUN32_KEY, &mut out);
     folder_entries(Location::UserFolder, user_startup_folder(), &mut out);
     folder_entries(Location::CommonFolder, common_startup_folder(), &mut out);
     out
@@ -327,8 +325,8 @@ pub fn list() -> Vec<Entry> {
 /// The raw `StartupApproved` value for an entry, if one exists.
 pub fn approved_value(location: Location, name: &str) -> Option<Vec<u8>> {
     let (hive, path) = location.approved_key();
-    let key = hive.open_subkey(path).ok()?;
-    key.get_raw_value(name).ok().map(|v| v.bytes)
+    let key = RegKey::open_read(hive, path).ok()?;
+    key.get_raw(name).ok().map(|(_, bytes)| bytes)
 }
 
 fn check_switchable(location: Location, name: &str) -> Result<(), String> {
@@ -344,9 +342,8 @@ fn check_switchable(location: Location, name: &str) -> Result<(), String> {
 /// Does this per-user entry still exist (Run value or Startup-folder file)?
 pub fn exists(location: Location, name: &str) -> bool {
     match location {
-        Location::HkcuRun => RegKey::predef(HKEY_CURRENT_USER)
-            .open_subkey(RUN_KEY)
-            .and_then(|k| k.get_raw_value(name))
+        Location::HkcuRun => RegKey::open_read(RegHive::Hkcu, RUN_KEY)
+            .and_then(|k| k.get_raw(name))
             .is_ok(),
         Location::UserFolder => user_startup_folder().map_or(false, |d| d.join(name).is_file()),
         _ => false,
@@ -362,9 +359,9 @@ pub fn set_enabled(location: Location, name: &str, enabled: bool) -> Result<Opti
     }
     let previous = approved_value(location, name);
     let (hive, path) = location.approved_key();
-    let (key, _) = hive.create_subkey(path).map_err(|e| format!("could not open {}: {}", path, e))?;
-    let bytes = encode_approved(enabled, crate::win::now_filetime()).to_vec();
-    key.set_raw_value(name, &RegValue { bytes, vtype: REG_BINARY })
+    let key = RegKey::create(hive, path).map_err(|e| format!("could not open {}: {}", path, e))?;
+    let bytes = encode_approved(enabled, crate::win::now_filetime());
+    key.set_binary(name, &bytes)
         .map_err(|e| format!("could not switch \"{}\": {}", name, e))?;
     Ok(previous)
 }
@@ -375,17 +372,16 @@ pub fn restore(location: Location, name: &str, previous: Option<&[u8]>) -> Resul
     let (hive, path) = location.approved_key();
     match previous {
         Some(bytes) => {
-            let (key, _) = hive.create_subkey(path).map_err(|e| format!("could not open {}: {}", path, e))?;
-            key.set_raw_value(name, &RegValue { bytes: bytes.to_vec(), vtype: REG_BINARY })
+            let key = RegKey::create(hive, path).map_err(|e| format!("could not open {}: {}", path, e))?;
+            key.set_binary(name, bytes)
                 .map_err(|e| format!("could not restore \"{}\": {}", name, e))
         }
-        None => match hive.open_subkey_with_flags(path, winreg::enums::KEY_SET_VALUE) {
+        None => match RegKey::open_set_value(hive, path) {
             Ok(key) => match key.delete_value(name) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Ok(()) | Err(RegError::NotFound) => Ok(()),
                 Err(e) => Err(format!("could not restore \"{}\": {}", name, e)),
             },
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(RegError::NotFound) => Ok(()),
             Err(e) => Err(format!("could not open {}: {}", path, e)),
         },
     }

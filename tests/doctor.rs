@@ -233,23 +233,19 @@ fn never_acts_on_itself_or_unknown_findings() {
 struct RunValue;
 impl RunValue {
     fn create(command: &str) -> RunValue {
-        use winreg::enums::HKEY_CURRENT_USER;
-        let hkcu = winreg::RegKey::predef(HKEY_CURRENT_USER);
-        let (run, _) = hkcu.create_subkey(startup::RUN_KEY).unwrap();
-        assert!(run.get_raw_value(TEST_VALUE).is_err(), "{} already exists; remove it first", TEST_VALUE);
+        let run = win::RegKey::create(win::RegHive::Hkcu, startup::RUN_KEY).unwrap();
+        assert!(run.get_raw(TEST_VALUE).is_err(), "{} already exists; remove it first", TEST_VALUE);
         assert!(startup::approved_value(Location::HkcuRun, TEST_VALUE).is_none());
-        run.set_value(TEST_VALUE, &command.to_string()).unwrap();
+        run.set_string(TEST_VALUE, command, false).unwrap();
         RunValue
     }
 }
 impl Drop for RunValue {
     fn drop(&mut self) {
-        use winreg::enums::{HKEY_CURRENT_USER, KEY_SET_VALUE};
-        let hkcu = winreg::RegKey::predef(HKEY_CURRENT_USER);
-        if let Ok(k) = hkcu.open_subkey_with_flags(startup::RUN_KEY, KEY_SET_VALUE) {
+        if let Ok(k) = win::RegKey::open_write(win::RegHive::Hkcu, startup::RUN_KEY) {
             let _ = k.delete_value(TEST_VALUE);
         }
-        if let Ok(k) = hkcu.open_subkey_with_flags(startup::APPROVED_RUN, KEY_SET_VALUE) {
+        if let Ok(k) = win::RegKey::open_write(win::RegHive::Hkcu, startup::APPROVED_RUN) {
             let _ = k.delete_value(TEST_VALUE);
         }
     }
@@ -399,4 +395,143 @@ fn real_scan_is_read_only_and_sane() {
     }
     // Scanning wrote nothing to the data folder.
     assert!(!dir.join("doctor-undo.json.tmp").exists());
+}
+
+#[test]
+fn bug11_guard_and_apply_skip_reused_pid_with_same_name() {
+    let (_g, dir) = setup();
+    let exe = copy_exe(&dir, r"System32\PING.EXE", "DoctorTestPingReuse");
+    let child = Command::new(&exe).args(["-t", "127.0.0.1"]).creation_flags(CREATE_NO_WINDOW).spawn().unwrap();
+    let mut child = Kill(child);
+    let pid = child.0.id();
+    std::thread::sleep(Duration::from_millis(300));
+
+    let live = win::list_processes()
+        .into_iter()
+        .find(|p| p.pid == pid)
+        .expect("spawned DoctorTestPingReuse in process list");
+    assert!(live.created > 0);
+
+    // Guard re-triggers on PID reuse with same name & PID but different `created`.
+    let mut guard = doctor::Guard::new(vec!["DoctorTestPingReuse".into()]);
+    let p_old = win::Proc { created: live.created.saturating_sub(1000), ..live.clone() };
+    assert_eq!(guard.on_tick(std::slice::from_ref(&p_old), true).len(), 1);
+    assert!(guard.on_tick(std::slice::from_ref(&p_old), true).is_empty());
+    assert_eq!(guard.on_tick(std::slice::from_ref(&live), true).len(), 1);
+
+    // Build a report whose Finding recorded an older creation time for the same PID & exe name.
+    let mut stale_proc = live.clone();
+    stale_proc.created = live.created.saturating_sub(50_000).max(1);
+    stale_proc.committed = 512 * 1024 * 1024;
+    let mut facts = std::collections::HashMap::new();
+    facts.insert(doctor::proc_key(&stale_proc), doctor::ProcFacts { owned: true, same_session: true });
+    let inp = doctor::ScanInput {
+        time: "2026-11-21 12:34:56".into(),
+        sys: win::SysInfo::default(),
+        procs: vec![stale_proc],
+        facts,
+        windows: std::collections::HashMap::new(),
+        startup: Vec::new(),
+        ue: Vec::new(),
+        unreal_active: false,
+        memguard_running: true,
+        memguard_paused: false,
+        self_tree: std::collections::HashSet::new(),
+    };
+    let mut ds = doctor::DoctorSettings::default();
+    ds.close = vec!["DoctorTestPingReuse".into()];
+    let r = doctor::build_report(&athermemguard::config::Config::builtin(), &ds, &inp, &mut |_| None);
+    let f = r.finding("app:doctortestpingreuse").expect("finding built for stale process");
+    assert_eq!(f.pids, vec![pid]);
+
+    let out = doctor::apply(&r, &[(f.id.clone(), ActionKind::End)], true);
+    assert_eq!(out[0].result, OutcomeKind::Done);
+    assert_eq!(out[0].message, "Already closed");
+    assert!(child.0.try_wait().unwrap().is_none(), "live process with newer created must not be terminated");
+}
+
+#[test]
+fn bug16_drivers_report_uses_loaded_modules() {
+    let (_g, _dir) = setup();
+    let paths = win::loaded_driver_paths();
+    assert!(!paths.is_empty(), "expected loaded kernel modules");
+    assert!(
+        paths.iter().any(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("sys"))),
+        "expected at least one .sys module"
+    );
+
+    let r = athermemguard::drivers::report();
+    assert!(r.total_gb > 0.0);
+    for t in &r.tags {
+        for d in &t.drivers {
+            assert!(d.file.to_ascii_lowercase().ends_with(".sys"), "unexpected driver file: {}", d.file);
+        }
+    }
+}
+
+#[test]
+fn bug17_unquoted_spaced_command_line_relaunches_on_undo() {
+    let (_g, dir) = setup();
+    let spaced_dir = dir.join("dir with spaces");
+    std::fs::create_dir_all(&spaced_dir).unwrap();
+    let exe = copy_exe(&spaced_dir, r"System32\WindowsPowerShell\v1.0\powershell.exe", "DoctorSpaceWindow");
+    let cmdline = format!("{} -NoProfile -NonInteractive -Command {}", exe.display(), FORM_SCRIPT);
+
+    let undo_id = "test-spaced-relaunch-1";
+    let mut log = doctor::UndoLog::load();
+    log.push_run(doctor::UndoRun {
+        id: "test-spaced".into(),
+        time: win::local_time_string(),
+        entries: vec![doctor::UndoEntry {
+            id: undo_id.into(),
+            finding_id: "app:doctorspacewindow".into(),
+            title: "DoctorSpaceWindow".into(),
+            action: ActionKind::Close,
+            step: doctor::UndoStep::Relaunch {
+                apps: vec![doctor::Relaunch { exe: exe.display().to_string(), command_line: cmdline }],
+            },
+            undone: false,
+        }],
+    });
+    log.save().unwrap();
+
+    let before = pids_named("DoctorSpaceWindow");
+    let out = doctor::undo(false, Some(undo_id));
+    assert_eq!(out[0].result, OutcomeKind::Undone, "{:?}", out);
+
+    let start = Instant::now();
+    let relaunched = loop {
+        let now: Vec<u32> = pids_named("DoctorSpaceWindow").into_iter().filter(|p| !before.contains(p)).collect();
+        if let Some(&p) = now.first() {
+            break p;
+        }
+        assert!(start.elapsed() < Duration::from_secs(20), "spaced relaunch did not start");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(win::terminate(relaunched));
+}
+
+#[test]
+fn f5_1_write_embedded_cli_bytes_supports_lznt1_and_raw_mz() {
+    let (_g, dir) = setup();
+    let out_dir = dir.join("embedded-cli-out");
+    let _ = std::fs::remove_dir_all(&out_dir);
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let mut raw = b"MZ\x90\x00".to_vec();
+    for i in 0..4096u32 {
+        raw.extend_from_slice(&(i % 7).to_le_bytes());
+    }
+    let encoded = athermemguard::install::encode_embedded_cli(&raw).unwrap();
+    athermemguard::install::write_embedded_cli_bytes(&out_dir, &encoded).unwrap();
+    let cli_path = out_dir.join(athermemguard::paths::CLI_EXE);
+    assert_eq!(std::fs::read(&cli_path).unwrap(), raw);
+
+    let raw_mz = b"MZ-fallback-cli";
+    athermemguard::install::write_embedded_cli_bytes(&out_dir, raw_mz).unwrap();
+    assert_eq!(std::fs::read(&cli_path).unwrap(), raw_mz);
+
+    assert!(athermemguard::install::write_embedded_cli_bytes(&out_dir, b"AMGZ\x10\x00\x00\x00bad").is_err());
+    assert_eq!(std::fs::read(&cli_path).unwrap(), raw_mz);
+    let _ = std::fs::remove_dir_all(&out_dir);
 }

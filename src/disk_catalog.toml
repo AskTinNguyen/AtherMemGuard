@@ -5,11 +5,11 @@
 # class: regenerable  Unreal or the tool rebuilds it          default action: now (delete)
 #        disposable   not rebuilt, but not needed               default action: bin
 #        rebuild_cost rebuilt, but it takes long (hours of shader or cook work)   default: bin
-#        review       your call (lanes, worktrees, the git LFS store): never cleaned
+#        review       your call (lanes, worktrees, the git LFS store, VHDXs): never auto-cleaned
 # tool:  the tool's own clean command is offered too (permanent, "can't be undone").
 # Zen (ue:zen) is never deleted file by file: use Zen's own garbage collection.
 #
-# [[project]] paths are relative to an Unreal project root (the folder with the .uproject).
+# [[project]] paths are relative to a recognised root (.uproject, Engine\Build\Build.version, .git, Cargo.toml).
 # [[global]] paths start with an environment variable.
 
 [[project]]
@@ -32,6 +32,13 @@ title = "Project cache (DDC)"
 path = 'DerivedDataCache'
 
 [[project]]
+key = "ue:plugin_ddc"
+class = "regenerable"
+title = "Plugin cache (DDC)"
+plugins = true
+path = 'DerivedDataCache'
+
+[[project]]
 key = "ue:crashes"
 class = "regenerable"
 title = "Crash reports"
@@ -50,6 +57,18 @@ title = "Logs"
 path = 'Saved\Logs'
 
 [[project]]
+key = "ue:profiling"
+class = "disposable"
+title = "Profiling captures"
+path = 'Saved\Profiling'
+
+[[project]]
+key = "ue:video_captures"
+class = "disposable"
+title = "Video captures"
+path = 'Saved\VideoCaptures'
+
+[[project]]
 key = "ue:cooked"
 class = "rebuild_cost"
 title = "Cooked content"
@@ -62,10 +81,80 @@ title = "Staged builds"
 path = 'Saved\StagedBuilds'
 
 [[project]]
+key = "ue:archived_builds"
+class = "rebuild_cost"
+title = "Archived builds"
+path = 'Saved\ArchivedBuilds'
+
+[[project]]
+key = "ue:pdb"
+class = "review"
+title = "Debug symbols (PDB)"
+path = 'Binaries\Win64'
+glob = "*.pdb"
+older_than_days = 7
+
+[[project]]
+key = "vs:ipch"
+class = "regenerable"
+title = "Visual Studio IntelliSense PCH (ipch)"
+path = '.vs\...\ipch'
+
+[[project]]
+key = "rust:target"
+class = "regenerable"
+title = "Rust build files (target)"
+path = 'target'
+marker = "Cargo.toml"
+older_than_days = 7
+
+[[project]]
 key = "git:lfs"
 class = "review"
 title = "Git LFS store"
 path = '.git\lfs\objects'
+tool = "git-lfs"
+diagnostic = true
+
+[[project]]
+key = "git:loose_objects"
+class = "review"
+title = "Git loose objects"
+path = '.git\objects'
+tool = "git-maintenance"
+diagnostic = true
+
+[[project]]
+key = "git:packs"
+class = "review"
+title = "Git packfiles"
+path = '.git\objects\pack'
+tool = "git-repack"
+diagnostic = true
+
+[[project]]
+key = "git:tmp_packs"
+class = "review"
+title = "Stale Git temp packs"
+path = '.git\objects\pack'
+tool = "git-prune-tmp"
+diagnostic = true
+
+[[project]]
+key = "git:reflogs"
+class = "review"
+title = "Git reflogs"
+path = '.git\logs'
+tool = "git-reflog"
+diagnostic = true
+
+[[project]]
+key = "git:worktrees"
+class = "review"
+title = "Stale Git worktrees"
+path = '.git\worktrees'
+tool = "git-worktree-prune"
+diagnostic = true
 
 [[global]]
 key = "ue:global_ddc"
@@ -78,6 +167,31 @@ key = "ue:zen"
 class = "rebuild_cost"
 title = "Unreal's Zen cache"
 path = '%ZEN%'
+tool = "zen"
+
+[[global]]
+key = "ue:uba"
+class = "regenerable"
+title = "Unreal Build Accelerator cache"
+path = '%LOCALAPPDATA%\UnrealBuildAccelerator'
+
+[[global]]
+key = "ue:uba_shared"
+class = "regenerable"
+title = "Shared Unreal Build Accelerator cache"
+path = '%PROGRAMDATA%\Epic\UnrealBuildAccelerator'
+
+[[global]]
+key = "ue:vault_cache"
+class = "rebuild_cost"
+title = "Epic Games Launcher VaultCache"
+path = '%LOCALAPPDATA%\EpicGamesLauncher\VaultCache'
+
+[[global]]
+key = "ue:swarm_cache"
+class = "regenerable"
+title = "Unreal Swarm Agent cache"
+path = '%LOCALAPPDATA%\UnrealEngine\Common\SwarmCache'
 
 [[global]]
 key = "temp:old"
@@ -90,21 +204,42 @@ older_than_days = 7
 key = "cache:npm"
 class = "regenerable"
 title = "npm cache"
-path = '%LOCALAPPDATA%\npm-cache\_cacache'
+path = '%npm_config_cache%\_cacache'
 tool = "npm"
 
 [[global]]
 key = "cache:pip"
 class = "regenerable"
 title = "pip cache"
-path = '%LOCALAPPDATA%\pip\cache'
+path = '%PIP_CACHE_DIR%'
 tool = "pip"
 
 [[global]]
 key = "cache:uv"
 class = "regenerable"
 title = "uv cache"
-path = '%LOCALAPPDATA%\uv\cache'
+path = '%UV_CACHE_DIR%'
+tool = "uv"
+
+[[global]]
+key = "cache:pnpm"
+class = "regenerable"
+title = "pnpm store"
+path = '%PNPM_STORE_DIR%'
+tool = "pnpm"
+
+[[global]]
+key = "cache:yarn"
+class = "regenerable"
+title = "Yarn cache"
+path = '%YARN_CACHE_FOLDER%'
+tool = "yarn"
+
+[[global]]
+key = "cache:bun"
+class = "regenerable"
+title = "Bun install cache"
+path = '%BUN_INSTALL_CACHE_DIR%'
 
 [[global]]
 key = "cache:nuget_http"
@@ -114,10 +249,125 @@ path = '%LOCALAPPDATA%\NuGet\v3-cache'
 tool = "dotnet"
 
 [[global]]
+key = "cache:nuget_packages"
+class = "rebuild_cost"
+title = "NuGet packages cache"
+path = '%NUGET_PACKAGES%'
+
+[[global]]
+key = "cache:vcpkg"
+class = "rebuild_cost"
+title = "vcpkg binary cache"
+path = '%VCPKG_DEFAULT_BINARY_CACHE%'
+
+[[global]]
+key = "cache:cargo_registry"
+class = "regenerable"
+title = "Cargo registry cache"
+path = '%CARGO_HOME%\registry\cache'
+
+[[global]]
+key = "cache:cargo_src"
+class = "regenerable"
+title = "Cargo extracted crate sources"
+path = '%CARGO_HOME%\registry\src'
+
+[[global]]
+key = "cache:cargo_git_checkouts"
+class = "regenerable"
+title = "Cargo git checkouts"
+path = '%CARGO_HOME%\git\checkouts'
+
+[[global]]
+key = "cache:cargo_git_db"
+class = "regenerable"
+title = "Cargo git database"
+path = '%CARGO_HOME%\git\db'
+
+[[global]]
+key = "cache:sccache"
+class = "regenerable"
+title = "sccache compiler cache"
+path = '%SCCACHE_DIR%'
+
+[[global]]
+key = "cache:rider"
+class = "regenerable"
+title = "JetBrains Rider caches"
+path = '%LOCALAPPDATA%\JetBrains\Rider*'
+
+[[global]]
+key = "wsl:vhdx"
+class = "review"
+title = "WSL2 virtual disk (ext4.vhdx)"
+path = '%LOCALAPPDATA%\Packages\*\LocalState\ext4.vhdx'
+
+[[global]]
+key = "wsl:vhdx_local"
+class = "review"
+title = "WSL2 virtual disk (ext4.vhdx)"
+path = '%LOCALAPPDATA%\wsl\{*}\ext4.vhdx'
+
+[[global]]
+key = "docker:vhdx"
+class = "review"
+title = "Docker Desktop virtual disk"
+path = '%LOCALAPPDATA%\Docker\wsl\disk\docker_data.vhdx'
+
+[[global]]
+key = "docker:vhdx_legacy"
+class = "review"
+title = "Docker Desktop virtual disk"
+path = '%LOCALAPPDATA%\Docker\wsl\data\ext4.vhdx'
+
+[[global]]
 key = "sys:crashdumps"
 class = "regenerable"
 title = "Crash dumps"
 path = '%LOCALAPPDATA%\CrashDumps'
+
+[[global]]
+key = "sys:wer_user"
+class = "regenerable"
+title = "Windows Error Reporting archive"
+path = '%LOCALAPPDATA%\Microsoft\Windows\WER\ReportArchive'
+
+[[global]]
+key = "sys:wer_queue"
+class = "regenerable"
+title = "Windows Error Reporting queue"
+path = '%LOCALAPPDATA%\Microsoft\Windows\WER\ReportQueue'
+
+[[global]]
+key = "sys:memory_dmp"
+class = "review"
+title = "Windows kernel memory dump"
+path = '%SystemRoot%\MEMORY.DMP'
+
+[[global]]
+key = "sys:minidump"
+class = "review"
+title = "Windows minidumps"
+path = '%SystemRoot%\Minidump'
+
+[[global]]
+key = "sys:windows_update"
+class = "review"
+title = "Windows Update download cache"
+path = '%SystemRoot%\SoftwareDistribution\Download'
+
+[[global]]
+key = "sys:delivery_opt"
+class = "review"
+title = "Windows Delivery Optimization cache"
+path = '%SystemRoot%\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache'
+
+[[global]]
+key = "sys:winsxs"
+class = "review"
+title = "Windows component store (WinSxS)"
+path = '%SystemRoot%\WinSxS'
+no_walk = true
 
 [[global]]
 key = "gpu:d3dscache"
@@ -128,5 +378,47 @@ path = '%LOCALAPPDATA%\D3DSCache'
 [[global]]
 key = "gpu:nv_dxcache"
 class = "regenerable"
-title = "NVIDIA shader cache"
+title = "NVIDIA DirectX shader cache"
 path = '%LOCALAPPDATA%\NVIDIA\DXCache'
+
+[[global]]
+key = "gpu:nv_glcache"
+class = "regenerable"
+title = "NVIDIA OpenGL shader cache"
+path = '%LOCALAPPDATA%\NVIDIA\GLCache'
+
+[[global]]
+key = "gpu:nv_optix"
+class = "regenerable"
+title = "NVIDIA OptiX shader cache"
+path = '%LOCALAPPDATA%\NVIDIA\OptixCache'
+
+[[global]]
+key = "gpu:amd_dxcache"
+class = "regenerable"
+title = "AMD DirectX shader cache"
+path = '%LOCALAPPDATA%\AMD\DxCache'
+
+[[global]]
+key = "gpu:amd_dxccache"
+class = "regenerable"
+title = "AMD Dxc shader cache"
+path = '%LOCALAPPDATA%\AMD\DxcCache'
+
+[[global]]
+key = "gpu:amd_glcache"
+class = "regenerable"
+title = "AMD OpenGL shader cache"
+path = '%LOCALAPPDATA%\AMD\GLCache'
+
+[[global]]
+key = "gpu:intel_shader"
+class = "regenerable"
+title = "Intel shader cache"
+path = '%LOCALAPPDATA%\Intel\ShaderCache'
+
+[[global]]
+key = "gpu:intel_locallow"
+class = "regenerable"
+title = "Intel LocalLow shader cache"
+path = '%USERPROFILE%\AppData\LocalLow\Intel\ShaderCache'

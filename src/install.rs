@@ -5,16 +5,21 @@
 //! Release builds (`--features embed-cli`) carry `memguard.exe` inside `AtherMemGuard.exe`,
 //! so the one setup exe is all anyone downloads. Dev builds copy it from next to the exe.
 
+use std::borrow::Cow;
 use std::fs;
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::sleep;
 use std::time::Duration;
 
-use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_EXPAND_SZ, REG_SZ};
-use winreg::{RegKey, RegValue};
+use windows_sys::Win32::System::Registry::{REG_EXPAND_SZ, REG_SZ};
 
 use crate::paths;
-use crate::win;
+use crate::win::{self, RegHive, RegKey};
+
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Ask the running copy to exit and wait for it.
 pub fn stop_running() -> bool {
@@ -30,10 +35,6 @@ pub fn stop_running() -> bool {
     false
 }
 
-fn to_wide_bytes(s: &str) -> Vec<u8> {
-    s.encode_utf16().chain(std::iter::once(0)).flat_map(|c| c.to_le_bytes()).collect()
-}
-
 fn from_wide_bytes(b: &[u8]) -> String {
     let wide: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0).collect();
     String::from_utf16_lossy(&wide)
@@ -42,11 +43,9 @@ fn from_wide_bytes(b: &[u8]) -> String {
 /// Add or remove the install folder on the user's PATH, keeping the value's registry type.
 fn update_user_path(dir: &std::path::Path, add: bool) -> Result<bool, String> {
     let dir = dir.display().to_string();
-    let env = RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
-        .map_err(|e| e.to_string())?;
-    let (current, vtype) = match env.get_raw_value("Path") {
-        Ok(v) => (from_wide_bytes(&v.bytes), v.vtype),
+    let env = RegKey::open_write(RegHive::Hkcu, "Environment").map_err(|e| e.to_string())?;
+    let (current, vtype) = match env.get_raw("Path") {
+        Ok((t, bytes)) => (from_wide_bytes(&bytes), t),
         Err(_) => (String::new(), REG_EXPAND_SZ),
     };
     let mut parts: Vec<&str> = current.split(';').filter(|p| !p.is_empty()).collect();
@@ -59,9 +58,9 @@ fn update_user_path(dir: &std::path::Path, add: bool) -> Result<bool, String> {
     } else {
         parts.retain(|p| !p.eq_ignore_ascii_case(&dir));
     }
-    let vtype = if matches!(vtype, REG_SZ | REG_EXPAND_SZ) { vtype } else { REG_EXPAND_SZ };
-    env.set_raw_value("Path", &RegValue { bytes: to_wide_bytes(&parts.join(";")), vtype }).map_err(|e| e.to_string())?;
-    crate::tray::broadcast_environment_change();
+    let expand = vtype != REG_SZ;
+    env.set_string("Path", &parts.join(";"), expand).map_err(|e| e.to_string())?;
+    win::broadcast_environment_change();
     Ok(true)
 }
 
@@ -85,8 +84,8 @@ fn migrate_from_memcap() -> bool {
             sleep(Duration::from_millis(100));
         }
     }
-    if let Ok(run) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(paths::RUN_KEY, KEY_READ | KEY_WRITE) {
-        if run.get_raw_value("MemCap").is_ok() {
+    if let Ok(run) = RegKey::open_write(RegHive::Hkcu, paths::RUN_KEY) {
+        if run.get_raw("MemCap").is_ok() {
             found = true;
             let _ = run.delete_value("MemCap");
         }
@@ -113,16 +112,15 @@ fn migrate_from_memcap() -> bool {
 
 /// Is the tray app set to start when the user signs in?
 pub fn is_run_at_startup() -> bool {
-    RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey_with_flags(paths::RUN_KEY, KEY_READ)
-        .map(|k| k.get_raw_value(paths::RUN_VALUE).is_ok())
+    RegKey::open_read(RegHive::Hkcu, paths::RUN_KEY)
+        .map(|k| k.get_raw(paths::RUN_VALUE).is_ok())
         .unwrap_or(false)
 }
 
 /// Turn start-at-sign-in on or off. On points at the installed tray app if there is one,
 /// otherwise at the copy that is running.
 pub fn set_run_at_startup(on: bool) -> Result<(), String> {
-    let (run, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(paths::RUN_KEY).map_err(|e| e.to_string())?;
+    let run = RegKey::create(RegHive::Hkcu, paths::RUN_KEY).map_err(|e| e.to_string())?;
     if !on {
         let _ = run.delete_value(paths::RUN_VALUE);
         return Ok(());
@@ -133,7 +131,8 @@ pub fn set_run_at_startup(on: bool) -> Result<(), String> {
     } else {
         std::env::current_exe().map_err(|e| e.to_string())?.with_file_name(paths::TRAY_EXE)
     };
-    run.set_value(paths::RUN_VALUE, &format!("\"{}\"", exe.display())).map_err(|e| e.to_string())
+    run.set_string(paths::RUN_VALUE, &format!("\"{}\"", exe.display()), false)
+        .map_err(|e| e.to_string())
 }
 
 
@@ -144,8 +143,8 @@ fn uninstall_command(dir: &Path) -> String {
 
 /// The entry in Settings > Apps, so the app can be removed the usual way.
 fn write_uninstall_entry(dir: &Path) -> Result<(), String> {
-    let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(paths::UNINSTALL_KEY).map_err(|e| e.to_string())?;
-    let set = |name: &str, value: &str| key.set_value(name, &value.to_string()).map_err(|e| e.to_string());
+    let key = RegKey::create(RegHive::Hkcu, paths::UNINSTALL_KEY).map_err(|e| e.to_string())?;
+    let set = |name: &str, value: &str| key.set_string(name, value, false).map_err(|e| e.to_string());
     set("DisplayName", paths::PRODUCT_NAME)?;
     set("DisplayVersion", env!("CARGO_PKG_VERSION"))?;
     set("Publisher", paths::PUBLISHER)?;
@@ -157,9 +156,9 @@ fn write_uninstall_entry(dir: &Path) -> Result<(), String> {
         .filter_map(|n| fs::metadata(dir.join(n)).ok())
         .map(|m| m.len() / 1024 + 1)
         .sum();
-    key.set_value("EstimatedSize", &(size_kb.min(u32::MAX as u64) as u32)).map_err(|e| e.to_string())?;
-    key.set_value("NoModify", &1u32).map_err(|e| e.to_string())?;
-    key.set_value("NoRepair", &1u32).map_err(|e| e.to_string())?;
+    key.set_dword("EstimatedSize", size_kb.min(u32::MAX as u64) as u32).map_err(|e| e.to_string())?;
+    key.set_dword("NoModify", 1).map_err(|e| e.to_string())?;
+    key.set_dword("NoRepair", 1).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -172,7 +171,7 @@ pub fn refresh_install_record() {
     if !same_path(&here, &dir.join(paths::TRAY_EXE)) {
         return;
     }
-    let registered = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(paths::UNINSTALL_KEY, KEY_READ).is_ok();
+    let registered = RegKey::open_read(RegHive::Hkcu, paths::UNINSTALL_KEY).is_ok();
     if registered {
         if let Err(e) = write_uninstall_entry(&dir) {
             crate::log::write(&format!("could not refresh the Settings > Apps entry: {}", e));
@@ -184,7 +183,7 @@ pub fn refresh_install_record() {
 
 /// `memguard.exe`, carried inside `AtherMemGuard.exe` by release builds (`embed-cli`).
 #[cfg(feature = "embed-cli")]
-const EMBEDDED_CLI: Option<&[u8]> = Some(include_bytes!(env!("MEMGUARD_CLI")));
+const EMBEDDED_CLI: Option<&[u8]> = Some(include_bytes!(env!("MEMGUARD_CLI_EMBED")));
 #[cfg(not(feature = "embed-cli"))]
 const EMBEDDED_CLI: Option<&[u8]> = None;
 
@@ -200,6 +199,10 @@ fn same_path(a: &Path, b: &Path) -> bool {
     norm(a) == norm(b)
 }
 
+static REPLACE_NONCE: AtomicU64 = AtomicU64::new(0);
+const EMBEDDED_CLI_MAGIC: &[u8; 4] = b"AMGZ";
+const MAX_EMBEDDED_CLI_BYTES: usize = 64 * 1024 * 1024;
+
 /// Write `bytes` to `dest`. If `dest` is a program that is running (an agent waiting on
 /// `memguard wait`, say), it can't be overwritten but it can be renamed: move it aside to
 /// `<dest>.old` and put the new file in its place.
@@ -207,7 +210,8 @@ fn replace_file(dest: &Path, bytes: &[u8]) -> Result<(), String> {
     if fs::read(dest).map(|cur| cur == bytes).unwrap_or(false) {
         return Ok(());
     }
-    let fresh = with_suffix(dest, ".new");
+    let nonce = REPLACE_NONCE.fetch_add(1, Ordering::Relaxed);
+    let fresh = with_suffix(dest, &format!(".{}.{}.new", std::process::id(), nonce));
     let old = with_suffix(dest, ".old");
     let mut last = String::new();
     for _ in 0..20 {
@@ -234,11 +238,60 @@ fn replace_file(dest: &Path, bytes: &[u8]) -> Result<(), String> {
     Err(format!("Couldn't write {} ({}).", dest.display(), last))
 }
 
+/// Compress `raw` into the `[b"AMGZ", uncompressed_len: u32 LE, lznt1_payload...]` container.
+pub fn encode_embedded_cli(raw: &[u8]) -> Result<Vec<u8>, String> {
+    if raw.is_empty() || raw.len() > MAX_EMBEDDED_CLI_BYTES {
+        return Err(format!("embedded CLI size {} out of range (1..={})", raw.len(), MAX_EMBEDDED_CLI_BYTES));
+    }
+    let compressed = win::compress_lznt1(raw)?;
+    let mut out = Vec::with_capacity(8 + compressed.len());
+    out.extend_from_slice(EMBEDDED_CLI_MAGIC);
+    out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+    out.extend_from_slice(&compressed);
+    Ok(out)
+}
+
+/// Decode an embedded CLI payload (`AMGZ` LZNT1 container, or raw `MZ` executable fallback).
+pub fn decode_embedded_cli(bytes: &[u8]) -> Result<Cow<'_, [u8]>, String> {
+    if bytes.starts_with(EMBEDDED_CLI_MAGIC) {
+        if bytes.len() < 8 {
+            return Err("embedded CLI header is truncated".into());
+        }
+        let uncompressed_len = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+        if uncompressed_len == 0 || uncompressed_len > MAX_EMBEDDED_CLI_BYTES {
+            return Err(format!("embedded CLI uncompressed size {} is invalid", uncompressed_len));
+        }
+        let payload = &bytes[8..];
+        if payload.is_empty() {
+            return Err("embedded CLI compressed payload is empty".into());
+        }
+        let out = win::decompress_lznt1(payload, uncompressed_len)?;
+        if out.len() != uncompressed_len {
+            return Err(format!(
+                "embedded CLI decompressed to {} bytes, expected {}",
+                out.len(),
+                uncompressed_len
+            ));
+        }
+        return Ok(Cow::Owned(out));
+    }
+    if bytes.starts_with(b"MZ") {
+        return Ok(Cow::Borrowed(bytes));
+    }
+    Err("embedded CLI has an unrecognized format".into())
+}
+
+/// Decode and atomically write an embedded CLI payload into `dir\memguard.exe`.
+pub fn write_embedded_cli_bytes(dir: &Path, bytes: &[u8]) -> Result<(), String> {
+    let decoded = decode_embedded_cli(bytes)?;
+    replace_file(&dir.join(paths::CLI_EXE), &decoded)
+}
+
 /// Write the CLI that this exe carries into `dir`. Returns false (and does nothing) when this
 /// build carries none, as in dev builds where `memguard.exe` is built beside it.
 pub fn write_embedded_cli(dir: &Path) -> Result<bool, String> {
     match EMBEDDED_CLI {
-        Some(bytes) => replace_file(&dir.join(paths::CLI_EXE), bytes).map(|_| true),
+        Some(bytes) => write_embedded_cli_bytes(dir, bytes).map(|_| true),
         None => Ok(false),
     }
 }
@@ -413,16 +466,8 @@ fn id_list(target: &Path) -> Option<Vec<u8>> {
 }
 
 fn create_shortcut(target: &Path, lnk: &Path) -> Result<(), String> {
-    if let Some(dir) = lnk.parent() {
-        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
     let bytes = shortcut_bytes(target, "Keeps memory free for Unreal Engine work");
-    let tmp = with_suffix(lnk, ".tmp");
-    fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, lnk).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        e.to_string()
-    })
+    crate::config::write_atomic_bytes(lnk, &bytes)
 }
 
 // ---------------------------------------------------------------- launch mode
@@ -500,17 +545,107 @@ pub fn install(opts: InstallOptions) -> Result<InstallResult, String> {
     let path_changed = if add_to_path { update_user_path(&paths::install_dir(), true)? } else { false };
     // ShellExecute starts it without inheriting our handles. A plain spawn would pass on
     // the caller's output pipe, and a script or agent reading it would wait forever.
-    let started = start && crate::tray::launch_detached(&tray, "", false);
+    let started = start && win::launch_detached(&tray, "", false);
     crate::log::write(&format!("installed {} to {}", env!("CARGO_PKG_VERSION"), dir.display()));
     Ok(InstallResult { dir, stopped_previous, migrated_from_memcap, path_changed, started })
+}
+
+// ---------------------------------------------------------------- opt-in elevated helper task
+
+fn elevated_helper_exe() -> Result<PathBuf, String> {
+    let installed = paths::install_dir().join(paths::TRAY_EXE);
+    if installed.exists() {
+        return Ok(installed);
+    }
+    Ok(std::env::current_exe().map_err(|e| e.to_string())?.with_file_name(paths::TRAY_EXE))
+}
+
+pub fn elevated_helper_create_args(exe: &Path) -> Vec<String> {
+    let arg = if exe.file_name().is_some_and(|n| n.eq_ignore_ascii_case(paths::CLI_EXE)) {
+        "flush-cache"
+    } else {
+        "--flush-cache"
+    };
+    vec![
+        "/Create".to_string(),
+        "/F".to_string(),
+        "/TN".to_string(),
+        crate::ops::ELEVATED_HELPER_TASK.to_string(),
+        "/TR".to_string(),
+        format!("\"{}\" {}", exe.display(), arg),
+        "/SC".to_string(),
+        "ONCE".to_string(),
+        "/ST".to_string(),
+        "00:00".to_string(),
+        "/RL".to_string(),
+        "HIGHEST".to_string(),
+    ]
+}
+
+pub fn elevated_helper_delete_args() -> [&'static str; 4] {
+    ["/Delete", "/F", "/TN", crate::ops::ELEVATED_HELPER_TASK]
+}
+
+pub fn elevated_helper_query_args() -> [&'static str; 3] {
+    ["/Query", "/TN", crate::ops::ELEVATED_HELPER_TASK]
+}
+
+fn run_schtasks(args: &[&str]) -> Result<(), String> {
+    let status = Command::new("schtasks.exe")
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("could not run schtasks.exe: {}", e))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("schtasks.exe exited with {}", status))
+    }
+}
+
+/// Opt-in: register `ops::ELEVATED_HELPER_TASK` so `AtherMemGuard.exe --flush-cache` can run
+/// elevated without UAC prompts. Requires administrator privileges; never called automatically.
+pub fn install_elevated_helper() -> Result<(), String> {
+    if cfg!(test) || paths::is_test_home() {
+        return Err("refusing to modify scheduled tasks in test mode".into());
+    }
+    if !win::is_elevated() {
+        return Err("installing the elevated helper task requires administrator privileges".into());
+    }
+    let exe = elevated_helper_exe()?;
+    let args = elevated_helper_create_args(&exe);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_schtasks(&refs)
+}
+
+/// Remove the opt-in elevated helper scheduled task if present.
+pub fn uninstall_elevated_helper() -> Result<(), String> {
+    if cfg!(test) || paths::is_test_home() {
+        return Ok(());
+    }
+    run_schtasks(&elevated_helper_delete_args())
+}
+
+/// True when the opt-in elevated helper scheduled task exists.
+pub fn is_elevated_helper_installed() -> bool {
+    if cfg!(test) || paths::is_test_home() {
+        return false;
+    }
+    run_schtasks(&elevated_helper_query_args()).is_ok()
 }
 
 pub fn uninstall() -> Result<(), String> {
     stop_running();
     let _ = set_run_at_startup(false);
-    let _ = RegKey::predef(HKEY_CURRENT_USER).delete_subkey_all(paths::UNINSTALL_KEY);
+    let _ = win::reg_delete_tree(RegHive::Hkcu, paths::UNINSTALL_KEY);
     let _ = update_user_path(&paths::install_dir(), false);
     let _ = fs::remove_file(paths::start_menu_shortcut());
+    if !paths::is_test_home() && is_elevated_helper_installed() {
+        let _ = uninstall_elevated_helper();
+    }
 
     let dir = paths::install_dir();
     let here = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -519,7 +654,7 @@ pub fn uninstall() -> Result<(), String> {
         // in case the exe is still closing.
         let rd = format!("rmdir /s /q \"{}\" 2>nul", dir.display());
         let params = format!("/c ping -n 3 127.0.0.1 >nul & {rd} & ping -n 3 127.0.0.1 >nul & {rd}");
-        if !crate::tray::launch_detached(Path::new("cmd.exe"), &params, true) {
+        if !win::launch_detached(Path::new("cmd.exe"), &params, true) {
             return Err("could not schedule removal of the program folder".into());
         }
     } else if dir.exists() {
@@ -648,5 +783,107 @@ mod tests {
         create_shortcut(&f, &lnk).unwrap();
         assert!(fs::metadata(&lnk).unwrap().len() > 100);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lznt1_embedded_cli_round_trip_and_fallback() {
+        let dir = std::env::temp_dir().join(format!("memguard-lznt1-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut payload = b"MZ\x90\x00".to_vec();
+        for i in 0..8192u32 {
+            payload.extend_from_slice(&(i % 13).to_le_bytes());
+        }
+        let encoded = encode_embedded_cli(&payload).unwrap();
+        assert!(encoded.starts_with(b"AMGZ"));
+        assert!(encoded.len() < payload.len());
+        assert_eq!(decode_embedded_cli(&encoded).unwrap().as_ref(), payload.as_slice());
+
+        write_embedded_cli_bytes(&dir, &encoded).unwrap();
+        assert_eq!(fs::read(dir.join(paths::CLI_EXE)).unwrap(), payload);
+
+        // Raw MZ fallback still writes verbatim.
+        let raw_mz = b"MZ-raw-cli-binary-test";
+        write_embedded_cli_bytes(&dir, raw_mz).unwrap();
+        assert_eq!(fs::read(dir.join(paths::CLI_EXE)).unwrap(), raw_mz);
+
+        // Error cases: truncated header, invalid size, empty/corrupt payload, unrecognized magic.
+        assert!(decode_embedded_cli(b"AMGZ\x01").is_err());
+        assert!(decode_embedded_cli(b"AMGZ\x00\x00\x00\x00\x01").is_err());
+        let mut oversized = b"AMGZ".to_vec();
+        oversized.extend_from_slice(&((MAX_EMBEDDED_CLI_BYTES as u32) + 1).to_le_bytes());
+        oversized.push(0);
+        assert!(decode_embedded_cli(&oversized).is_err());
+        let mut bad_len = encoded.clone();
+        let wrong_len = (payload.len() as u32) + 16;
+        bad_len[4..8].copy_from_slice(&wrong_len.to_le_bytes());
+        assert!(decode_embedded_cli(&bad_len).is_err());
+        assert!(decode_embedded_cli(b"AMGZ\x10\x00\x00\x00").is_err());
+        assert!(decode_embedded_cli(b"NOPE1234").is_err());
+        let mut corrupt = b"AMGZ".to_vec();
+        corrupt.extend_from_slice(&64u32.to_le_bytes());
+        corrupt.extend_from_slice(&[0xff; 12]);
+        assert!(decode_embedded_cli(&corrupt).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn elevated_helper_args_and_test_guard() {
+        let tray_exe = Path::new(r"C:\Apps\AtherMemGuard\AtherMemGuard.exe");
+        let args = elevated_helper_create_args(tray_exe);
+        assert_eq!(
+            args,
+            vec![
+                "/Create",
+                "/F",
+                "/TN",
+                crate::ops::ELEVATED_HELPER_TASK,
+                "/TR",
+                r#""C:\Apps\AtherMemGuard\AtherMemGuard.exe" --flush-cache"#,
+                "/SC",
+                "ONCE",
+                "/ST",
+                "00:00",
+                "/RL",
+                "HIGHEST",
+            ]
+        );
+        let cli_args = elevated_helper_create_args(Path::new(r"C:\Apps\AtherMemGuard\memguard.exe"));
+        assert_eq!(cli_args[5], r#""C:\Apps\AtherMemGuard\memguard.exe" flush-cache"#);
+        assert_eq!(elevated_helper_delete_args(), ["/Delete", "/F", "/TN", crate::ops::ELEVATED_HELPER_TASK]);
+        assert_eq!(elevated_helper_query_args(), ["/Query", "/TN", crate::ops::ELEVATED_HELPER_TASK]);
+
+        // Guarded under cfg!(test): never spawns schtasks.exe.
+        assert!(!is_elevated_helper_installed());
+        assert!(install_elevated_helper().is_err());
+        assert!(uninstall_elevated_helper().is_ok());
+    }
+
+    #[test]
+    fn t5_embedded_cli_empty_oversize_and_incompressible_roundtrip() {
+        // Empty payload must be rejected cleanly.
+        assert!(encode_embedded_cli(&[]).is_err());
+        assert!(decode_embedded_cli(b"").is_err());
+
+        // Header claiming > 64 MiB uncompressed size must be rejected cleanly.
+        let mut oversize = Vec::from(*b"AMGZ");
+        oversize.extend_from_slice(&((65u32 * 1024 * 1024).to_le_bytes()));
+        oversize.extend_from_slice(&[0u8; 16]);
+        assert!(decode_embedded_cli(&oversize).is_err(), "65 MiB AMGZ header must fail validation");
+
+        // Incompressible > 128 KiB pseudo-random payload must survive LZNT1 chunked roundtrip.
+        let mut incomp = vec![0u8; 160_000];
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        for b in &mut incomp {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (state >> 24) as u8;
+        }
+        let encoded = encode_embedded_cli(&incomp).expect("encode incompressible >128KB");
+        let decoded = decode_embedded_cli(&encoded).expect("decode incompressible >128KB");
+        assert_eq!(decoded.as_ref(), incomp.as_slice());
     }
 }

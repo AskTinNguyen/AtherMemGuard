@@ -81,6 +81,13 @@ pub fn write_all(dir: &Path) -> Result<Vec<PathBuf>, String> {
         // Minimum size.
         let mut w = sample_settings();
         save("settings-min", &render_settings(&mut w, scale, 720, Some(480)))?;
+        // New Checkup ([doctor]) and Disk space ([disk]) Settings sections.
+        let mut w = sample_settings();
+        w.set_query("checkup");
+        save("settings-checkup", &render_settings(&mut w, scale, 900, None))?;
+        let mut w = sample_settings();
+        w.set_query("disk space");
+        save("settings-disk", &render_settings(&mut w, scale, 900, None))?;
         for (name, t) in toast::catalog::samples() {
             save(&format!("toast-{}", name), &toast::render(&t, scale))?;
         }

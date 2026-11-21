@@ -170,6 +170,46 @@ fn child() {
     std::fs::write(data_dir.join("settings.toml"), "[updates]\nmanifest_url = \"https://updates.example.com/latest.json\"\n").unwrap();
     assert_eq!(updater::manifest_url(), "https://updates.example.com/latest.json");
     std::fs::remove_file(data_dir.join("settings.toml")).unwrap();
+
+    // Bug #13: team.toml layering + configured HTTPS host/port validation.
+    let team_file = data_dir.join("team.toml");
+    let settings_file = data_dir.join("settings.toml");
+    std::fs::write(
+        &team_file,
+        "[updates]\nmanifest_url = \"https://team.updates.example:8443/memguard/latest.json\"\n",
+    )
+    .unwrap();
+    assert_eq!(updater::manifest_url(), "https://team.updates.example:8443/memguard/latest.json");
+    let mk_manifest = |url: &str| {
+        format!(
+            r#"{{"windows":{{"version":"9.9.9","url":"{}","sha256":"{}","size":5}}}}"#,
+            url,
+            "0".repeat(64)
+        )
+    };
+    assert!(updater::parse_manifest(&mk_manifest("https://TEAM.UPDATES.EXAMPLE:8443/releases/setup.exe")).is_ok());
+    assert!(updater::parse_manifest(&mk_manifest("https://github.com/AskTinNguyen/AtherMemGuard/releases/download/v1/x.exe")).is_ok());
+    assert!(updater::parse_manifest(&mk_manifest("https://objects.githubusercontent.com/bucket/x.exe")).is_ok());
+    for rejected in [
+        "https://team.updates.example/releases/setup.exe",
+        "https://team.updates.example:9443/releases/setup.exe",
+        "https://team.updates.example.evil.com:8443/setup.exe",
+        "https://user@team.updates.example:8443/setup.exe",
+        "http://team.updates.example:8443/setup.exe",
+    ] {
+        assert!(updater::parse_manifest(&mk_manifest(rejected)).is_err(), "should reject {}", rejected);
+    }
+    // User settings.toml overrides team.toml.
+    std::fs::write(
+        &settings_file,
+        "[updates]\nmanifest_url = \"https://user.updates.example/latest.json\"\n",
+    )
+    .unwrap();
+    assert_eq!(updater::manifest_url(), "https://user.updates.example/latest.json");
+    assert!(updater::parse_manifest(&mk_manifest("https://user.updates.example:443/setup.exe")).is_ok());
+    assert!(updater::parse_manifest(&mk_manifest("https://team.updates.example:8443/setup.exe")).is_err());
+    std::fs::remove_file(&settings_file).unwrap();
+    std::fs::remove_file(&team_file).unwrap();
     // Without the test override, a manifest pointing at this PC over http is refused.
     let local = format!(
         r#"{{"windows":{{"version":"9.9.9","url":"{}/real.exe","sha256":"{}","size":5}}}}"#,

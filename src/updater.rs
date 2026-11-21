@@ -46,10 +46,29 @@ fn test_override() -> Option<String> {
     std::env::var(paths::UPDATE_URL_ENV).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
-/// `[updates] manifest_url` read straight from settings.toml, so this works before and after
-/// the settings code knows the key. Missing file, table or key = empty.
+/// `[updates] manifest_url` from the effective layered settings (`team.toml < settings.toml`),
+/// read-only (never creates `settings.toml`). Missing file, table or key = empty.
 fn settings_manifest_url() -> String {
-    fs::read_to_string(paths::config_file()).map(|text| manifest_url_from_toml(&text)).unwrap_or_default()
+    let user_path = paths::config_file();
+    let team_path = crate::config::team_file();
+    if !user_path.exists() && !team_path.exists() {
+        return String::new();
+    }
+    let user = fs::read_to_string(&user_path).unwrap_or_default();
+    let team = fs::read_to_string(&team_path).ok();
+    if let Ok((cfg, _)) = crate::config::config_from_layers(team.as_deref(), &user) {
+        return cfg.updates.manifest_url.trim().to_string();
+    }
+    if team.is_some() {
+        if let Ok((cfg, _)) = crate::config::config_from_layers(None, &user) {
+            return cfg.updates.manifest_url.trim().to_string();
+        }
+    }
+    let u = manifest_url_from_toml(&user);
+    if !u.is_empty() {
+        return u;
+    }
+    team.as_deref().map(manifest_url_from_toml).unwrap_or_default()
 }
 
 fn manifest_url_from_toml(text: &str) -> String {
@@ -82,13 +101,31 @@ fn manifest_url_allowed(url: &str, allow_localhost: bool) -> bool {
     }
 }
 
-/// Where the exe may come from: HTTPS on GitHub, or this PC with the test override.
-fn download_url_allowed(url: &str, allow_localhost: bool) -> bool {
-    match net::parse_url(url) {
-        Some(u) if allow_localhost && net::is_localhost(&u.host) => true,
-        Some(u) => u.https && UPDATE_HOSTS.iter().any(|h| u.host.eq_ignore_ascii_case(h)),
-        None => false,
+/// Where the exe may come from: HTTPS on GitHub, HTTPS on the configured manifest host/port,
+/// or this PC with the test override.
+fn download_url_allowed_with(url: &str, allow_localhost: bool, configured_manifest_url: Option<&str>) -> bool {
+    let Some(u) = net::parse_url(url) else {
+        return false;
+    };
+    if allow_localhost && net::is_localhost(&u.host) {
+        return true;
     }
+    if !u.https {
+        return false;
+    }
+    if UPDATE_HOSTS.iter().any(|h| u.host.eq_ignore_ascii_case(h)) {
+        return true;
+    }
+    if let Some(mu) = configured_manifest_url.and_then(net::parse_url).filter(|m| m.https) {
+        return u.host.eq_ignore_ascii_case(&mu.host) && u.port == mu.port;
+    }
+    false
+}
+
+#[cfg(test)]
+fn download_url_allowed(url: &str, allow_localhost: bool) -> bool {
+    let configured = manifest_url();
+    download_url_allowed_with(url, allow_localhost, Some(&configured))
 }
 
 /// Compare dotted version numbers: "0.0.10" > "0.0.9", "1.0" == "1.0.0". Anything that isn't
@@ -117,10 +154,16 @@ pub fn compare_versions(a: &str, b: &str) -> Ordering {
 /// The "windows" entry of a manifest, validated. Plain http to this PC is accepted only while
 /// `ATHER_MEMGUARD_UPDATE_URL` is set.
 pub fn parse_manifest(json: &str) -> Result<Manifest, String> {
-    parse_manifest_with(json, test_override().is_some())
+    let configured = manifest_url();
+    parse_manifest_with_manifest(json, test_override().is_some(), Some(&configured))
 }
 
+#[cfg(test)]
 fn parse_manifest_with(json: &str, allow_localhost: bool) -> Result<Manifest, String> {
+    parse_manifest_with_manifest(json, allow_localhost, None)
+}
+
+fn parse_manifest_with_manifest(json: &str, allow_localhost: bool, configured_manifest_url: Option<&str>) -> Result<Manifest, String> {
     const UNREADABLE: &str = "The update information couldn't be read";
     if json.len() as u64 > MAX_MANIFEST {
         return Err(format!("{}: it's larger than expected.", UNREADABLE));
@@ -147,8 +190,8 @@ fn parse_manifest_with(json: &str, allow_localhost: bool) -> Result<Manifest, St
         return Err(format!("{}: the file size isn't valid.", UNREADABLE));
     }
     let url = text("url");
-    if !download_url_allowed(&url, allow_localhost) {
-        return Err(format!("{}: the download isn't on GitHub over HTTPS.", UNREADABLE));
+    if !download_url_allowed_with(&url, allow_localhost, configured_manifest_url) {
+        return Err(format!("{}: the download isn't on GitHub or the configured update host over HTTPS.", UNREADABLE));
     }
     let notes: String = text("notes").chars().take(MAX_NOTES).collect();
     Ok(Manifest { version, url, sha256, size, notes })
@@ -173,7 +216,7 @@ fn check_against(current: &str) -> CheckResult {
         Ok(t) => t,
         Err(_) => return CheckResult::Failed("The update information couldn't be read.".into()),
     };
-    match parse_manifest_with(&text, allow_localhost) {
+    match parse_manifest_with_manifest(&text, allow_localhost, Some(&url)) {
         Ok(m) if compare_versions(&m.version, current) == Ordering::Greater => CheckResult::Available(m),
         Ok(_) => CheckResult::UpToDate,
         Err(e) => CheckResult::Failed(e),
@@ -229,8 +272,9 @@ pub fn download(m: &Manifest, progress: &dyn Fn(u64, u64)) -> Result<PathBuf, St
 }
 
 fn download_to(m: &Manifest, staged: &Path, progress: &dyn Fn(u64, u64)) -> Result<PathBuf, String> {
-    if !download_url_allowed(&m.url, test_override().is_some()) {
-        return Err("The download isn't on GitHub over HTTPS, so it wasn't downloaded.".into());
+    let configured = manifest_url();
+    if !download_url_allowed_with(&m.url, test_override().is_some(), Some(&configured)) {
+        return Err("The download isn't on GitHub or the configured update host over HTTPS, so it wasn't downloaded.".into());
     }
     if m.size == 0 || m.size > MAX_EXE {
         return Err("The update's file size isn't valid.".into());
@@ -299,7 +343,7 @@ pub fn install_staged(staged: &Path) -> Result<(), String> {
     swap_exe(&target, staged)?;
     let params = format!("--after-update {}", std::process::id());
     // ShellExecute: the new copy inherits none of our handles.
-    if !crate::tray::launch_detached(&target, &params, false) {
+    if !crate::win::launch_detached(&target, &params, false) {
         unswap_exe(&target, staged);
         return Err("Couldn't start the new version, so the current one stays.".into());
     }
@@ -547,5 +591,54 @@ mod tests {
         assert!(download_to(&big, &staged, &|_, _| {}).is_err());
         assert!(!staged.exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn configured_team_https_host_and_port_allowed() {
+        let team_manifest = "https://updates.studio.example:8443/memguard/latest.json";
+        assert!(download_url_allowed_with(
+            "https://UPDATES.STUDIO.EXAMPLE:8443/releases/AtherMemGuard-Setup.exe",
+            false,
+            Some(team_manifest)
+        ));
+        assert!(download_url_allowed_with(GOOD_URL, false, Some(team_manifest)));
+        assert!(!download_url_allowed_with(
+            "https://updates.studio.example/releases/AtherMemGuard-Setup.exe",
+            false,
+            Some(team_manifest)
+        ));
+        assert!(!download_url_allowed_with(
+            "https://updates.studio.example:9443/releases/AtherMemGuard-Setup.exe",
+            false,
+            Some(team_manifest)
+        ));
+        assert!(!download_url_allowed_with(
+            "https://updates.studio.example.evil.com:8443/setup.exe",
+            false,
+            Some(team_manifest)
+        ));
+        assert!(!download_url_allowed_with(
+            "http://updates.studio.example:8443/setup.exe",
+            false,
+            Some(team_manifest)
+        ));
+        assert!(!download_url_allowed_with(
+            "https://user@updates.studio.example:8443/setup.exe",
+            false,
+            Some(team_manifest)
+        ));
+        assert!(download_url_allowed_with(
+            "https://updates.studio.example:443/setup.exe",
+            false,
+            Some("https://updates.studio.example/latest.json")
+        ));
+        // A plain-http test manifest must not unlock arbitrary HTTP/HTTPS hosts.
+        assert!(!download_url_allowed_with(
+            "https://evil.example/setup.exe",
+            true,
+            Some("http://127.0.0.1:8080/latest.json")
+        ));
+        // Test helper `download_url_allowed` compiles and rejects unknown hosts.
+        assert!(!download_url_allowed("https://evil.example/x.exe", false));
     }
 }

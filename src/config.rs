@@ -13,12 +13,15 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 /// The defaults compiled into the program. Every key is set here; the files on disk only
 /// override. Soft caps are percentages of total RAM so they suit 16 GB and 128 GB PCs alike.
 pub const BUILTIN_TOML: &str = r#"# Ather MemGuard built-in defaults.
 interval_sec = 10
 trim_cooldown_sec = 120
+foreground_grace_sec = 45
 
 [general]
 preset = "balanced"
@@ -26,6 +29,7 @@ notifications = true
 auto_prime = true
 prime_hotkey = "Ctrl+Alt+M"
 check_ram_speed = true
+elevated_helper = false
 
 [updates]
 check_automatically = true
@@ -40,6 +44,8 @@ elevated_ram_free_pct = 10
 elevated_commit_free_pct = 12
 critical_ram_free_pct = 4
 critical_commit_free_pct = 6
+hysteresis_pct = 2.0
+hysteresis_gb = 2.0
 
 [ue]
 protect = [
@@ -47,8 +53,13 @@ protect = [
     "clang-cl", "lld-link", "UbaAgent", "UbaCli", "UbaHost", "zenserver", "UnrealPak",
     "LiveCodingConsole", "UnrealTraceServer", "CrashReportClient*", "EpicWebHelper",
     "AutomationTool", "msbuild", "git", "git-lfs",
+    "UnrealHeaderTool", "UnrealLightmass", "dxc", "fxc", "ispc", "rc", "lib", "llvm-lib",
 ]
-workers = ["cl", "clang-cl", "link", "lld-link", "ShaderCompileWorker"]
+workers = [
+    "cl", "clang-cl", "link", "lld-link", "ShaderCompileWorker",
+    "UbaHost", "UbaAgent", "LiveCodingConsole", "UnrealHeaderTool", "UnrealLightmass",
+    "UnrealPak", "dxc", "fxc", "ispc", "rc", "lib", "llvm-lib",
+]
 editor_restart_hint_gb = 48
 editor_growth_alert_gb_per_hour = 6
 worker_throttle = false
@@ -58,6 +69,14 @@ min_workers = 4
 editor = { ram_gb = 16, commit_gb = 24, disk_gb = 20 }
 build = { ram_gb = 24, commit_gb = 40, disk_gb = 50 }
 cook = { ram_gb = 32, commit_gb = 48, disk_gb = 100 }
+
+[doctor]
+keep = []
+close = []
+close_while_unreal = []
+ignore_below_mb = 150
+review_above_mb = 1024
+nudge_above_gb = 4.0
 
 [disk]
 enabled = true
@@ -88,6 +107,7 @@ trim_above_pct = 2.4
 [group.elevated]
 trim_above_pct = 0.8
 cpu = "below"
+io_priority = "verylow"
 [group.critical]
 trim_above_pct = 0.2
 
@@ -101,6 +121,7 @@ trim_above_pct = 1.2
 [group.elevated]
 trim_above_pct = 0.4
 cpu = "below"
+io_priority = "verylow"
 [group.critical]
 trim_above_pct = 0.05
 
@@ -110,6 +131,7 @@ processes = ["claude", "codex"]
 priority = "low"
 [group.elevated]
 trim_above_pct = 4.8
+io_priority = "verylow"
 [group.critical]
 trim_above_pct = 1.6
 
@@ -122,6 +144,7 @@ processes = [
 priority = "verylow"
 trim_above_pct = 0.4
 cpu = "eco"
+io_priority = "verylow"
 [group.critical]
 trim_above_pct = 0.05
 "#;
@@ -142,6 +165,7 @@ preset = "balanced"
 # auto_prime = true             # free RAM the moment a build or cook starts
 # prime_hotkey = "Ctrl+Alt+M"   # empty = no hotkey
 # check_ram_speed = true        # say once if the RAM runs below its rated speed (`memguard ram`)
+# elevated_helper = false       # opt-in scheduled-task elevation for standby purge / page combining
 
 # [updates]
 # check_automatically = true
@@ -155,6 +179,8 @@ preset = "balanced"
 # Minimum time between trims of the same group. It doubles (up to 16x) while a group keeps
 # climbing straight back over its limit, and is ignored at critical pressure.
 # trim_cooldown_sec = 120
+# Seconds after an app leaves the foreground before it can be trimmed or throttled.
+# foreground_grace_sec = 45
 
 # [pressure]
 # Percent of total RAM that is free / percent of the commit limit that is free.
@@ -162,12 +188,14 @@ preset = "balanced"
 # elevated_commit_free_pct = 12
 # critical_ram_free_pct = 4
 # critical_commit_free_pct = 6
+# hysteresis_pct = 2.0
+# hysteresis_gb = 2.0
 
 # [ue]
 # Never touched by any group, whatever the group lists say. A trailing * is a wildcard.
 # protect = ["UnrealEditor*", "ShaderCompileWorker", "UnrealBuildTool", "dotnet", "cl", ...]
 # Compile / shader workers, counted in status and used by worker_throttle.
-# workers = ["cl", "clang-cl", "link", "lld-link", "ShaderCompileWorker"]
+# workers = ["cl", "clang-cl", "link", "lld-link", "ShaderCompileWorker", ...]
 # Suggest restarting the editor when one editor process commits more than this.
 # editor_restart_hint_gb = 48
 # Tell you when an editor's memory keeps growing faster than this. 0 = off.
@@ -183,6 +211,14 @@ preset = "balanced"
 # editor = { ram_gb = 16, commit_gb = 24, disk_gb = 20 }
 # build = { ram_gb = 24, commit_gb = 40, disk_gb = 50 }
 # cook = { ram_gb = 32, commit_gb = 48, disk_gb = 100 }
+
+# [doctor]
+# keep = []                     # never proposed for closing
+# close = []                    # always treated as not needed for Unreal
+# close_while_unreal = []       # asked to close whenever Unreal is running
+# ignore_below_mb = 150
+# review_above_mb = 1024
+# nudge_above_gb = 4.0
 
 # [disk]
 # enabled = true                # watch free space and say once when a drive gets low
@@ -217,7 +253,11 @@ preset = "balanced"
 #   trim_above_mb   the same in MB. Wins over trim_above_pct when both are set. 0 = off.
 #                   Soft caps are never below 128 MB.
 #   cpu             normal | below | idle | eco   (eco = Windows efficiency mode)
+#   io_priority     verylow | low | normal
 #   suspend         true freezes the apps completely until pressure drops. Use with care.
+#   ws_cap_mb       optional physical working-set cap on the group. 0 = off.
+#   ws_cap_per_process_mb   the same, per process. 0 = off.
+#   cpu_rate_pct    optional Job Object CPU rate cap (1..100). 0 or unset = off.
 #   hard_cap_mb     hard cap on the group's committed memory. Apps that hit it usually
 #                   crash. Sandboxed browser/Electron helpers can't be capped. 0 = off.
 #   hard_cap_per_process_mb   the same, per process.
@@ -287,6 +327,25 @@ pub enum Cpu {
     Eco,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IoPriority {
+    VeryLow,
+    Low,
+    Normal,
+}
+
+impl IoPriority {
+    /// Windows ProcessIoPriority value (`0 = VeryLow`, `1 = Low`, `2 = Normal`).
+    pub fn value(self) -> u32 {
+        match self {
+            IoPriority::VeryLow => 0,
+            IoPriority::Low => 1,
+            IoPriority::Normal => 2,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Preset {
@@ -345,8 +404,16 @@ pub struct Policy {
     pub trim_above_pct: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<Cpu>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_priority: Option<IoPriority>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suspend: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_cap_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_cap_per_process_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_rate_pct: Option<u32>,
 }
 
 fn yes() -> bool {
@@ -370,7 +437,15 @@ pub struct Group {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu: Option<Cpu>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_priority: Option<IoPriority>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suspend: Option<bool>,
+    #[serde(default)]
+    pub ws_cap_mb: u64,
+    #[serde(default)]
+    pub ws_cap_per_process_mb: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_rate_pct: Option<u32>,
     #[serde(default)]
     pub hard_cap_mb: u64,
     #[serde(default)]
@@ -383,6 +458,13 @@ pub struct Group {
     pub critical: Option<Policy>,
 }
 
+fn default_pressure_hysteresis_pct() -> f64 {
+    2.0
+}
+fn default_pressure_hysteresis_gb() -> f64 {
+    2.0
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pressure {
@@ -390,6 +472,10 @@ pub struct Pressure {
     pub elevated_commit_free_pct: f64,
     pub critical_ram_free_pct: f64,
     pub critical_commit_free_pct: f64,
+    #[serde(default = "default_pressure_hysteresis_pct")]
+    pub hysteresis_pct: f64,
+    #[serde(default = "default_pressure_hysteresis_gb")]
+    pub hysteresis_gb: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -455,11 +541,20 @@ pub struct General {
     pub prime_hotkey: String,
     /// Check whether the RAM runs below its rated speed (the checkup row and a one-time toast).
     pub check_ram_speed: bool,
+    /// Opt-in elevated scheduled-task helper for standby purge / page combining. Zero-admin default.
+    pub elevated_helper: bool,
 }
 
 impl Default for General {
     fn default() -> Self {
-        General { preset: Preset::Balanced, notifications: true, auto_prime: true, prime_hotkey: "Ctrl+Alt+M".into(), check_ram_speed: true }
+        General {
+            preset: Preset::Balanced,
+            notifications: true,
+            auto_prime: true,
+            prime_hotkey: "Ctrl+Alt+M".into(),
+            check_ram_speed: true,
+            elevated_helper: false,
+        }
     }
 }
 
@@ -542,6 +637,31 @@ impl Default for DiskSettings {
     }
 }
 
+/// `[doctor]` checkup settings (keep / close lists and thresholds).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DoctorSettings {
+    pub keep: Vec<String>,
+    pub close: Vec<String>,
+    pub close_while_unreal: Vec<String>,
+    pub ignore_below_mb: u64,
+    pub review_above_mb: u64,
+    pub nudge_above_gb: f64,
+}
+
+impl Default for DoctorSettings {
+    fn default() -> Self {
+        DoctorSettings {
+            keep: Vec::new(),
+            close: Vec::new(),
+            close_while_unreal: Vec::new(),
+            ignore_below_mb: 150,
+            review_above_mb: 1024,
+            nudge_above_gb: 4.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -549,6 +669,8 @@ pub struct Config {
     pub interval_sec: u64,
     #[serde(default = "default_cooldown")]
     pub trim_cooldown_sec: u64,
+    #[serde(default = "default_foreground_grace")]
+    pub foreground_grace_sec: u64,
     #[serde(default)]
     pub general: General,
     #[serde(default)]
@@ -561,10 +683,8 @@ pub struct Config {
     pub ue: Ue,
     #[serde(default = "default_prime")]
     pub prime: Prime,
-    /// The checkup's own settings (keep / close lists, thresholds). `doctor.rs` reads and
-    /// validates them itself; the table is carried here so the file still loads.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub doctor: Option<toml::Table>,
+    #[serde(default)]
+    pub doctor: DoctorSettings,
     /// Disk and Dev Drive settings; `Config::disk()` fills in the defaults when the table is
     /// missing. 0.2.1 carries this table untyped, so files stay compatible both ways.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -578,22 +698,41 @@ fn default_interval() -> u64 {
     10
 }
 fn default_cooldown() -> u64 {
-    60
+    120
 }
+fn default_foreground_grace() -> u64 {
+    45
+}
+
+fn builtin_table_ref() -> &'static toml::Table {
+    static TABLE: OnceLock<toml::Table> = OnceLock::new();
+    TABLE.get_or_init(|| parse_table("built-in defaults", BUILTIN_TOML).expect("built-in default table is valid"))
+}
+
+fn builtin_config_ref() -> &'static Config {
+    static CFG: OnceLock<Config> = OnceLock::new();
+    CFG.get_or_init(|| Config::from_table(builtin_table_ref().clone()).expect("built-in default config is valid"))
+}
+
 fn default_pressure() -> Pressure {
-    Config::builtin().pressure
+    builtin_config_ref().pressure.clone()
 }
 fn default_ue() -> Ue {
-    Config::builtin().ue
+    builtin_config_ref().ue.clone()
 }
 fn default_prime() -> Prime {
-    Config::builtin().prime
+    builtin_config_ref().prime.clone()
 }
 
 impl Config {
     /// The defaults compiled into the program.
     pub fn builtin() -> Config {
-        Config::parse(BUILTIN_TOML).expect("built-in default config is valid")
+        builtin_config_ref().clone()
+    }
+
+    /// Pre-compile UE protect/workers and active group patterns for fast tick matching.
+    pub fn compile_patterns(&self) -> CompiledPatterns {
+        CompiledPatterns::from_config(self)
     }
 
     /// Parse one complete settings text on its own (no layering), normalise and validate it.
@@ -611,7 +750,14 @@ impl Config {
         self.interval_sec = self.interval_sec.clamp(2, 600);
         for g in &mut self.groups {
             for p in &mut g.processes {
-                if p.to_ascii_lowercase().ends_with(".exe") {
+                if p.len() >= 4 && p.get(p.len() - 4..).is_some_and(|t| t.eq_ignore_ascii_case(".exe")) {
+                    p.truncate(p.len() - 4);
+                }
+            }
+        }
+        for list in [&mut self.doctor.keep, &mut self.doctor.close, &mut self.doctor.close_while_unreal] {
+            for p in list.iter_mut() {
+                if p.len() >= 4 && p.get(p.len() - 4..).is_some_and(|t| t.eq_ignore_ascii_case(".exe")) {
                     p.truncate(p.len() - 4);
                 }
             }
@@ -622,6 +768,10 @@ impl Config {
 
     fn validate(&self) -> Result<(), String> {
         let pct_ok = |v: Option<f64>| v.map_or(true, |p| p.is_finite() && (0.0..=100.0).contains(&p));
+        let cpu_rate_ok = |v: Option<u32>| v.is_none_or(|r| r <= 100);
+        if self.foreground_grace_sec > 3600 {
+            return Err("foreground_grace_sec must be between 0 and 3600".into());
+        }
         let mut names: Vec<&str> = Vec::new();
         for g in &self.groups {
             let name = g.name.trim();
@@ -642,6 +792,9 @@ impl Config {
             if !pct_ok(g.trim_above_pct) || policies.iter().any(|p| p.as_ref().is_some_and(|p| !pct_ok(p.trim_above_pct))) {
                 return Err(format!("group \"{}\": trim_above_pct must be between 0 and 100", g.name));
             }
+            if !cpu_rate_ok(g.cpu_rate_pct) || policies.iter().any(|p| p.as_ref().is_some_and(|p| !cpu_rate_ok(p.cpu_rate_pct))) {
+                return Err(format!("group \"{}\": cpu_rate_pct must be between 0 and 100", g.name));
+            }
         }
         if !(1..=3650).contains(&self.history.keep_days) {
             return Err("history.keep_days must be between 1 and 3650".into());
@@ -657,6 +810,24 @@ impl Config {
         for v in [p.elevated_ram_free_pct, p.elevated_commit_free_pct, p.critical_ram_free_pct, p.critical_commit_free_pct] {
             if !(v.is_finite() && (0.0..=100.0).contains(&v)) {
                 return Err("pressure percentages must be between 0 and 100".into());
+            }
+        }
+        if !(p.hysteresis_pct.is_finite() && (0.0..=50.0).contains(&p.hysteresis_pct)) {
+            return Err("pressure.hysteresis_pct must be between 0 and 50".into());
+        }
+        if !(p.hysteresis_gb.is_finite() && p.hysteresis_gb >= 0.0) {
+            return Err("pressure.hysteresis_gb must be 0 or more".into());
+        }
+        if !(self.doctor.nudge_above_gb.is_finite() && self.doctor.nudge_above_gb >= 0.0) {
+            return Err("doctor.nudge_above_gb must be 0 or more".into());
+        }
+        for (field, list) in [
+            ("doctor.keep", &self.doctor.keep),
+            ("doctor.close", &self.doctor.close),
+            ("doctor.close_while_unreal", &self.doctor.close_while_unreal),
+        ] {
+            if list.iter().any(|p| p.trim().is_empty()) {
+                return Err(format!("{}: entries cannot be empty", field));
             }
         }
         let hk = self.general.prime_hotkey.trim();
@@ -707,11 +878,17 @@ impl Config {
         load_layered().map(|(c, _)| c)
     }
 
-    /// Load settings, falling back to the built-in defaults if a file is broken.
+    /// Load settings, falling back to `team.toml` over built-in defaults if `settings.toml`
+    /// is broken, or built-in defaults alone if `team.toml` is absent/broken.
     pub fn load_or_default() -> (Config, Option<String>) {
         match Config::load() {
             Ok(c) => (c, None),
-            Err(e) => (Config::builtin(), Some(e)),
+            Err(e) => {
+                let cfg = Store::real()
+                    .load_team_over_builtin()
+                    .unwrap_or_else(Config::builtin);
+                (cfg, Some(e))
+            }
         }
     }
 }
@@ -734,6 +911,7 @@ pub fn any_matches(patterns: &[String], name: &str) -> bool {
 /// `name_matches`, without lowercasing both sides on every comparison.
 #[derive(Debug, Clone, Default)]
 pub struct Patterns {
+    match_all: bool,
     exact: Vec<String>,
     prefixes: Vec<String>,
 }
@@ -743,21 +921,82 @@ impl Patterns {
         let mut out = Patterns::default();
         for p in patterns {
             let p = p.to_ascii_lowercase();
+            if p == "*" {
+                out.match_all = true;
+                continue;
+            }
             match p.strip_suffix('*') {
-                Some(prefix) => out.prefixes.push(prefix.to_string()),
+                Some(prefix) => {
+                    if prefix.is_empty() {
+                        out.match_all = true;
+                    } else {
+                        out.prefixes.push(prefix.to_string());
+                    }
+                }
                 None => out.exact.push(p),
             }
+        }
+        if out.match_all {
+            out.exact.clear();
+            out.prefixes.clear();
+            return out;
+        }
+        out.exact.sort();
+        out.exact.dedup();
+        out.prefixes.sort();
+        out.prefixes.dedup();
+        let mut minimal: Vec<String> = Vec::with_capacity(out.prefixes.len());
+        for p in out.prefixes {
+            if !minimal.last().is_some_and(|prev| p.starts_with(prev.as_str())) {
+                minimal.push(p);
+            }
+        }
+        out.prefixes = minimal;
+        if !out.prefixes.is_empty() {
+            out.exact.retain(|e| !out.prefixes.iter().any(|p| e.starts_with(p.as_str())));
         }
         out
     }
 
+    pub fn is_empty(&self) -> bool {
+        !self.match_all && self.exact.is_empty() && self.prefixes.is_empty()
+    }
+
     /// Does `lower_name` (already ASCII-lowercased) match any pattern?
     pub fn matches_lower(&self, lower_name: &str) -> bool {
-        self.exact.iter().any(|p| p == lower_name) || self.prefixes.iter().any(|p| lower_name.starts_with(p.as_str()))
+        if self.match_all {
+            return true;
+        }
+        self.exact.binary_search_by(|p| p.as_str().cmp(lower_name)).is_ok()
+            || self.prefixes.iter().any(|p| lower_name.starts_with(p.as_str()))
     }
 
     pub fn matches(&self, name: &str) -> bool {
         self.matches_lower(&name.to_ascii_lowercase())
+    }
+}
+
+/// Pre-compiled matchers for `ue.protect`, `ue.workers`, and `cfg.active_groups()`.
+#[derive(Debug, Clone, Default)]
+pub struct CompiledPatterns {
+    pub protect: Patterns,
+    pub workers: Patterns,
+    /// One `Patterns` per `cfg.active_groups()`, in the same order.
+    pub groups: Vec<Patterns>,
+}
+
+impl CompiledPatterns {
+    pub fn from_config(cfg: &Config) -> Self {
+        CompiledPatterns {
+            protect: Patterns::new(&cfg.ue.protect),
+            workers: Patterns::new(&cfg.ue.workers),
+            groups: cfg.active_groups().map(|g| Patterns::new(&g.processes)).collect(),
+        }
+    }
+
+    /// Index into `groups` (matching `cfg.active_groups()`) of the first group matching `lower_name`.
+    pub fn first_group_lower(&self, lower_name: &str) -> Option<usize> {
+        self.groups.iter().position(|p| p.matches_lower(lower_name))
     }
 }
 
@@ -865,29 +1104,20 @@ fn layer_warnings(label: &str, t: &toml::Table, out: &mut Vec<String>) {
     }
 }
 
-/// The merged table for built-in + the given layers, in order.
-fn merge_layers(layers: &[(&str, &str)], warnings: &mut Vec<String>) -> Result<toml::Table, String> {
-    let mut merged = parse_table("built-in defaults", BUILTIN_TOML)?;
-    for (label, text) in layers {
-        let t = parse_table(label, text)?;
-        layer_warnings(label, &t, warnings);
-        merge_tables(&mut merged, &t, true).map_err(|e| format!("{}: {}", label, e))?;
-    }
-    Ok(merged)
-}
-
 /// Pure layering: built-in, then `team` (if any), then `user`. Errors name the layer at fault.
 pub fn config_from_layers(team: Option<&str>, user: &str) -> Result<(Config, Vec<String>), String> {
     let mut warnings = Vec::new();
-    let mut layers: Vec<(&str, &str)> = Vec::new();
+    let mut merged = builtin_table_ref().clone();
     if let Some(t) = team {
-        layers.push(("team.toml", t));
-        // Check the team layer on its own first, so a mistake there is reported as such.
-        let mut w = Vec::new();
-        Config::from_table(merge_layers(&layers, &mut w)?).map_err(|e| format!("team.toml: {}", e))?;
+        let tt = parse_table("team.toml", t)?;
+        layer_warnings("team.toml", &tt, &mut warnings);
+        merge_tables(&mut merged, &tt, true).map_err(|e| format!("team.toml: {}", e))?;
+        // Validate the team layer on its own first, so a mistake there is reported as such.
+        Config::from_table(merged.clone()).map_err(|e| format!("team.toml: {}", e))?;
     }
-    layers.push(("settings.toml", user));
-    let merged = merge_layers(&layers, &mut warnings)?;
+    let ut = parse_table("settings.toml", user)?;
+    layer_warnings("settings.toml", &ut, &mut warnings);
+    merge_tables(&mut merged, &ut, true).map_err(|e| format!("settings.toml: {}", e))?;
     let cfg = Config::from_table(merged).map_err(|e| format!("settings.toml: {}", e))?;
     Ok((cfg, warnings))
 }
@@ -902,21 +1132,49 @@ pub fn is_untouched_v01(text: &str) -> bool {
     V01_DEFAULTS.iter().any(|d| normalize(d) == t)
 }
 
-/// Write `text` to `path` through a temp file and a rename, so readers never see half a file.
-fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
+static TMP_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// Write `data` to `path` through a unique same-directory temp file and a retry-protected rename.
+pub fn write_atomic_bytes(path: &Path, data: &[u8]) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         if !dir.as_os_str().is_empty() {
             fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
         }
     }
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    fs::write(&tmp, text).map_err(|e| format!("{}: {}", tmp.display(), e))?;
-    fs::rename(&tmp, path).map_err(|e| {
+    let nonce = TMP_NONCE.fetch_add(1, Ordering::Relaxed);
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let tmp_name = format!("{}.{}.{}.tmp", file_name, std::process::id(), nonce);
+    let tmp = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(tmp_name),
+        _ => PathBuf::from(tmp_name),
+    };
+    if let Err(e) = fs::write(&tmp, data) {
         let _ = fs::remove_file(&tmp);
-        format!("{}: {}", path.display(), e)
-    })
+        return Err(format!("{}: {}", tmp.display(), e));
+    }
+    let backoffs = [5u64, 10, 20, 40, 80, 160];
+    let mut last_err = None;
+    for (i, &ms) in backoffs.iter().enumerate() {
+        match fs::rename(&tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let retryable = e.kind() == std::io::ErrorKind::PermissionDenied
+                    || matches!(e.raw_os_error(), Some(5 | 32 | 33));
+                last_err = Some(e);
+                if !retryable || i + 1 == backoffs.len() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+        }
+    }
+    let _ = fs::remove_file(&tmp);
+    Err(format!("{}: {}", path.display(), last_err.expect("at least one attempt")))
+}
+
+/// Write `text` to `path` through a temp file and a rename, so readers never see half a file.
+pub fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
+    write_atomic_bytes(path, text.as_bytes())
 }
 
 // ---------------------------------------------------------------- paths inside the settings
@@ -1065,6 +1323,14 @@ fn user_group<'a>(doc: &'a mut toml_edit::DocumentMut, name: &str) -> Result<&'a
 
 // ---------------------------------------------------------------- the settings store
 
+struct LoadedState {
+    merged: toml::Table,
+    team: Option<toml::Table>,
+    user: toml::Table,
+    cfg: Config,
+    warnings: Vec<String>,
+}
+
 /// The settings files in one data folder. The public functions use the real data folder;
 /// tests use a temp folder.
 struct Store {
@@ -1122,26 +1388,54 @@ impl Store {
         Self::read(&self.user_path())
     }
 
-    fn load(&self) -> Result<(Config, Vec<String>), String> {
+    /// Single-read, single-parse load of `settings.toml` and `team.toml` over cached `BUILTIN_TOML`.
+    fn load_state(&self) -> Result<LoadedState, String> {
+        let user_label = self.user_path().display().to_string();
         let mut warnings: Vec<String> = self.ensure_user_file()?.into_iter().collect();
-        let user = Self::read(&self.user_path())?;
-        let team = match self.team_text() {
+        let user_str = Self::read(&self.user_path())?;
+        let user_table = parse_table("settings.toml", &user_str)
+            .map_err(|e| e.replace("settings.toml:", &format!("{}:", user_label)))?;
+
+        let team_text = match self.team_text() {
             Ok(t) => t,
             Err(e) => {
                 warnings.push(format!("{}; team settings ignored", e));
                 None
             }
         };
-        let result = match config_from_layers(team.as_deref(), &user) {
-            Err(e) if team.is_some() && e.starts_with("team.toml") => {
-                warnings.push(format!("{}; team settings ignored", e));
-                config_from_layers(None, &user)
+
+        let mut merged = builtin_table_ref().clone();
+        let mut valid_team: Option<toml::Table> = None;
+        if let Some(t_str) = team_text.as_deref() {
+            let mut team_try = merged.clone();
+            let mut team_warnings = Vec::new();
+            let team_res = parse_table("team.toml", t_str).and_then(|tt| {
+                layer_warnings("team.toml", &tt, &mut team_warnings);
+                merge_tables(&mut team_try, &tt, true).map_err(|e| format!("team.toml: {}", e))?;
+                Config::from_table(team_try.clone()).map_err(|e| format!("team.toml: {}", e))?;
+                Ok(tt)
+            });
+            match team_res {
+                Ok(tt) => {
+                    merged = team_try;
+                    valid_team = Some(tt);
+                    warnings.extend(team_warnings);
+                }
+                Err(e) => {
+                    warnings.push(format!("{}; team settings ignored", e));
+                }
             }
-            r => r,
-        };
-        let (cfg, w) = result.map_err(|e| e.replace("settings.toml:", &format!("{}:", self.user_path().display())))?;
-        warnings.extend(w);
-        Ok((cfg, warnings))
+        }
+
+        layer_warnings("settings.toml", &user_table, &mut warnings);
+        merge_tables(&mut merged, &user_table, true).map_err(|e| format!("{}: {}", user_label, e))?;
+        let cfg = Config::from_table(merged.clone()).map_err(|e| format!("{}: {}", user_label, e))?;
+        Ok(LoadedState { merged, team: valid_team, user: user_table, cfg, warnings })
+    }
+
+    fn load(&self) -> Result<(Config, Vec<String>), String> {
+        let state = self.load_state()?;
+        Ok((state.cfg, state.warnings))
     }
 
     /// Validate a new user-layer text against the current team layer.
@@ -1215,20 +1509,34 @@ impl Store {
         self.save_user(&doc)
     }
 
-    fn layer_tables(&self) -> (Option<toml::Table>, Option<toml::Table>) {
-        let user = self.user_text().ok().and_then(|t| t.parse::<toml::Table>().ok());
-        let team = self.team_text().ok().flatten().and_then(|t| t.parse::<toml::Table>().ok());
-        (team, user)
+    fn user_table_only(&self) -> Option<toml::Table> {
+        self.user_text().ok().and_then(|t| t.parse::<toml::Table>().ok())
+    }
+
+    fn valid_team_table(&self) -> Option<toml::Table> {
+        let t_str = self.team_text().ok().flatten()?;
+        let tt = parse_table("team.toml", &t_str).ok()?;
+        let mut team_try = builtin_table_ref().clone();
+        merge_tables(&mut team_try, &tt, true).ok()?;
+        Config::from_table(team_try).ok()?;
+        Some(tt)
+    }
+
+    fn load_team_over_builtin(&self) -> Option<Config> {
+        let t_str = self.team_text().ok().flatten()?;
+        let tt = parse_table("team.toml", &t_str).ok()?;
+        let mut team_try = builtin_table_ref().clone();
+        merge_tables(&mut team_try, &tt, true).ok()?;
+        Config::from_table(team_try).ok()
     }
 
     fn layer(&self, path: &str) -> Layer {
         let Ok(p) = SettingPath::parse(path) else {
             return Layer::Builtin;
         };
-        let (team, user) = self.layer_tables();
-        if user.as_ref().is_some_and(|t| layer_decides(t, &p)) {
+        if self.user_table_only().as_ref().is_some_and(|t| layer_decides(t, &p)) {
             Layer::User
-        } else if team.as_ref().is_some_and(|t| layer_decides(t, &p)) {
+        } else if self.valid_team_table().as_ref().is_some_and(|t| layer_decides(t, &p)) {
             Layer::Team
         } else {
             Layer::Builtin
@@ -1236,24 +1544,21 @@ impl Store {
     }
 
     fn effective_table(&self) -> Result<toml::Table, String> {
-        // Load first so the same rules apply (a broken team file is skipped).
-        let (_, warnings) = self.load()?;
-        let team_ok = !warnings.iter().any(|w| w.contains("team settings ignored"));
-        let user = Self::read(&self.user_path())?;
-        let team = if team_ok { self.team_text()? } else { None };
-        let mut layers = Vec::new();
-        if let Some(t) = team.as_deref() {
-            layers.push(("team.toml", t));
-        }
-        layers.push(("settings.toml", user.as_str()));
-        merge_layers(&layers, &mut Vec::new())
+        Ok(self.load_state()?.merged)
     }
 
     fn resolve(&self, path: &str) -> Option<Resolved<toml::Value>> {
         let p = SettingPath::parse(path).ok()?;
-        let merged = self.effective_table().ok()?;
-        let value = lookup(&merged, &p)?.clone();
-        Some(Resolved { value, from: self.layer(path) })
+        let state = self.load_state().ok()?;
+        let value = lookup(&state.merged, &p)?.clone();
+        let from = if layer_decides(&state.user, &p) {
+            Layer::User
+        } else if state.team.as_ref().is_some_and(|t| layer_decides(t, &p)) {
+            Layer::Team
+        } else {
+            Layer::Builtin
+        };
+        Some(Resolved { value, from })
     }
 
     fn effective_toml(&self) -> Result<String, String> {
@@ -1268,9 +1573,8 @@ impl Store {
     }
 
     fn group_in_lower_layers(&self, name: &str) -> bool {
-        let builtin = parse_table("built-in defaults", BUILTIN_TOML).expect("built-in defaults parse");
-        let (team, _) = self.layer_tables();
-        find_group(&builtin, name).is_some() || team.as_ref().is_some_and(|t| find_group(t, name).is_some())
+        find_group(builtin_table_ref(), name).is_some()
+            || self.valid_team_table().as_ref().is_some_and(|t| find_group(t, name).is_some())
     }
 
     fn add_group(&self, name: &str, processes: &[String]) -> Result<(), String> {
@@ -1329,6 +1633,11 @@ impl Store {
 /// `team.toml` in the data folder.
 pub fn team_file() -> PathBuf {
     Store::real().team_path()
+}
+
+/// Whether `team.toml` exists and is valid (active policy layer).
+pub fn has_valid_team_file() -> bool {
+    Store::real().valid_team_table().is_some()
 }
 
 /// Effective settings (built-in < team.toml < settings.toml) and warnings worth showing:
@@ -1550,7 +1859,8 @@ enabled = false
         assert_eq!(cfg.general.preset, Preset::Gentle); // team
         assert!(!cfg.general.auto_prime); // user
         assert!(cfg.ue.worker_throttle); // team, rest of [ue] from built-in
-        assert_eq!(cfg.ue.protect.len(), 21);
+        assert_eq!(cfg.ue.protect.len(), 29);
+        assert_eq!(cfg.ue.workers.len(), 17);
         let names: Vec<&str> = cfg.groups.iter().map(|g| g.name.as_str()).collect();
         assert_eq!(names, ["Browsers", "Chat", "Agents", "Background", "Tools"]);
         let b = &cfg.groups[0];
@@ -1840,5 +2150,112 @@ trim_above_mb = 2048 # tuned by hand
         let before = user(&other);
         assert!(other.import(&file).is_err());
         assert_eq!(user(&other), before);
+    }
+
+    #[test]
+    fn empty_parse_defaults_and_avenue2_knobs() {
+        let cfg = Config::parse("").unwrap();
+        assert_eq!(cfg.trim_cooldown_sec, 120);
+        assert_eq!(cfg.foreground_grace_sec, 45);
+        assert!(!cfg.general.elevated_helper);
+        assert_eq!(cfg.pressure.hysteresis_pct, 2.0);
+        assert_eq!(cfg.pressure.hysteresis_gb, 2.0);
+        assert_eq!(cfg.doctor, DoctorSettings::default());
+
+        let builtin = Config::builtin();
+        for tool in ["UnrealHeaderTool", "UnrealLightmass", "UnrealPak", "UbaHost", "UbaAgent", "LiveCodingConsole", "dxc", "fxc", "ispc", "rc", "lib", "llvm-lib"] {
+            assert!(builtin.ue.protect.iter().any(|p| p == tool), "protect missing {}", tool);
+            assert!(builtin.ue.workers.iter().any(|w| w == tool), "workers missing {}", tool);
+        }
+        assert_eq!(builtin.groups[3].io_priority, Some(IoPriority::VeryLow));
+
+        let s = temp_store();
+        fs::write(s.user_path(), DEFAULT_TOML).unwrap();
+        s.set("foreground_grace_sec", toml_edit::value(60)).unwrap();
+        s.set("general.elevated_helper", toml_edit::value(true)).unwrap();
+        s.set("pressure.hysteresis_pct", toml_edit::value(3.5)).unwrap();
+        s.set("pressure.hysteresis_gb", toml_edit::value(4.0)).unwrap();
+        s.set("group.Browsers.io_priority", toml_edit::value("low")).unwrap();
+        s.set("group.Browsers.ws_cap_mb", toml_edit::value(2048)).unwrap();
+        s.set("group.Browsers.ws_cap_per_process_mb", toml_edit::value(512)).unwrap();
+        s.set("group.Browsers.cpu_rate_pct", toml_edit::value(30)).unwrap();
+        s.set("doctor.keep", toml_edit::value(toml_edit::Array::from_iter(["Steam.exe"]))).unwrap();
+        s.set("doctor.nudge_above_gb", toml_edit::value(6.5)).unwrap();
+
+        let (loaded, _) = s.load().unwrap();
+        assert_eq!(loaded.foreground_grace_sec, 60);
+        assert!(loaded.general.elevated_helper);
+        assert_eq!(loaded.pressure.hysteresis_pct, 3.5);
+        assert_eq!(loaded.pressure.hysteresis_gb, 4.0);
+        assert_eq!(loaded.groups[0].io_priority, Some(IoPriority::Low));
+        assert_eq!(loaded.groups[0].ws_cap_mb, 2048);
+        assert_eq!(loaded.groups[0].ws_cap_per_process_mb, 512);
+        assert_eq!(loaded.groups[0].cpu_rate_pct, Some(30));
+        assert_eq!(loaded.doctor.keep, vec!["Steam".to_string()]);
+        assert_eq!(loaded.doctor.nudge_above_gb, 6.5);
+        assert_eq!(s.resolve("doctor.ignore_below_mb").unwrap().from, Layer::Builtin);
+        assert_eq!(s.resolve("doctor.keep").unwrap().from, Layer::User);
+
+        assert!(s.set("group.Browsers.cpu_rate_pct", toml_edit::value(150)).is_err());
+        assert!(s.set("foreground_grace_sec", toml_edit::value(4000)).is_err());
+        assert!(s.set("pressure.hysteresis_pct", toml_edit::value(80.0)).is_err());
+        assert!(s.set("doctor.nudge_above_gb", toml_edit::value(-1.0)).is_err());
+    }
+
+    #[test]
+    fn compiled_patterns_and_write_atomic_bytes_work() {
+        let cfg = Config::builtin();
+        let compiled = cfg.compile_patterns();
+        assert!(compiled.protect.matches("UnrealEditor-Win64-Development"));
+        assert!(compiled.workers.matches("UbaAgent"));
+        assert_eq!(compiled.first_group_lower("chrome"), Some(0));
+        assert_eq!(compiled.first_group_lower("slack"), Some(1));
+        assert_eq!(compiled.first_group_lower("codex"), Some(2));
+        assert_eq!(compiled.first_group_lower("spotify"), Some(3));
+        assert_eq!(compiled.first_group_lower("notepad"), None);
+
+        // Subsumed prefix + exact matching.
+        let p = Patterns::new(&["UnrealEditor*".into(), "Unreal*".into(), "UnrealBuildTool".into(), "cl".into()]);
+        assert!(!p.is_empty());
+        assert!(p.matches("UnrealBuildTool"));
+        assert!(p.matches("cl"));
+        assert!(!p.matches("clang-cl"));
+
+        let s = temp_store();
+        let target = s.dir.join("blob.bin");
+        write_atomic_bytes(&target, b"first").unwrap();
+        write_atomic_bytes(&target, b"second").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"second");
+        let leftover: Vec<_> = fs::read_dir(&s.dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftover.is_empty(), "leftover tmp files: {:?}", leftover);
+    }
+
+    #[test]
+    fn invalid_team_toml_is_ignored_consistently_and_empty_doctor_exe_rejected() {
+        let s = temp_store();
+        fs::write(s.user_path(), "").unwrap();
+        // Syntactically valid TOML, but invalid config (unknown preset + group missing processes).
+        fs::write(
+            s.team_path(),
+            "[general]\npreset = \"fast\"\n\n[[group]]\nname = \"BrokenTeamGrp\"\n",
+        )
+        .unwrap();
+
+        let resolved = s.resolve("general.preset").expect("resolve preset");
+        assert_eq!(resolved.from, Layer::Builtin);
+        assert_eq!(resolved.value.as_str(), Some("balanced"));
+        assert_eq!(s.layer("general.preset"), Layer::Builtin);
+        assert!(!s.group_in_lower_layers("BrokenTeamGrp"));
+        let err = s.remove_group("BrokenTeamGrp").unwrap_err();
+        assert!(err.contains("there is no group named"), "unexpected error: {}", err);
+
+        // Empty or ".exe"-only entries in doctor lists are rejected after .exe stripping.
+        assert!(Config::parse("[doctor]\nkeep = [\".exe\"]\n").is_err());
+        assert!(Config::parse("[doctor]\nclose = [\"\"]\n").is_err());
+        assert!(Config::parse("[doctor]\nclose_while_unreal = [\"  .EXE\"]\n").is_err());
     }
 }

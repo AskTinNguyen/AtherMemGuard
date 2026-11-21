@@ -3,10 +3,10 @@
 //! new one grows at the new place; once the new place has been written to, the old one shows
 //! up in the disk checkup as "Old cache, no longer used".
 //!
-//! Handled: `UE-LocalDataCachePath`, `NUGET_PACKAGES`, `npm_config_cache`, `PIP_CACHE_DIR`,
-//! `VCPKG_DEFAULT_BINARY_CACHE`. Never `CARGO_HOME` (it holds `cargo.exe`, on PATH),
-//! `GRADLE_USER_HOME` (settings and credentials) or `%TEMP%`. Zen's data path variable is not
-//! confirmed, so Zen is not moved.
+//! Handled: `UE-LocalDataCachePath`, `UE-ZenSubprocessDataPath`, `NUGET_PACKAGES`,
+//! `npm_config_cache`, `PIP_CACHE_DIR`, `UV_CACHE_DIR`, `PNPM_STORE_DIR`, `YARN_CACHE_FOLDER`,
+//! `BUN_INSTALL_CACHE_DIR`, `VCPKG_DEFAULT_BINARY_CACHE`, `SCCACHE_DIR`. Never `CARGO_HOME`
+//! (it holds `cargo.exe`, on PATH), `GRADLE_USER_HOME` (settings and credentials) or `%TEMP%`.
 //!
 //! The registry writes are behind `EnvStore`. The real one is `HKCU\Environment` plus a
 //! `WM_SETTINGCHANGE` broadcast; `ATHER_MEMGUARD_ENV_KEY` points it at a test key, which must
@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 use crate::config::DiskSettings;
 use crate::disk_space::{gb2, norm};
 use crate::engine::Level;
+use crate::win::{decode_reg_string, RegError, RegHive, RegKey, REG_EXPAND_SZ_TYPE};
 
 pub const ENV_KEY_VAR: &str = "ATHER_MEMGUARD_ENV_KEY";
 pub const TEST_KEY_PREFIX: &str = r"Software\AtherMemGuard-test\";
@@ -72,49 +73,36 @@ impl RegistryEnv {
     }
 }
 
-fn hkcu() -> winreg::RegKey {
-    winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
-}
-
-fn utf16_bytes(s: &str) -> Vec<u8> {
-    s.encode_utf16().chain(std::iter::once(0)).flat_map(|c| c.to_le_bytes()).collect()
-}
-
 impl EnvStore for RegistryEnv {
     fn get(&self, name: &str) -> Result<Option<EnvValue>, String> {
-        use winreg::enums::RegType;
-        let key = match hkcu().open_subkey(&self.subkey) {
+        let key = match RegKey::open_read(RegHive::Hkcu, &self.subkey) {
             Ok(k) => k,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(RegError::NotFound) => return Ok(None),
             Err(e) => return Err(e.to_string()),
         };
-        match key.get_raw_value(name) {
-            Ok(v) => {
-                let units: Vec<u16> = v.bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-                let n = units.iter().position(|&c| c == 0).unwrap_or(units.len());
-                Ok(Some(EnvValue { value: String::from_utf16_lossy(&units[..n]), expand: v.vtype == RegType::REG_EXPAND_SZ }))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        match key.get_raw(name) {
+            Ok((vtype, bytes)) => Ok(Some(EnvValue {
+                value: decode_reg_string(&bytes),
+                expand: vtype == REG_EXPAND_SZ_TYPE,
+            })),
+            Err(RegError::NotFound) => Ok(None),
             Err(e) => Err(e.to_string()),
         }
     }
 
     fn set(&self, name: &str, v: &EnvValue) -> Result<(), String> {
-        use winreg::enums::RegType;
-        let (key, _) = hkcu().create_subkey(&self.subkey).map_err(|e| e.to_string())?;
-        let rv = winreg::RegValue { bytes: utf16_bytes(&v.value), vtype: if v.expand { RegType::REG_EXPAND_SZ } else { RegType::REG_SZ } };
-        key.set_raw_value(name, &rv).map_err(|e| e.to_string())
+        crate::win::reg_set_string(RegHive::Hkcu, &self.subkey, name, &v.value, v.expand)
+            .map_err(|e| e.to_string())
     }
 
     fn remove(&self, name: &str) -> Result<(), String> {
-        let key = match hkcu().open_subkey_with_flags(&self.subkey, winreg::enums::KEY_SET_VALUE) {
+        let key = match RegKey::open_set_value(RegHive::Hkcu, &self.subkey) {
             Ok(k) => k,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(RegError::NotFound) => return Ok(()),
             Err(e) => return Err(e.to_string()),
         };
         match key.delete_value(name) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(()) | Err(RegError::NotFound) => Ok(()),
             Err(e) => Err(e.to_string()),
         }
     }
@@ -147,12 +135,19 @@ pub fn cache_vars() -> Vec<CacheVar> {
     let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
     let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
     let l = |p: &str| local.as_ref().map(|b| b.join(p));
+    let h = |p: &str| home.as_ref().map(|b| b.join(p));
     vec![
         CacheVar { name: "UE-LocalDataCachePath", what: "Unreal's shared cache (DDC)", default: l(r"UnrealEngine\Common\DerivedDataCache"), sub: r"UnrealEngine\DerivedDataCache" },
-        CacheVar { name: "NUGET_PACKAGES", what: "NuGet packages", default: home.as_ref().map(|h| h.join(r".nuget\packages")), sub: r"NuGet\packages" },
+        CacheVar { name: "UE-ZenSubprocessDataPath", what: "Unreal's Zen cache", default: l(r"UnrealEngine\Common\Zen"), sub: r"UnrealEngine\Zen" },
+        CacheVar { name: "NUGET_PACKAGES", what: "NuGet packages", default: h(r".nuget\packages"), sub: r"NuGet\packages" },
         CacheVar { name: "npm_config_cache", what: "npm cache", default: l("npm-cache"), sub: "npm-cache" },
         CacheVar { name: "PIP_CACHE_DIR", what: "pip cache", default: l(r"pip\cache"), sub: r"pip\cache" },
+        CacheVar { name: "UV_CACHE_DIR", what: "uv cache", default: l(r"uv\cache"), sub: r"uv\cache" },
+        CacheVar { name: "PNPM_STORE_DIR", what: "pnpm store", default: l(r"pnpm\store"), sub: r"pnpm\store" },
+        CacheVar { name: "YARN_CACHE_FOLDER", what: "Yarn cache", default: l(r"Yarn\Cache"), sub: r"Yarn\Cache" },
+        CacheVar { name: "BUN_INSTALL_CACHE_DIR", what: "Bun install cache", default: h(r".bun\install\cache"), sub: r"bun\cache" },
         CacheVar { name: "VCPKG_DEFAULT_BINARY_CACHE", what: "vcpkg binary cache", default: l(r"vcpkg\archives"), sub: r"vcpkg\archives" },
+        CacheVar { name: "SCCACHE_DIR", what: "sccache compiler cache", default: l(r"Mozilla\sccache"), sub: "sccache" },
     ]
 }
 
@@ -274,7 +269,6 @@ pub fn plan(vars: &[VarState], system: Option<&str>, vols: &[DestVolume], to: Op
         entries.push(PlanEntry { name: v.name.clone(), what: v.what.clone(), old_location: v.location.clone(), new_location: None, size: v.size, size_partial: v.size_partial, action: action.into(), reason });
     }
     let mut notes: Vec<String> = NEVER.iter().map(|(n, why)| format!("{} is never moved: {}.", n, why)).collect();
-    notes.push("Zen's cache isn't moved: its data path setting isn't confirmed yet.".into());
     notes.push("Nothing is copied or deleted. The old caches stay where they are until you remove them, so total use goes up at first.".into());
     notes.push("NuGet needs a restore afterwards (dotnet restore, or a build in Visual Studio), which downloads the packages again over the network.".into());
     notes.push("vcpkg, npm, pip, NuGet and Unreal fail or start over if the new drive is missing (unplugged, or its letter changed): keep it connected, or undo with memguard disk relocate --undo.".into());
@@ -309,7 +303,16 @@ pub fn plan(vars: &[VarState], system: Option<&str>, vols: &[DestVolume], to: Op
                 gb2(room),
                 gb2(crate::disk::threshold(s.elevated_free_gb, s.elevated_free_pct, v.total))
             )),
-            Some(v) => Ok((v, folder.trim_end_matches('\\').to_string())),
+            Some(v) => {
+                let normalized = folder.replace('/', "\\");
+                let trimmed = normalized.trim_end_matches('\\');
+                let clean = if trimmed.len() == 2 && trimmed.ends_with(':') {
+                    format!("{}\\", trimmed)
+                } else {
+                    trimmed.to_string()
+                };
+                Ok((v, clean))
+            }
         },
         None => vols
             .iter()
@@ -332,9 +335,10 @@ pub fn plan(vars: &[VarState], system: Option<&str>, vols: &[DestVolume], to: Op
             p.dest_free_now = Some(v.avail);
             p.dest_free_after = Some(v.avail.saturating_sub(need));
             let mut entries = std::mem::take(&mut p.entries);
+            let base = folder.trim_end_matches(['\\', '/']);
             for (e, var) in entries.iter_mut().zip(vars) {
                 if e.action == "set" {
-                    e.new_location = Some(format!("{}\\{}", folder, var.sub));
+                    e.new_location = Some(format!("{}\\{}", base, var.sub));
                 }
             }
             p.entries = entries;
@@ -358,7 +362,15 @@ pub fn to_path_problem(folder: &str) -> Option<String> {
 }
 
 /// Read this PC: every variable's current value (from `store`), where its cache is, how big.
+/// Skips `sizer` for caches already off the system drive (`!on_system`), since `plan()` skips them.
 pub fn read_vars(store: &dyn EnvStore, sizer: &dyn Fn(&str) -> Option<(u64, bool)>) -> Vec<VarState> {
+    let sys = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+    let sys_root = if sys.ends_with('\\') { sys } else { format!("{}\\", sys) };
+    let system = crate::disk_win::volume_of(&sys_root).map(|(_, g)| g);
+    read_vars_for_system(store, system.as_deref(), sizer)
+}
+
+fn read_vars_for_system(store: &dyn EnvStore, system: Option<&str>, sizer: &dyn Fn(&str) -> Option<(u64, bool)>) -> Vec<VarState> {
     cache_vars()
         .into_iter()
         .map(|cv| {
@@ -371,7 +383,12 @@ pub fn read_vars(store: &dyn EnvStore, sizer: &dyn Fn(&str) -> Option<(u64, bool
                 .unwrap_or_default();
             let exists = !location.is_empty() && Path::new(&location).is_dir();
             let volume = if location.is_empty() { None } else { existing_volume(&location) };
-            let counted = if exists { sizer(&location) } else { None };
+            let on_system = match (&volume, system) {
+                (Some(v), Some(s)) => v.eq_ignore_ascii_case(s),
+                (None, _) => false,
+                (_, None) => true,
+            };
+            let counted = if exists && on_system { sizer(&location) } else { None };
             let (size, size_partial) = match counted {
                 Some((bytes, complete)) => (Some(bytes), !complete),
                 None => (None, false),
@@ -461,10 +478,10 @@ pub fn apply(p: &RelocatePlan, store: &dyn EnvStore, files: &crate::disk_clean::
         let Some(new) = &e.new_location else { continue };
         std::fs::create_dir_all(new).map_err(|err| format!("couldn't make {}: {}", new, err))?;
         let previous = store.get(&e.name)?;
-        rec.entries.push(RecordEntry { name: e.name.clone(), previous, new_value: new.clone(), old_location: e.old_location.clone() });
-        // Save the record before each write, so a failure part-way can still be undone.
-        files.save_relocate_record(&rec)?;
         store.set(&e.name, &EnvValue { value: new.clone(), expand: false })?;
+        rec.entries.push(RecordEntry { name: e.name.clone(), previous, new_value: new.clone(), old_location: e.old_location.clone() });
+        // Persist after each committed write, so a later failure remains cleanly undoable.
+        files.save_relocate_record(&rec)?;
     }
     store.broadcast();
     crate::log::write(&format!("disk: relocated caches in {}: {}", rec.store, rec.entries.iter().map(|e| format!("{}={}", e.name, e.new_value)).collect::<Vec<_>>().join(", ")));
@@ -852,12 +869,13 @@ mod tests {
         k.remove("PIP_CACHE_DIR").unwrap();
         k.remove("PIP_CACHE_DIR").unwrap();
         assert_eq!(k.get("PIP_CACHE_DIR").unwrap(), None);
-        let _ = hkcu().delete_subkey_all(&sub);
-        let parent = hkcu().open_subkey(r"Software\AtherMemGuard-test").ok();
-        if parent.is_some_and(|p| p.enum_keys().next().is_none() && p.enum_values().next().is_none()) {
-            let _ = hkcu().delete_subkey(r"Software\AtherMemGuard-test");
+        let _ = crate::win::reg_delete_tree(RegHive::Hkcu, &sub);
+        if let Ok(parent) = RegKey::open_read(RegHive::Hkcu, r"Software\AtherMemGuard-test") {
+            if parent.enum_keys().is_ok_and(|k| k.is_empty()) && parent.enum_values().is_ok_and(|v| v.is_empty()) {
+                let _ = crate::win::reg_delete_key(RegHive::Hkcu, r"Software\AtherMemGuard-test");
+            }
         }
-        assert!(hkcu().open_subkey(&sub).is_err());
+        assert!(RegKey::open_read(RegHive::Hkcu, &sub).is_err());
     }
 
     #[test]
@@ -866,5 +884,128 @@ mod tests {
         assert_eq!(expand_vars(r"%AMG_TEST_X%\npm"), r"C:\x\npm");
         assert_eq!(expand_vars(r"%AMG_NOPE_Y%\a"), r"%AMG_NOPE_Y%\a");
         assert_eq!(expand_vars("100%"), "100%");
+    }
+
+    #[test]
+    fn expanded_cache_vars_include_zen_uv_pnpm_sccache_yarn_bun() {
+        let vars = cache_vars();
+        for name in [
+            "UE-LocalDataCachePath",
+            "UE-ZenSubprocessDataPath",
+            "UV_CACHE_DIR",
+            "PNPM_STORE_DIR",
+            "SCCACHE_DIR",
+            "YARN_CACHE_FOLDER",
+            "BUN_INSTALL_CACHE_DIR",
+        ] {
+            assert!(vars.iter().any(|v| v.name == name), "missing {}", name);
+        }
+        for (n, _) in NEVER {
+            assert!(!vars.iter().any(|v| v.name == *n), "{} must stay in NEVER", n);
+        }
+    }
+
+    #[test]
+    fn read_vars_skips_sizer_for_off_system_entries() {
+        use std::cell::Cell;
+        let dir = std::env::temp_dir().join(format!("amg-reloc-skip-offsys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let env = MemEnv::default();
+        env.set("PIP_CACHE_DIR", &EnvValue { value: dir.display().to_string(), expand: false }).unwrap();
+        let calls = Cell::new(0usize);
+        let sizer = |_p: &str| {
+            calls.set(calls.get() + 1);
+            Some((1234, true))
+        };
+        // Passing a synthetic different system GUID forces `PIP_CACHE_DIR` to be `!on_system`.
+        let vars_off = read_vars_for_system(&env, Some("\\\\?\\Volume{00000000-0000-0000-0000-000000000000}\\"), &sizer);
+        assert_eq!(calls.get(), 0, "sizer must not be called when all existing entries are off-system");
+        let pip_off = vars_off.iter().find(|v| v.name == "PIP_CACHE_DIR").unwrap();
+        assert!(pip_off.exists);
+        assert_eq!(pip_off.size, None);
+
+        // Passing the actual volume of `dir` sizes `PIP_CACHE_DIR`.
+        let actual_vol = existing_volume(&dir.display().to_string()).unwrap();
+        let vars_on = read_vars_for_system(&env, Some(&actual_vol), &sizer);
+        assert!(calls.get() >= 1);
+        let pip_on = vars_on.iter().find(|v| v.name == "PIP_CACHE_DIR").unwrap();
+        assert_eq!(pip_on.size, Some(1234));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct FailOnNthSet {
+        inner: MemEnv,
+        fail_on: usize,
+        calls: std::sync::Mutex<usize>,
+    }
+    impl EnvStore for FailOnNthSet {
+        fn get(&self, name: &str) -> Result<Option<EnvValue>, String> { self.inner.get(name) }
+        fn set(&self, name: &str, v: &EnvValue) -> Result<(), String> {
+            let mut c = self.calls.lock().unwrap();
+            *c += 1;
+            if *c == self.fail_on {
+                return Err(format!("injected failure on set #{}", *c));
+            }
+            self.inner.set(name, v)
+        }
+        fn remove(&self, name: &str) -> Result<(), String> { self.inner.remove(name) }
+        fn broadcast(&self) {}
+        fn describe(&self) -> String { self.inner.describe() }
+    }
+
+    #[test]
+    fn t5_partial_apply_failure_undo_recovery_and_old_caches_boundary() {
+        let root = std::env::temp_dir().join(format!("amg-t5-reloc-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = FailOnNthSet { inner: MemEnv::default(), fail_on: 2, calls: std::sync::Mutex::new(0) };
+        let vars = vec![
+            VarState { name: "PIP_CACHE_DIR".into(), what: "pip".into(), sub: r"pip\cache".into(), current: None, location: r"C:\Users\me\pip".into(), exists: true, volume: Some("SYS".into()), size: Some(1 << 20), size_partial: false },
+            VarState { name: "UV_CACHE_DIR".into(), what: "uv".into(), sub: "uv".into(), current: None, location: r"C:\Users\me\uv".into(), exists: true, volume: Some("SYS".into()), size: Some(1 << 20), size_partial: false },
+        ];
+        let vols = vec![DestVolume { guid: "DEST".into(), name: "E:".into(), root: "E:\\".into(), avail: 200 << 30, total: 500 << 30, suitable: true, fixed: true }];
+        let p = plan(&vars, Some("SYS"), &vols, Some((&root.join("Caches").display().to_string(), "DEST")), &DiskSettings::default());
+        let files = crate::disk_clean::DiskFiles::in_dir(root.join("data"));
+        assert!(apply(&p, &store, &files).is_err());
+
+        // Finding T5-2.3: failed var #2 must not be recorded in disk-relocate.json, so undo emits
+        // no spurious "was changed since" warning and cleanly restores var #1.
+        let rec = files.relocate_record().expect("partial record persisted for var #1");
+        assert_eq!(rec.entries.len(), 1);
+        assert_eq!(rec.entries[0].name, "PIP_CACHE_DIR");
+        let said = undo(&store, &files).unwrap();
+        assert!(!said.iter().any(|m| m.contains("was changed since")), "spurious warning: {:?}", said);
+        assert_eq!(said, vec!["PIP_CACHE_DIR is unset again."]);
+        assert_eq!(store.get("PIP_CACHE_DIR").unwrap(), None);
+
+        // old_caches_with boundary: file mtime older than rec.unix must NOT emit old cache
+        let old_dir = root.join("old_pip");
+        let new_dir = root.join("new_pip");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+        std::fs::write(new_dir.join("w.whl"), b"x").unwrap();
+        let future_unix = crate::disk_clean::unix_now() + 60;
+        let rec_future = RelocateRecord {
+            time: "t".into(),
+            unix: future_unix,
+            store: "memory".into(),
+            entries: vec![RecordEntry { name: "PIP_CACHE_DIR".into(), previous: None, new_value: new_dir.display().to_string(), old_location: old_dir.display().to_string() }],
+            undone: false,
+        };
+        let cv = vec![CacheVar { name: "PIP_CACHE_DIR", what: "pip cache", sub: r"pip\cache", default: Some(old_dir) }];
+        assert!(old_caches_with(&rec_future, &cv).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn t5_plan_trailing_forward_slash_normalizes_cleanly() {
+        // Regression test for Bug T5-2.2
+        let vars = vec![VarState { name: "PIP_CACHE_DIR".into(), what: "pip".into(), sub: r"pip\cache".into(), current: None, location: r"C:\Users\me\pip".into(), exists: true, volume: Some("SYS".into()), size: Some(1 << 20), size_partial: false }];
+        let vols = vec![DestVolume { guid: "DEST".into(), name: "E:".into(), root: "E:\\".into(), avail: 200 << 30, total: 500 << 30, suitable: true, fixed: true }];
+        let p = plan(&vars, Some("SYS"), &vols, Some(("E:/Caches/", "DEST")), &DiskSettings::default());
+        assert_eq!(p.refused, None);
+        let new_loc = p.entries[0].new_location.as_deref().unwrap();
+        assert!(!new_loc.contains("/\\") && !new_loc.contains("\\\\"), "bad join: {}", new_loc);
+        assert_eq!(norm(new_loc), norm(r"E:\Caches\pip\cache"));
     }
 }

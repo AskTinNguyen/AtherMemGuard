@@ -13,6 +13,7 @@ use std::cmp::Ordering;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+#[cfg(any(test, feature = "ui-snapshots"))]
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{HWND, RECT};
@@ -81,23 +82,26 @@ impl RealBackend {
     }
 }
 
+pub(crate) fn parse_installed_version(raw: &str) -> Option<String> {
+    let v = raw.trim();
+    (!v.is_empty()).then(|| v.to_string())
+}
+
+pub(crate) fn path_contains_dir(path_val: &str, dir_lower: &str) -> bool {
+    path_val.split(';').any(|e| e.trim().trim_end_matches('\\').to_lowercase() == dir_lower)
+}
+
 impl SetupBackend for RealBackend {
     fn installed_version(&self) -> Option<String> {
-        use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
-        let key = winreg::RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(crate::paths::UNINSTALL_KEY, KEY_READ).ok()?;
-        let v: String = key.get_value("DisplayVersion").ok()?;
-        let v = v.trim().to_string();
-        (!v.is_empty()).then_some(v)
+        let raw = crate::win::reg_get_string(crate::win::RegHive::Hkcu, crate::paths::UNINSTALL_KEY, "DisplayVersion").ok()?;
+        parse_installed_version(&raw)
     }
 
     fn installed_options(&self) -> Option<(bool, bool)> {
-        use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
         self.installed_version()?;
-        let dir = crate::paths::install_dir().display().to_string().to_lowercase();
-        let on_path = winreg::RegKey::predef(HKEY_CURRENT_USER)
-            .open_subkey_with_flags("Environment", KEY_READ)
-            .and_then(|k| k.get_value::<String, _>("Path"))
-            .map(|p| p.split(';').any(|e| e.trim().trim_end_matches('\\').to_lowercase() == dir))
+        let dir = crate::paths::install_dir().display().to_string().trim_end_matches('\\').to_lowercase();
+        let on_path = crate::win::reg_get_string(crate::win::RegHive::Hkcu, "Environment", "Path")
+            .map(|p| path_contains_dir(&p, &dir))
             .unwrap_or(false);
         Some((crate::install::is_run_at_startup(), on_path))
     }
@@ -130,6 +134,7 @@ impl SetupBackend for RealBackend {
 }
 
 /// For snapshots, tests and the demo: touches nothing, waits `delay`, then reports `outcome`.
+#[cfg(any(test, feature = "ui-snapshots"))]
 #[derive(Clone)]
 pub struct FakeBackend {
     pub installed: Option<String>,
@@ -141,6 +146,7 @@ pub struct FakeBackend {
     pub calls: Arc<Mutex<Vec<String>>>,
 }
 
+#[cfg(any(test, feature = "ui-snapshots"))]
 impl FakeBackend {
     pub fn new(installed: Option<&str>) -> FakeBackend {
         FakeBackend {
@@ -166,6 +172,7 @@ impl FakeBackend {
     }
 }
 
+#[cfg(any(test, feature = "ui-snapshots"))]
 impl SetupBackend for FakeBackend {
     fn installed_version(&self) -> Option<String> {
         self.installed.clone()
@@ -568,9 +575,11 @@ pub struct SetupWindow {
     hwnd: isize,
     scale: Scale,
     mouse: Option<Pt>,
+    hovered: Option<Act>,
     pressed: Option<Act>,
     focus: Option<Act>,
     anim: f32,
+    bar_rect: Option<Rect>,
     items: Vec<Item>,
 }
 
@@ -587,9 +596,11 @@ impl SetupWindow {
             hwnd: 0,
             scale: Scale(1.0),
             mouse: None,
+            hovered: None,
             pressed: None,
             focus: None,
             anim: 0.3,
+            bar_rect: None,
             items: Vec::new(),
         }
     }
@@ -599,10 +610,12 @@ impl SetupWindow {
         self.exit.get()
     }
 
+    #[cfg(any(test, feature = "ui-snapshots"))]
     pub fn set_mouse(&mut self, p: Option<Pt>) {
         self.mouse = p;
     }
 
+    #[cfg(any(test, feature = "ui-snapshots"))]
     pub fn items(&self) -> &[Item] {
         &self.items
     }
@@ -625,8 +638,12 @@ impl SetupWindow {
         y += hh;
         if v.bar {
             y += c.s(28.0);
-            items.push(Item { rect: Rect::new(x, y, w, c.s(3.0).max(2)), part: Part::Bar });
+            let br = Rect::new(x, y, w, c.s(3.0).max(2));
+            items.push(Item { rect: br, part: Part::Bar });
+            self.bar_rect = Some(br);
             y += c.s(3.0) + c.s(22.0);
+        } else {
+            self.bar_rect = None;
         }
         if let Some(body) = &v.body {
             y += c.s(16.0);
@@ -677,6 +694,7 @@ impl SetupWindow {
             let _ = bx;
         }
         self.items = items;
+        self.hovered = self.mouse.and_then(|p| self.hit(p));
     }
 
     fn state_for(&self, it: &Item) -> WState {
@@ -753,18 +771,19 @@ impl SetupWindow {
             r
         });
         *self.worker.borrow_mut() = Some(handle);
-        host.set_timer(TIMER_ANIM, 16);
+        host.set_timer(TIMER_ANIM, 33);
     }
 
-    fn poll_worker(&mut self, host: &mut Host) {
+    fn poll_worker(&mut self, host: &mut Host) -> bool {
         let done = self.worker.borrow().as_ref().map(|h| h.is_finished()).unwrap_or(false);
         if !done {
-            return;
+            return false;
         }
-        let Some(h) = self.worker.borrow_mut().take() else { return };
+        let Some(h) = self.worker.borrow_mut().take() else { return false };
         let r = h.join().unwrap_or_else(|_| Err("Setup stopped unexpectedly.".into()));
         host.kill_timer(TIMER_ANIM);
         self.input(Input::Finished(r), host);
+        true
     }
 }
 
@@ -800,6 +819,7 @@ impl Surface for SetupWindow {
             }
         }
         self.items = items;
+        self.hovered = self.mouse.and_then(|p| self.hit(p));
     }
 
     fn event(&mut self, ev: Event, host: &mut Host) -> bool {
@@ -809,20 +829,33 @@ impl Surface for SetupWindow {
         }
         match ev {
             Event::Resized => host.invalidate(),
-            Event::Timer(TIMER_WAKE) => self.poll_worker(host),
+            Event::Timer(TIMER_WAKE) => {
+                let _ = self.poll_worker(host);
+            }
             Event::Timer(TIMER_ANIM) => {
-                self.anim = (self.anim + 0.012).rem_euclid(1.0);
-                self.poll_worker(host);
-                host.invalidate();
+                self.anim = (self.anim + 0.024).rem_euclid(1.0);
+                if !self.poll_worker(host) {
+                    if let Some(r) = self.bar_rect {
+                        host.invalidate_rect(r.inset(-1, -1));
+                    } else if matches!(self.model.phase, Phase::Working(_)) {
+                        host.invalidate();
+                    }
+                }
             }
             Event::MouseMove(p) => {
                 self.mouse = Some(p);
-                host.set_cursor(if self.hit(p).is_some() { Cursor::Hand } else { Cursor::Arrow });
-                host.invalidate();
+                let hit = self.hit(p);
+                host.set_cursor(if hit.is_some() { Cursor::Hand } else { Cursor::Arrow });
+                if hit != self.hovered {
+                    self.hovered = hit;
+                    host.invalidate();
+                }
             }
             Event::MouseLeave => {
                 self.mouse = None;
-                host.invalidate();
+                if self.hovered.take().is_some() {
+                    host.invalidate();
+                }
             }
             Event::MouseDown(p, MouseButton::Left) => {
                 self.pressed = self.hit(p);
@@ -930,6 +963,7 @@ pub fn run_setup_with_version(backend: Box<dyn SetupBackend>, mode: SetupMode, v
 }
 
 /// Paint a setup window at its client size (snapshots).
+#[cfg(any(test, feature = "ui-snapshots"))]
 pub fn render(w: &mut SetupWindow, scale: Scale) -> Canvas {
     let mut c = Canvas::new(scale.s(SIZE.0 as f32), scale.s(SIZE.1 as f32), scale);
     w.paint(&mut c);
@@ -1139,5 +1173,48 @@ mod tests {
                 assert!(bottom <= c.height() - s.s(20.0), "{ctx}: content reaches {bottom} of {}", c.height());
             }
         }
+    }
+
+    #[test]
+    fn registry_parsing_helpers_handle_edge_cases() {
+        assert_eq!(parse_installed_version(""), None);
+        assert_eq!(parse_installed_version("  \t "), None);
+        assert_eq!(parse_installed_version(" 0.2.5\n"), Some("0.2.5".into()));
+
+        let dir = r"c:\users\dev\appdata\local\programs\athermemguard";
+        assert!(path_contains_dir(r"C:\Windows\System32;C:\Users\Dev\AppData\Local\Programs\AtherMemGuard\", dir));
+        assert!(path_contains_dir(r" C:\Users\Dev\AppData\Local\Programs\AtherMemGuard ", dir));
+        assert!(!path_contains_dir(r"C:\Users\Dev\AppData\Local\Programs\AtherMemGuard2", dir));
+        assert!(!path_contains_dir("", dir));
+    }
+
+    #[test]
+    fn dirty_hover_and_30fps_partial_bar_invalidation() {
+        let mut w = SetupWindow::new(Box::new(FakeBackend::new(None)), SetupMode::Install, "0.2.5");
+        let mut c = Canvas::new(520, 600, Scale(1.0));
+        w.paint(&mut c);
+        let btn = w.items().iter().find(|it| it.act() == Some(Act::Primary)).unwrap().rect;
+
+        let mut h1 = Host::detached((520, 600), Scale(1.0));
+        w.event(Event::MouseMove(Pt::new(btn.cx(), btn.cy())), &mut h1);
+        assert_eq!(h1.invalidations(), (1, 0));
+
+        let mut h2 = Host::detached((520, 600), Scale(1.0));
+        w.event(Event::MouseMove(Pt::new(btn.cx() + 2, btn.cy())), &mut h2);
+        assert_eq!(h2.invalidations(), (0, 0), "same hovered Act must not repaint");
+
+        let mut h3 = Host::detached((520, 600), Scale(1.0));
+        w.event(Event::MouseLeave, &mut h3);
+        assert_eq!(h3.invalidations(), (1, 0));
+        let mut h4 = Host::detached((520, 600), Scale(1.0));
+        w.event(Event::MouseLeave, &mut h4);
+        assert_eq!(h4.invalidations(), (0, 0));
+
+        w.model.phase = Phase::Working(Task::Install);
+        w.paint(&mut c);
+        assert!(w.bar_rect.is_some());
+        let mut h5 = Host::detached((520, 600), Scale(1.0));
+        w.event(Event::Timer(TIMER_ANIM), &mut h5);
+        assert_eq!(h5.invalidations(), (0, 1));
     }
 }

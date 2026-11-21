@@ -70,13 +70,13 @@ pub fn save_str(kind: &str, key: &str, value: &str) -> Result<(), String> {
 }
 
 fn write(change: impl FnOnce(&str) -> String) -> Result<(), String> {
-    let path = file();
-    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    write_at(&file(), change)
+}
+
+fn write_at(path: &std::path::Path, change: impl FnOnce(&str) -> String) -> Result<(), String> {
+    let old = std::fs::read_to_string(path).unwrap_or_default();
     let text = change(&old);
-    std::fs::create_dir_all(crate::paths::data_dir()).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+    crate::config::write_atomic(path, &text)
 }
 
 #[cfg(test)]
@@ -103,5 +103,24 @@ mod tests {
         assert_eq!(parse_str(&text, "doctor", "tab").as_deref(), Some("memory"));
         assert_eq!(parse(&text, "doctor"), Some(Rect::new(1, 2, 760, 720)));
         assert_eq!(parse_str(&text, "settings", "tab"), None);
+    }
+
+    #[test]
+    fn write_at_updates_atomically_without_tmp_leftovers() {
+        let dir = std::env::temp_dir().join(format!("amg_uistate_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("ui-state.toml");
+        write_at(&p, |old| with_rect(old, "doctor", Rect::new(10, 20, 760, 720))).unwrap();
+        write_at(&p, |old| with_str(old, "doctor", "tab", "disk")).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(parse(&text, "doctor"), Some(Rect::new(10, 20, 760, 720)));
+        assert_eq!(parse_str(&text, "doctor", "tab").as_deref(), Some("disk"));
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

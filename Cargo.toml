@@ -16,15 +16,35 @@ path = "src/bin/memguard.rs"
 [[bin]]
 name = "AtherMemGuard"
 path = "src/bin/tray.rs"
+required-features = ["gui"]
+
+[[example]]
+name = "ui_demo"
+path = "examples/ui_demo.rs"
+required-features = ["ui-snapshots"]
+
+[[example]]
+name = "ui_snapshots"
+path = "examples/ui_snapshots.rs"
+required-features = ["ui-snapshots"]
+
+[[test]]
+name = "tray_doctor"
+path = "tests/tray_doctor.rs"
+required-features = ["gui"]
 
 [[test]]
 name = "update_flow"
 path = "tests/update_flow.rs"
 harness = false
+required-features = ["gui"]
 
 [features]
-# Release builds: AtherMemGuard.exe carries memguard.exe (path in the MEMGUARD_CLI env var)
-# and writes it on install and after an update. package.ps1 sets this up.
+default = ["gui"]
+gui = []
+ui-snapshots = ["gui"]
+# Release builds: AtherMemGuard.exe carries memguard.exe (path in the MEMGUARD_CLI env var,
+# compressed into OUT_DIR by build.rs) and writes it on install and after an update.
 embed-cli = []
 
 [dependencies]
@@ -32,8 +52,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 toml_edit = "0.22"
-clap = { version = "4", features = ["derive"] }
-winreg = "0.52"
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage"] }
 sha2 = "0.10"
 
 [build-dependencies]
@@ -72,7 +91,8 @@ features = [
 ]
 
 [profile.release]
-opt-level = "s"
+opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
+panic = "abort"

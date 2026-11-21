@@ -78,6 +78,11 @@ pub enum ButtonAct {
     ResetAll,
 }
 
+/// True when a `Ctl::Chips` list holds process names where `.exe` should be stripped.
+pub fn chip_strip_exe(path: &str) -> bool {
+    path == "ue.protect" || path.starts_with("doctor.")
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Ctl {
     Segmented { path: String, options: Vec<(&'static str, &'static str)>, selected: usize },
@@ -89,7 +94,7 @@ pub enum Ctl {
     /// A group's apps: chips plus "+ Add app…".
     GroupApps { group: String, items: Vec<String> },
     Buttons(Vec<(String, ButtonAct, ButtonStyle)>),
-    Headroom { ram_path: String, ram: f64, commit_path: String, commit: f64 },
+    Headroom { ram_path: String, ram: f64, commit_path: String, commit: f64, disk_path: String, disk: f64 },
     /// No control (the Agents group's explanation).
     None,
 }
@@ -177,7 +182,15 @@ fn value_words(v: &Value) -> String {
         Value::Int(i) => i.to_string(),
         Value::Float(f) => format_number(*f),
         Value::Text(s) => s.clone(),
-        Value::List(l) => format!("{} apps", l.len()),
+        Value::List(l) => {
+            if l.is_empty() {
+                "None".into()
+            } else if l.len() <= 3 {
+                l.join(", ")
+            } else {
+                format!("{} items", l.len())
+            }
+        }
     }
 }
 
@@ -243,19 +256,28 @@ impl<'a> Builder<'a> {
     fn num_of(&self, path: &str) -> f64 {
         self.get(path).and_then(|s| s.value.as_f64()).unwrap_or(0.0)
     }
-    fn is_int(&self, path: &str) -> bool {
-        matches!(self.get(path).map(|s| s.value), Some(Value::Int(_)))
-    }
     fn toggle(&mut self, label: &str, hint: &str, path: &str) -> Row {
         let on = self.bool_of(path);
         self.row(label, hint, Ctl::Toggle { path: path.into(), on }, &[path], value_words)
     }
-    fn number(&mut self, label: &str, hint: &str, path: &str, unit: &str, min: f64, max: f64) -> Row {
+    fn number_kind(&mut self, label: &str, hint: &str, path: &str, unit: &str, min: f64, max: f64, integer: bool) -> Row {
         let value = self.num_of(path);
-        let integer = self.is_int(path);
         let u = unit.to_string();
         let ctl = Ctl::Number { path: path.into(), value, unit: unit.into(), min, max, integer, off_at_zero: false };
         self.row(label, hint, ctl, &[path], move |v| format!("{} {}", value_words(v), u))
+    }
+    fn number_int(&mut self, label: &str, hint: &str, path: &str, unit: &str, min: f64, max: f64) -> Row {
+        self.number_kind(label, hint, path, unit, min, max, true)
+    }
+    fn number_float(&mut self, label: &str, hint: &str, path: &str, unit: &str, min: f64, max: f64) -> Row {
+        self.number_kind(label, hint, path, unit, min, max, false)
+    }
+    fn chips(&mut self, label: &str, hint: &str, path: &str) -> Row {
+        let items: Vec<String> = self.get(path).and_then(|s| s.value.as_list().map(|l| l.to_vec())).unwrap_or_default();
+        let mut r = self.row(label, hint, Ctl::Chips { path: path.into(), items: items.clone(), add_label: "+ Add…" }, &[path], value_words);
+        r.value_text = items.join(" ");
+        r.wide = true;
+        r
     }
 }
 
@@ -303,6 +325,8 @@ pub fn build(input: &ModelInput) -> Vec<Block> {
     b.push(r);
     let r = b.toggle("Check memory speed", "Tells you once if your RAM is running slower than it was sold to run.", "general.check_ram_speed");
     b.push(r);
+    let r = b.number_int("Check interval", "How often memory and Unreal activity are checked.", "interval_sec", "sec", 2.0, 600.0);
+    b.push(r);
 
     // ---------------------------------------------------------------- APP GROUPS
     b.section("App groups");
@@ -321,27 +345,22 @@ pub fn build(input: &ModelInput) -> Vec<Block> {
 
     // ---------------------------------------------------------------- UNREAL
     b.section("Unreal");
-    let protect: Vec<String> = b.get("ue.protect").and_then(|s| s.value.as_list().map(|l| l.to_vec())).unwrap_or_default();
-    let mut r = b.row(
+    let r = b.chips(
         "Never touched",
         "Unreal's own tools. Listed apps are skipped even if a group names them.",
-        Ctl::Chips { path: "ue.protect".into(), items: protect.clone(), add_label: "+ Add…" },
-        &["ue.protect"],
-        value_words,
+        "ue.protect",
     );
-    r.value_text = protect.join(" ");
-    r.wide = true;
     b.push(r);
-    let r = b.number(
+    let r = b.number_float(
         "Suggest restarting the editor above",
-        "One notification when an editor uses more than this.",
+        "One alert when an editor uses more than this.",
         "ue.editor_restart_hint_gb",
         "GB",
         4.0,
         1024.0,
     );
     b.push(r);
-    let r = b.number(
+    let r = b.number_float(
         "Warn when the editor grows faster than",
         "Measured over the last 30 minutes. 0 turns the warning off.",
         "ue.editor_growth_alert_gb_per_hour",
@@ -359,7 +378,7 @@ pub fn build(input: &ModelInput) -> Vec<Block> {
     let throttle = matches!(r.ctl, Ctl::Toggle { on: true, .. });
     b.push(r);
     if throttle {
-        let r = b.number("Keep at least this many workers running", "Never pauses below this many.", "ue.min_workers", "workers", 1.0, 256.0);
+        let r = b.number_int("Keep at least this many workers running", "Never pauses below this many.", "ue.min_workers", "workers", 1.0, 256.0);
         b.push(r);
     }
 
@@ -382,17 +401,90 @@ pub fn build(input: &ModelInput) -> Vec<Block> {
     // ---------------------------------------------------------------- HEADROOM
     b.section("Headroom");
     for (label, w) in [("Editor", "editor"), ("Build", "build"), ("Cook", "cook")] {
-        let (rp, cp) = (format!("prime.{}.ram_gb", w), format!("prime.{}.commit_gb", w));
-        let ctl = Ctl::Headroom { ram_path: rp.clone(), ram: b.num_of(&rp), commit_path: cp.clone(), commit: b.num_of(&cp) };
-        let r = b.row(label, HEADROOM_HINT, ctl, &[&rp, &cp], |v| format!("{} GB", value_words(v)));
+        let (rp, cp, dp) = (format!("prime.{}.ram_gb", w), format!("prime.{}.commit_gb", w), format!("prime.{}.disk_gb", w));
+        let ctl = Ctl::Headroom {
+            ram_path: rp.clone(),
+            ram: b.num_of(&rp),
+            commit_path: cp.clone(),
+            commit: b.num_of(&cp),
+            disk_path: dp.clone(),
+            disk: b.num_of(&dp),
+        };
+        let mut r = b.row(label, HEADROOM_HINT, ctl, &[&rp, &cp, &dp], |v| {
+            if v.as_f64().is_some_and(|x| x <= 0.0) {
+                "Off".into()
+            } else {
+                format!("{} GB", value_words(v))
+            }
+        });
+        r.wide = true;
         b.push(r);
     }
+
+    // ---------------------------------------------------------------- CHECKUP
+    b.section("Checkup");
+    let r = b.chips("Always keep open", "Apps never suggested for closing during a checkup.", "doctor.keep");
+    b.push(r);
+    let r = b.chips("Close automatically", "Apps closed automatically when a checkup runs.", "doctor.close");
+    b.push(r);
+    let r = b.chips("Close while Unreal runs", "Apps closed whenever Unreal Editor, a build or a cook starts.", "doctor.close_while_unreal");
+    b.push(r);
+    let r = b.number_float(
+        "Nudge when reclaimable memory exceeds",
+        "Shows a tray hint when background apps hold more than this. 0 nudges whenever any can be freed.",
+        "doctor.nudge_above_gb",
+        "GB",
+        0.0,
+        1024.0,
+    );
+    b.push(r);
+    let r = b.number_int("Ignore apps smaller than", "Skips background apps using less memory than this in checkup results.", "doctor.ignore_below_mb", "MB", 0.0, 1_048_576.0);
+    b.push(r);
+    let r = b.number_int("Highlight apps above", "Marks larger background apps for review in checkup results.", "doctor.review_above_mb", "MB", 0.0, 1_048_576.0);
+    b.push(r);
+
+    // ---------------------------------------------------------------- DISK SPACE
+    b.section("Disk space");
+    let r = b.toggle("Monitor disk space", "Tracks free space on watched drives and checks for safe cleanup targets.", "disk.enabled");
+    b.push(r);
+    let r = b.toggle("Check Dev Drive health", "Audits ReFS Dev Drive filters, VHDX backing slack and cluster efficiency.", "disk.check_dev_drive");
+    b.push(r);
+    let r = b.chips("Watched drives", "Drive letters, folders, or \"auto\" to watch Unreal and cache drives.", "disk.watch");
+    b.push(r);
+    let r = b.chips("Project folders", "Unreal project roots scanned for DerivedDataCache, Intermediate and build waste.", "disk.project_dirs");
+    b.push(r);
+    let r = b.chips("Branch and worktree folders", "Parent folders containing multiple Perforce workspaces or Git worktrees.", "disk.lane_dirs");
+    b.push(r);
+    let r = b.chips("Never clean folders", "Folders excluded from disk cleanup suggestions.", "disk.keep");
+    b.push(r);
+    let r = b.number_float("Warn when free space drops below", "Marks a watched drive low when free GB falls under this.", "disk.elevated_free_gb", "GB", 0.0, 100_000.0);
+    b.push(r);
+    let r = b.number_float("…or free percentage drops below", "Marks a watched drive low when free share falls under this.", "disk.elevated_free_pct", "%", 0.0, 100.0);
+    b.push(r);
+    let r = b.number_float("Critical when free space drops below", "Marks a watched drive critical when free GB falls under this.", "disk.critical_free_gb", "GB", 0.0, 100_000.0);
+    b.push(r);
+    let r = b.number_float("…or critical free percentage drops below", "Marks a watched drive critical when free share falls under this.", "disk.critical_free_pct", "%", 0.0, 100.0);
+    b.push(r);
+    let r = b.number_float("Minimum cache drive free space", "Free space required on DDC, Zen and TEMP drives before wait gates pass.", "disk.cache_min_free_gb", "GB", 0.0, 100_000.0);
+    b.push(r);
+    let r = b.number_float("Minimum age before cleanup", "Skips any target whose files were modified more recently than this.", "disk.min_age_hours", "hours", 0.0, 8760.0);
+    b.push(r);
+    let r = b.number_float("Keep deleted items in bin for", "Hours before items moved to the AtherMemGuard bin are purged permanently.", "disk.hold_hours", "hours", 0.0, 8760.0);
+    b.push(r);
+    let r = b.number_int("Folder scan depth", "How many subfolder levels to search inside project and branch roots.", "disk.scan_depth", "levels", 1.0, 16.0);
+    b.push(r);
+    let r = b.number_int("Scan time limit", "Maximum seconds spent scanning disks before returning partial results.", "disk.scan_budget_sec", "sec", 1.0, 3600.0);
+    b.push(r);
+    let r = b.number_int("Scan worker threads", "Parallel threads used for disk scanning and cleanup.", "disk.scan_threads", "threads", 1.0, 64.0);
+    b.push(r);
+    let r = b.number_int("Reuse recent scan for", "Seconds a cached disk scan result stays valid before rescanning.", "disk.fresh_sec", "sec", 0.0, 86_400.0);
+    b.push(r);
 
     // ---------------------------------------------------------------- HISTORY
     b.section("History");
     let r = b.toggle("Record memory history", "One line every 10 seconds, kept on this PC.", "history.enabled");
     b.push(r);
-    let r = b.number("Keep for", "Older days are deleted.", "history.keep_days", "days", 1.0, 365.0);
+    let r = b.number_int("Keep for", "Older days are deleted.", "history.keep_days", "days", 1.0, 365.0);
     b.push(r);
     let r = b.row(
         "Memory history",
@@ -610,7 +702,7 @@ mod tests {
         let sections: Vec<&str> = blocks.iter().filter_map(|b| if let Block::Section(s) = b { Some(*s) } else { None }).collect();
         assert_eq!(
             sections,
-            ["General", "App groups", "Unreal", "Memory pressure", "Headroom", "History", "Updates", "AI agents", "Team and backup"]
+            ["General", "App groups", "Unreal", "Memory pressure", "Headroom", "Checkup", "Disk space", "History", "Updates", "AI agents", "Team and backup"]
         );
         let labels: Vec<&str> = rows(&blocks).iter().map(|r| r.label.as_str()).collect();
         for l in [
@@ -619,6 +711,7 @@ mod tests {
             "Run at Windows startup",
             "Notifications",
             "Free memory now",
+            "Check interval",
             "Add a group",
             "Never touched",
             "Suggest restarting the editor above",
@@ -629,6 +722,27 @@ mod tests {
             "Editor",
             "Build",
             "Cook",
+            "Always keep open",
+            "Close automatically",
+            "Close while Unreal runs",
+            "Nudge when reclaimable memory exceeds",
+            "Ignore apps smaller than",
+            "Highlight apps above",
+            "Monitor disk space",
+            "Check Dev Drive health",
+            "Watched drives",
+            "Project folders",
+            "Branch and worktree folders",
+            "Never clean folders",
+            "Warn when free space drops below",
+            "Critical when free space drops below",
+            "Minimum cache drive free space",
+            "Minimum age before cleanup",
+            "Keep deleted items in bin for",
+            "Folder scan depth",
+            "Scan time limit",
+            "Scan worker threads",
+            "Reuse recent scan for",
             "Record memory history",
             "Keep for",
             "Check for updates automatically",
@@ -680,5 +794,66 @@ mod tests {
         assert_eq!(label_of(&SPEEDS, "eco"), "Efficiency mode");
         assert_eq!(UpdateState::UpToDate { checked: "today at 14:02".into() }.hint(), "Up to date. Checked today at 14:02.");
         assert_eq!(short_folder(std::path::Path::new(r"C:\Users\you\AppData\Roaming\AtherMemGuard\settings.toml")), r"%APPDATA%\AtherMemGuard");
+    }
+
+    #[test]
+    fn f62a_number_types_are_explicit_even_with_int_literals() {
+        let mut store = FakeStore::mockup();
+        // Simulate BUILTIN_TOML integer literals on f64 fields (just as RealStore returns from TOML).
+        for p in [
+            "ue.editor_restart_hint_gb",
+            "ue.editor_growth_alert_gb_per_hour",
+            "disk.elevated_free_gb",
+            "disk.elevated_free_pct",
+            "disk.critical_free_gb",
+            "disk.critical_free_pct",
+            "disk.cache_min_free_gb",
+            "disk.min_age_hours",
+            "disk.hold_hours",
+            "doctor.nudge_above_gb",
+        ] {
+            store.builtin.insert(p.into(), Value::Int(5));
+        }
+        let blocks = page(&store);
+        let all_rows = rows(&blocks);
+        let is_int = |path: &str| -> bool {
+            all_rows
+                .iter()
+                .find_map(|r| match &r.ctl {
+                    Ctl::Number { path: p, integer, .. } if p == path => Some(*integer),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing Ctl::Number for {path}"))
+        };
+        for float_path in [
+            "ue.editor_restart_hint_gb",
+            "ue.editor_growth_alert_gb_per_hour",
+            "doctor.nudge_above_gb",
+            "disk.elevated_free_gb",
+            "disk.elevated_free_pct",
+            "disk.critical_free_gb",
+            "disk.critical_free_pct",
+            "disk.cache_min_free_gb",
+            "disk.min_age_hours",
+            "disk.hold_hours",
+        ] {
+            assert!(!is_int(float_path), "{float_path} must use float input");
+        }
+        for int_path in [
+            "interval_sec",
+            "history.keep_days",
+            "doctor.ignore_below_mb",
+            "doctor.review_above_mb",
+            "disk.scan_depth",
+            "disk.scan_budget_sec",
+            "disk.scan_threads",
+            "disk.fresh_sec",
+        ] {
+            assert!(is_int(int_path), "{int_path} must use integer input");
+        }
+        assert!(chip_strip_exe("ue.protect"));
+        assert!(chip_strip_exe("doctor.keep"));
+        assert!(!chip_strip_exe("disk.project_dirs"));
+        assert!(!chip_strip_exe("disk.watch"));
     }
 }

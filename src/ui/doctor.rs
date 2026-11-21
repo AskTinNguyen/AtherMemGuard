@@ -12,6 +12,7 @@
 
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
+#[cfg(any(test, feature = "ui-snapshots"))]
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::HWND;
@@ -727,6 +728,7 @@ pub fn outcome_text(outs: &[Outcome]) -> (String, Rgb) {
 // ---------------------------------------------------------------- fake
 
 /// Plausible findings for every section; `apply` only reports, it never touches a process.
+#[cfg(any(test, feature = "ui-snapshots"))]
 pub struct FakeDoctor {
     pub clear: bool,
     pub delay: Duration,
@@ -738,6 +740,7 @@ pub struct FakeDoctor {
     disk_checked: Mutex<bool>,
 }
 
+#[cfg(any(test, feature = "ui-snapshots"))]
 impl FakeDoctor {
     pub fn new() -> FakeDoctor {
         FakeDoctor { clear: false, delay: Duration::ZERO, applied: Mutex::new([false; 2]), after_apply: Mutex::new(None), disk_checked: Mutex::new(true) }
@@ -862,12 +865,14 @@ impl FakeDoctor {
     }
 }
 
+#[cfg(any(test, feature = "ui-snapshots"))]
 impl Default for FakeDoctor {
     fn default() -> FakeDoctor {
         FakeDoctor::new()
     }
 }
 
+#[cfg(any(test, feature = "ui-snapshots"))]
 impl DoctorSource for FakeDoctor {
     fn scan(&self) -> Report {
         std::thread::sleep(self.delay);
@@ -1059,6 +1064,13 @@ pub fn confirm_words(names: &[String], one_row_is_many: bool) -> (String, String
 /// The Disk space tab's words before any disk checkup ran.
 pub const NO_DISK_CHECKUP: &str = "No disk checkup yet. It finds build files, caches and logs on your drives and what removing each would really free. It counts in the background for up to a minute and deletes nothing.";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct DoctorHover {
+    act: Option<Act>,
+    row_item: Option<usize>,
+    dialog: Option<bool>,
+}
+
 pub struct DoctorWindow {
     source: Arc<Mutex<Box<dyn DoctorSource>>>,
     pub model: Option<DoctorModel>,
@@ -1080,6 +1092,7 @@ pub struct DoctorWindow {
     scale: Scale,
     size: (i32, i32),
     mouse: Option<Pt>,
+    hover: DoctorHover,
     pressed: Option<Act>,
     focus: Option<Act>,
     scroll: Scroll,
@@ -1092,6 +1105,9 @@ pub struct DoctorWindow {
     head_n: usize,
     /// The header's area (above `scroll.view`).
     head: Rect,
+    footer_rects: (Rect, Option<Rect>, Rect),
+    dialog_rects: Option<(Rect, Rect)>,
+    bar_rect: Option<Rect>,
     menu_row: Option<usize>,
     /// Where commands from rows go (the tray's dispatcher); a no-op by default.
     commands: Box<dyn Fn(Command)>,
@@ -1117,6 +1133,7 @@ impl DoctorWindow {
             scale: Scale(1.0),
             size: (760, 720),
             mouse: None,
+            hover: DoctorHover::default(),
             pressed: None,
             focus: None,
             scroll: Scroll::default(),
@@ -1125,6 +1142,9 @@ impl DoctorWindow {
             items: Vec::new(),
             head_n: 0,
             head: Rect::default(),
+            footer_rects: (Rect::default(), None, Rect::default()),
+            dialog_rects: None,
+            bar_rect: None,
             menu_row: None,
         }
     }
@@ -1163,6 +1183,7 @@ impl DoctorWindow {
         self.tab = tab;
         self.scroll.y = self.tab_scroll[tab.index()];
         self.confirm = None;
+        self.dialog_rects = None;
         self.menu_row = None;
         if !matches!(self.focus, Some(Act::Tab(_))) {
             self.focus = None;
@@ -1201,7 +1222,7 @@ impl DoctorWindow {
             wake(hwnd, TIMER_WAKE);
         });
         if let Some(h) = host {
-            h.set_timer(TIMER_ANIM, 16);
+            h.set_timer(TIMER_ANIM, 33);
         }
     }
 
@@ -1216,6 +1237,7 @@ impl DoctorWindow {
         self.scan_scope = scope;
         self.working = true;
         self.confirm = None;
+        self.dialog_rects = None;
         self.run(move |s| Job::Scanned(s.scan(), undoable(s), scope), host);
     }
 
@@ -1230,6 +1252,7 @@ impl DoctorWindow {
         self.working = true;
         self.disk_error = None;
         self.confirm = None;
+        self.dialog_rects = None;
         self.run(
             |s| {
                 let r = s.disk_checkup();
@@ -1256,6 +1279,7 @@ impl DoctorWindow {
                 let disk = m.disk_rows();
                 if !disk.is_empty() {
                     self.confirm = Some(Confirm::Disk(disk));
+                    self.dialog_rects = None;
                 }
             }
             Tab::Memory => {
@@ -1264,6 +1288,7 @@ impl DoctorWindow {
                     self.run_clean_up(Tab::Memory, host);
                 } else {
                     self.confirm = Some(Confirm::CleanUp(ending));
+                    self.dialog_rects = None;
                 }
             }
         }
@@ -1364,16 +1389,20 @@ impl DoctorWindow {
         }
     }
 
-    fn poll(&mut self, host: &mut Host) {
+    fn poll(&mut self, host: &mut Host) -> bool {
         let job = self.rx.as_ref().and_then(|rx| rx.try_recv().ok());
         if let Some(job) = job {
             self.rx = None;
             host.kill_timer(TIMER_ANIM);
             self.on_job(job);
             host.invalidate();
+            true
+        } else {
+            false
         }
     }
 
+    #[cfg(any(test, feature = "ui-snapshots"))]
     pub fn set_mouse(&mut self, p: Option<Pt>) {
         self.mouse = p;
     }
@@ -1472,10 +1501,14 @@ impl DoctorWindow {
         // The showing tab, scrolled.
         let top = y - self.scroll.y;
         let mut y = top + c.s(4.0);
+        self.bar_rect = None;
         if self.tab_busy() {
             y += c.s(28.0);
             let what = if self.counting && self.tab == Tab::Disk { "Counting what's on your drives… (up to a minute)" } else { "Checking…" };
-            items.push(Item::new(Rect::new(left, y, content_w, c.s(40.0)), Paint::Checking(what.into())));
+            let r = Rect::new(left, y, content_w, c.s(40.0));
+            let th = c.line_height(F_BODY);
+            self.bar_rect = Some(Rect::new(r.x, r.y + th + c.s(12.0), r.w, c.s(3.0).max(2)));
+            items.push(Item::new(r, Paint::Checking(what.into())));
             y += c.s(40.0);
         } else if let Some(m) = self.model.clone() {
             let sections = m.sections(self.tab);
@@ -1550,6 +1583,8 @@ impl DoctorWindow {
         self.scroll.clamp();
         self.items = items;
         self.head_n = head_n;
+        self.footer_rects = self.footer_layout(c);
+        self.hover = self.compute_hover(self.mouse);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1815,7 +1850,7 @@ impl DoctorWindow {
         let w = c.width();
         c.fill_rect(Rect::new(0, y, w, fh), SURFACE);
         c.hline(0, y, w, BORDER);
-        let (tr, undo, br) = self.footer_layout(c);
+        let (tr, undo, br) = self.footer_rects;
         let text = self.footer_text();
         if !text.is_empty() {
             // Canvas::text must not get an empty string (DrawTextW reads past it with DT_END_ELLIPSIS).
@@ -1867,11 +1902,52 @@ impl DoctorWindow {
         })
     }
 
+    fn dialog_buttons(&mut self) -> Option<(Rect, Rect)> {
+        if self.confirm.is_none() {
+            self.dialog_rects = None;
+            return None;
+        }
+        if let Some(rects) = self.dialog_rects {
+            return Some(rects);
+        }
+        let d = self.dialog()?;
+        let probe = Canvas::probe(self.scale);
+        let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
+        let (_, ok, cancel) = d.layout(&probe, area);
+        self.dialog_rects = Some((ok, cancel));
+        Some((ok, cancel))
+    }
+
+    fn compute_hover(&mut self, p: Option<Pt>) -> DoctorHover {
+        let Some(p) = p else {
+            return DoctorHover::default();
+        };
+        if self.confirm.is_some() {
+            let dialog = self.dialog_buttons().and_then(|(ok, cancel)| {
+                if ok.contains(p) {
+                    Some(true)
+                } else if cancel.contains(p) {
+                    Some(false)
+                } else {
+                    None
+                }
+            });
+            return DoctorHover { act: None, row_item: None, dialog };
+        }
+        let act = self.hit(p);
+        let n = self.head_n.min(self.items.len());
+        let row_item = if self.scroll.view.contains(p) {
+            self.items[n..].iter().position(|i| matches!(i.paint, Paint::RowBg) && i.rect.contains(p)).map(|i| n + i)
+        } else {
+            None
+        };
+        DoctorHover { act, row_item, dialog: None }
+    }
+
     // ------------------------------------------------------------ input
 
     fn hit(&self, p: Pt) -> Option<Act> {
-        let probe = Canvas::new(self.size.0.max(1), self.size.1.max(1), self.scale);
-        let (_, undo, br) = self.footer_layout(&probe);
+        let (_, undo, br) = self.footer_rects;
         if br.contains(p) {
             return Some(Act::CleanUp);
         }
@@ -1915,7 +1991,10 @@ impl DoctorWindow {
                 self.menu_row = Some(i);
                 host.menu(MENU_CHOICE, items, at);
             }
-            Act::EndAnyway(i) => self.confirm = Some(Confirm::End(i)),
+            Act::EndAnyway(i) => {
+                self.confirm = Some(Confirm::End(i));
+                self.dialog_rects = None;
+            }
             Act::HowToFix(i) => {
                 let Some(f) = self.model.as_ref().and_then(|m| m.report.findings.get(i)) else { return };
                 if let Some(cmd) = f.help_command {
@@ -1948,6 +2027,7 @@ impl DoctorWindow {
     }
 
     fn confirm_ok(&mut self, host: &mut Host) {
+        self.dialog_rects = None;
         match self.confirm.take() {
             Some(Confirm::Disk(_)) => self.run_clean_up(Tab::Disk, Some(host)),
             Some(Confirm::End(i)) => self.end_anyway(i, Some(host)),
@@ -2017,7 +2097,12 @@ impl Surface for DoctorWindow {
         self.scroll.paint(c, false);
         self.paint_footer(c);
         if let Some(d) = self.dialog() {
+            let (_, ok, cancel) = d.layout(c, c.bounds());
+            self.dialog_rects = Some((ok, cancel));
+            self.hover = self.compute_hover(self.mouse);
             d.paint(c, c.bounds(), self.mouse, false);
+        } else {
+            self.dialog_rects = None;
         }
     }
 
@@ -2028,17 +2113,28 @@ impl Surface for DoctorWindow {
         }
         match ev {
             Event::Resized => {
+                if host.size.0 > 0 && host.size.1 > 0 {
+                    self.size = host.size;
+                }
+                self.dialog_rects = None;
                 if !self.started && self.model.is_none() {
                     self.started = true;
                     self.scan(Some(host));
                 }
                 host.invalidate();
             }
-            Event::Timer(TIMER_WAKE) => self.poll(host),
+            Event::Timer(TIMER_WAKE) => {
+                let _ = self.poll(host);
+            }
             Event::Timer(TIMER_ANIM) => {
-                self.anim = (self.anim + 0.012).rem_euclid(1.0);
-                self.poll(host);
-                host.invalidate();
+                self.anim = (self.anim + 0.024).rem_euclid(1.0);
+                if !self.poll(host) && self.tab_busy() {
+                    if let Some(r) = self.bar_rect {
+                        host.invalidate_rect(r.inset(-1, -1));
+                    } else {
+                        host.invalidate();
+                    }
+                }
             }
             Event::Timer(TIMER_TAB_MEMORY) => {
                 self.set_tab(Tab::Memory);
@@ -2050,13 +2146,24 @@ impl Surface for DoctorWindow {
             }
             Event::MouseMove(p) => {
                 self.mouse = Some(p);
-                let hand = self.confirm.is_none() && (self.hit(p).is_some() || self.row_check_at(p).is_some());
-                host.set_cursor(if hand { Cursor::Hand } else { Cursor::Arrow });
-                host.invalidate();
+                if self.confirm.is_some() {
+                    host.set_cursor(Cursor::Arrow);
+                } else {
+                    let hand = self.hit(p).is_some() || self.row_check_at(p).is_some();
+                    host.set_cursor(if hand { Cursor::Hand } else { Cursor::Arrow });
+                }
+                let next = self.compute_hover(Some(p));
+                if next != self.hover {
+                    self.hover = next;
+                    host.invalidate();
+                }
             }
             Event::MouseLeave => {
                 self.mouse = None;
-                host.invalidate();
+                if self.hover != DoctorHover::default() {
+                    self.hover = DoctorHover::default();
+                    host.invalidate();
+                }
             }
             Event::MouseDown(p, MouseButton::Left) => {
                 if self.confirm.is_none() {
@@ -2067,13 +2174,12 @@ impl Surface for DoctorWindow {
             }
             Event::MouseUp(p, MouseButton::Left) => {
                 if self.confirm.is_some() {
-                    if let Some(d) = self.dialog() {
-                        let probe = Canvas::new(self.size.0.max(1), self.size.1.max(1), self.scale);
-                        let (_, ok, cancel) = d.layout(&probe, probe.bounds());
+                    if let Some((ok, cancel)) = self.dialog_buttons() {
                         if ok.contains(p) {
                             self.confirm_ok(host);
                         } else if cancel.contains(p) {
                             self.confirm = None;
+                            self.dialog_rects = None;
                         }
                     }
                     host.invalidate();
@@ -2105,6 +2211,7 @@ impl Surface for DoctorWindow {
                 if self.confirm.is_some() {
                     if vk == VK_ESCAPE || vk == VK_RETURN {
                         self.confirm = None; // Enter is the safe choice
+                        self.dialog_rects = None;
                     }
                     host.invalidate();
                     return true;
@@ -2195,6 +2302,7 @@ pub fn open_doctor(source: Box<dyn DoctorSource>, commands: Box<dyn Fn(Command)>
 }
 
 /// Paint the window at `w` (96-DPI px) wide and `h` high, or the whole page with `h == None`.
+#[cfg(any(test, feature = "ui-snapshots"))]
 pub fn render(win: &mut DoctorWindow, scale: Scale, w: i32, h: Option<i32>) -> Canvas {
     let pw = scale.s(w as f32);
     let ph = match h {
@@ -2951,5 +3059,74 @@ mod tests {
                 check_layout(&mut none, scale, width, "no disk checkup");
             }
         }
+    }
+
+    #[test]
+    fn dirty_hover_and_cached_rects_and_anim_partial_rect() {
+        let mut w = DoctorWindow::new(Box::new(FakeDoctor::new()));
+        let mut c = Canvas::new(760, 720, Scale(1.0));
+        // Before scan: tab_busy() is true -> bar_rect cached, TIMER_ANIM invalidates only bar_rect.
+        w.paint(&mut c);
+        assert!(w.bar_rect.is_some());
+        let mut host = Host::detached((760, 720), Scale(1.0));
+        w.event(Event::Timer(TIMER_ANIM), &mut host);
+        assert_eq!(host.invalidations(), (0, 1));
+
+        // After scan: cached footer_rects work in hit(), and intra-row MouseMove does not repaint.
+        w.scan(None);
+        w.paint(&mut c);
+        assert!(w.bar_rect.is_none());
+        let (_, _, br) = w.footer_rects;
+        assert_eq!(w.hit(Pt::new(br.cx(), br.cy())), Some(Act::CleanUp));
+
+        let row = w.items().iter().find(|it| matches!(it.paint, Paint::RowBg)).unwrap().rect;
+        let p1 = Pt::new(row.x + 80, row.y + 8);
+        let p2 = Pt::new(row.x + 85, row.y + 8);
+        let mut h1 = Host::detached((760, 720), Scale(1.0));
+        w.event(Event::MouseMove(p1), &mut h1);
+        assert_eq!(h1.invalidations(), (1, 0));
+        let mut h2 = Host::detached((760, 720), Scale(1.0));
+        w.event(Event::MouseMove(p2), &mut h2);
+        assert_eq!(h2.invalidations(), (0, 0), "moving inside same row must not repaint");
+        let mut h3 = Host::detached((760, 720), Scale(1.0));
+        w.event(Event::MouseLeave, &mut h3);
+        assert_eq!(h3.invalidations(), (1, 0));
+        let mut h4 = Host::detached((760, 720), Scale(1.0));
+        w.event(Event::MouseLeave, &mut h4);
+        assert_eq!(h4.invalidations(), (0, 0));
+    }
+
+    #[test]
+    fn resized_updates_size_for_dialog_buttons_before_paint() {
+        let mut w = DoctorWindow::new(Box::new(FakeDoctor::new()));
+        let mut large_c = Canvas::new(900, 800, Scale(1.0));
+        w.scan(None);
+        w.paint(&mut large_c);
+        assert_eq!(w.size, (900, 800));
+
+        // Resize to (620, 480) via Event::Resized WITHOUT calling paint() afterwards.
+        let mut small_host = Host::detached((620, 480), Scale(1.0));
+        w.event(Event::Resized, &mut small_host);
+        assert_eq!(w.size, (620, 480));
+
+        // Open Confirm::CleanUp and compute the expected ok rect for (620, 480) vs (900, 800).
+        let m = w.model.as_mut().unwrap();
+        for r in &mut m.rows {
+            r.checked = false;
+        }
+        let orphans = idx(m, "ue:orphans");
+        m.toggle(orphans);
+        w.activate(Act::CleanUp, &mut small_host);
+        assert_eq!(w.confirm, Some(Confirm::CleanUp(vec![orphans])));
+
+        let d = w.dialog().unwrap();
+        let probe = Canvas::probe(Scale(1.0));
+        let (_, ok_large, _) = d.layout(&probe, Rect::new(0, 0, 900, 800));
+        let (_, ok_small, _) = d.layout(&probe, Rect::new(0, 0, 620, 480));
+        let click = Pt::new(ok_small.cx(), ok_small.cy());
+        assert!(!ok_large.contains(click), "ok_small center should differ from stale (900, 800) layout");
+
+        w.event(Event::MouseUp(click, MouseButton::Left), &mut small_host);
+        assert_eq!(w.confirm, None, "dialog click after Event::Resized before paint() must hit resized ok button");
     }
 }

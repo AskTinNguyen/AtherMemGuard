@@ -10,10 +10,10 @@
 //! settings edits, the guard) work on plain data and are unit-tested. The Win32 calls are
 //! in `doctor_win`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::os::windows::process::CommandExt;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,13 @@ use crate::engine::{self, is_protected, SystemStatus, UeProcess};
 use crate::startup::{self, Location};
 use crate::win::{self, Proc, SysInfo};
 use crate::paths;
+
+/// Stable process identity `(pid, creation_filetime)` so recycled PIDs never alias older processes.
+pub type ProcKey = (u32, u64);
+
+pub fn proc_key(p: &Proc) -> ProcKey {
+    (p.pid, p.created)
+}
 
 const MB: u64 = 1024 * 1024;
 /// How long `close` waits for an app to exit after asking it to.
@@ -353,35 +360,11 @@ pub fn catalog_match<'a>(cat: &'a [CatalogApp], name: &str) -> Option<&'a Catalo
 
 // ---------------------------------------------------------------- settings ([doctor] in settings.toml)
 
-/// `[doctor]` settings. Read straight from settings.toml; a missing file or key means the
-/// defaults.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct DoctorSettings {
-    /// Never proposed, whatever the catalogue says.
-    pub keep: Vec<String>,
-    /// Treated as "not needed for Unreal".
-    pub close: Vec<String>,
-    /// Asked to close whenever the editor, a build or a cook is running.
-    pub close_while_unreal: Vec<String>,
-    /// Apps using less committed memory than this are left out (unless they start with Windows).
-    pub ignore_below_mb: u64,
-    /// Unknown apps above this much committed memory are shown under "Worth a look".
-    pub review_above_mb: u64,
-    /// The tray suggests a checkup when Unreal work starts and at least this much could be freed.
-    pub nudge_above_gb: f64,
-}
+pub use crate::config::DoctorSettings;
 
-impl Default for DoctorSettings {
-    fn default() -> Self {
-        DoctorSettings {
-            keep: Vec::new(),
-            close: Vec::new(),
-            close_while_unreal: Vec::new(),
-            ignore_below_mb: 150,
-            review_above_mb: 1024,
-            nudge_above_gb: 4.0,
-        }
+fn strip_exe_suffix(p: &mut String) {
+    if p.len() >= 4 && p.get(p.len() - 4..).is_some_and(|t| t.eq_ignore_ascii_case(".exe")) {
+        p.truncate(p.len() - 4);
     }
 }
 
@@ -393,21 +376,45 @@ impl DoctorSettings {
             None => DoctorSettings::default(),
             Some(v) => v.clone().try_into::<DoctorSettings>().map_err(|e| format!("[doctor]: {}", e))?,
         };
-        for list in [&mut ds.keep, &mut ds.close, &mut ds.close_while_unreal] {
+        for (field, list) in [
+            ("doctor.keep", &mut ds.keep),
+            ("doctor.close", &mut ds.close),
+            ("doctor.close_while_unreal", &mut ds.close_while_unreal),
+        ] {
             for p in list.iter_mut() {
-                if p.to_ascii_lowercase().ends_with(".exe") {
-                    p.truncate(p.len() - 4);
+                strip_exe_suffix(p);
+                if p.trim().is_empty() {
+                    return Err(format!("{}: entries cannot be empty", field));
                 }
             }
+        }
+        if !(ds.nudge_above_gb.is_finite() && ds.nudge_above_gb >= 0.0) {
+            return Err("doctor.nudge_above_gb must be 0 or more".into());
         }
         Ok(ds)
     }
 
-    /// From settings.toml in the data folder; defaults if it's missing or broken.
+    /// Layered `[doctor]` settings (`team.toml < settings.toml`), read-only (never writes
+    /// `settings.toml`); defaults if missing or broken.
     pub fn load() -> DoctorSettings {
-        fs::read_to_string(paths::config_file())
+        let user_path = paths::config_file();
+        let team_path = crate::config::team_file();
+        if !user_path.exists() && !team_path.exists() {
+            return DoctorSettings::default();
+        }
+        let user = fs::read_to_string(&user_path).unwrap_or_default();
+        let team = fs::read_to_string(&team_path).ok();
+        if let Ok((cfg, _)) = crate::config::config_from_layers(team.as_deref(), &user) {
+            return cfg.doctor;
+        }
+        if team.is_some() {
+            if let Ok((cfg, _)) = crate::config::config_from_layers(None, &user) {
+                return cfg.doctor;
+            }
+        }
+        DoctorSettings::from_settings_text(&user)
             .ok()
-            .and_then(|t| DoctorSettings::from_settings_text(&t).ok())
+            .or_else(|| team.as_deref().and_then(|t| DoctorSettings::from_settings_text(t).ok()))
             .unwrap_or_default()
     }
 }
@@ -467,17 +474,19 @@ pub struct ProcFacts {
 
 /// MemGuard and every process it was started from (its parent, grandparent, ...). Acting
 /// on these would close the agent or terminal that ran `memguard doctor --fix`.
-pub fn self_tree(procs: &[Proc], me: u32) -> HashSet<u32> {
+pub fn self_tree(procs: &[Proc], me: u32) -> HashSet<ProcKey> {
     let by_pid: HashMap<u32, &Proc> = procs.iter().map(|p| (p.pid, p)).collect();
-    let mut tree = HashSet::from([me]);
+    let me_key = by_pid.get(&me).map(|p| proc_key(p)).unwrap_or((me, 0));
+    let mut tree = HashSet::from([me_key]);
     let mut cur = me;
     while let Some(p) = by_pid.get(&cur) {
         let Some(parent) = by_pid.get(&p.ppid) else { break };
+        let parent_key = proc_key(parent);
         // A parent created after its child is a recycled PID, not the real parent.
-        if parent.pid == 0 || tree.contains(&parent.pid) || (p.created != 0 && parent.created > p.created) {
+        if parent.pid == 0 || tree.contains(&parent_key) || (p.created != 0 && parent.created > p.created) {
             break;
         }
-        tree.insert(parent.pid);
+        tree.insert(parent_key);
         cur = parent.pid;
     }
     tree
@@ -487,8 +496,8 @@ pub fn self_tree(procs: &[Proc], me: u32) -> HashSet<u32> {
 pub struct ActContext<'a> {
     pub cfg: &'a Config,
     pub ds: &'a DoctorSettings,
-    pub self_tree: HashSet<u32>,
-    pub facts: HashMap<u32, ProcFacts>,
+    pub self_tree: HashSet<ProcKey>,
+    pub facts: HashMap<ProcKey, ProcFacts>,
 }
 
 /// Why this process must not be closed or ended, or `None` if it may be. `orphan` relaxes
@@ -500,13 +509,14 @@ pub fn refusal(ctx: &ActContext, p: &Proc, orphan: bool) -> Option<String> {
     if let Some(why) = hard_never(&p.name) {
         return Some(why.into());
     }
-    if ctx.self_tree.contains(&p.pid) {
+    let key = proc_key(p);
+    if ctx.self_tree.contains(&key) {
         return Some("Ather MemGuard was started from it, so it won't close it.".into());
     }
     if !orphan && is_protected(ctx.cfg, p) {
         return Some("It's part of Unreal work and is protected.".into());
     }
-    let facts = ctx.facts.get(&p.pid).copied().unwrap_or_default();
+    let facts = ctx.facts.get(&key).copied().unwrap_or_default();
     if !facts.owned {
         return Some("It belongs to another user or to Windows.".into());
     }
@@ -535,21 +545,20 @@ pub struct ScanInput {
     pub time: String,
     pub sys: SysInfo,
     pub procs: Vec<Proc>,
-    pub facts: HashMap<u32, ProcFacts>,
+    pub facts: HashMap<ProcKey, ProcFacts>,
     pub windows: HashMap<u32, WindowFacts>,
     pub startup: Vec<startup::Entry>,
     pub ue: Vec<UeProcess>,
     pub unreal_active: bool,
     pub memguard_running: bool,
     pub memguard_paused: bool,
-    pub self_tree: HashSet<u32>,
+    pub self_tree: HashSet<ProcKey>,
 }
 
 /// Look at this PC and say what could be freed. Read-only.
 pub fn scan(cfg: &Config) -> Report {
-    let ds = DoctorSettings::load();
     let input = gather(cfg);
-    let mut report = build_report(cfg, &ds, &input, &mut describe_pid);
+    let mut report = build_report(cfg, &cfg.doctor, &input, &mut describe_pid);
     // The RAM check reads firmware tables, so it runs once per process (`check_cached`).
     // Only reading here: the "Show me how" page is written when the person clicks it.
     add_ram_findings(&mut report, cfg.general.check_ram_speed, crate::ramcheck::check_cached);
@@ -662,7 +671,7 @@ fn window_facts() -> HashMap<u32, WindowFacts> {
     map
 }
 
-fn facts_for(procs: &[Proc]) -> HashMap<u32, ProcFacts> {
+fn facts_for(procs: &[Proc]) -> HashMap<ProcKey, ProcFacts> {
     let me = doctor_win::current_user_sid();
     let session = doctor_win::current_session();
     procs
@@ -670,7 +679,7 @@ fn facts_for(procs: &[Proc]) -> HashMap<u32, ProcFacts> {
         .filter(|p| p.pid != 0)
         .map(|p| {
             let o = doctor_win::ownership(p.pid, me.as_deref(), session);
-            (p.pid, ProcFacts { owned: o.owned, same_session: o.same_session })
+            (proc_key(p), ProcFacts { owned: o.owned, same_session: o.same_session })
         })
         .collect()
 }
@@ -734,13 +743,41 @@ struct AppAcc<'a> {
     entry: Option<&'a CatalogApp>,
     verdict: Option<Verdict>,
     names: BTreeSet<String>,
-    pids: Vec<u32>,
+    keys: Vec<ProcKey>,
     ram: u64,
     committed: u64,
     visible: usize,
     candidates: usize,
     in_self_tree: bool,
     members: Vec<&'a Proc>,
+}
+
+const MAX_RECORDED_FINDING_KEYS: usize = 512;
+type ScanKeysKey = (String, String, Vec<u32>);
+
+static SCAN_PROC_KEYS: Mutex<VecDeque<(ScanKeysKey, Vec<ProcKey>)>> = Mutex::new(VecDeque::new());
+
+fn record_scan_keys(time: &str, id: &str, pids: &[u32], keys: Vec<ProcKey>) {
+    if pids.is_empty() || keys.is_empty() {
+        return;
+    }
+    let mut map = SCAN_PROC_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (time.to_string(), id.to_string(), pids.to_vec());
+    if map.len() >= MAX_RECORDED_FINDING_KEYS {
+        map.pop_front();
+    }
+    map.push_back((key, keys));
+}
+
+fn lookup_scan_keys(time: &str, id: &str, pids: &[u32]) -> Option<Vec<ProcKey>> {
+    if pids.is_empty() {
+        return None;
+    }
+    let map = SCAN_PROC_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    map.iter()
+        .rev()
+        .find(|((t, i, p), _)| t == time && i == id && p == pids)
+        .map(|(_, ks)| ks.clone())
 }
 
 fn combine(a: Option<Verdict>, b: Option<Verdict>) -> Option<Verdict> {
@@ -791,7 +828,8 @@ pub fn build_report(
         if p.pid == 0 || is_protected(cfg, p) {
             continue;
         }
-        let f = input.facts.get(&p.pid).copied().unwrap_or_default();
+        let pk = proc_key(p);
+        let f = input.facts.get(&pk).copied().unwrap_or_default();
         if !f.owned || !f.same_session {
             continue;
         }
@@ -812,13 +850,13 @@ pub fn build_report(
             acc.verdict = combine(acc.verdict, verdict);
         }
         acc.names.insert(p.name.clone());
-        acc.pids.push(p.pid);
+        acc.keys.push(pk);
         acc.ram += p.ram;
         acc.committed += p.committed;
         let w = input.windows.get(&p.pid).copied().unwrap_or_default();
         acc.visible += w.visible;
         acc.candidates += w.candidates;
-        acc.in_self_tree |= input.self_tree.contains(&p.pid);
+        acc.in_self_tree |= input.self_tree.contains(&pk);
         acc.members.push(p);
     }
 
@@ -830,7 +868,7 @@ pub fn build_report(
         let mut committed_mb = acc.committed / MB;
         let mut ram_mb = acc.ram / MB;
         let mut names: Vec<String> = acc.names.iter().cloned().collect();
-        let mut pids = acc.pids.clone();
+        let mut keys = acc.keys.clone();
         let auto = acc.verdict.is_none();
         let verdict = match acc.verdict {
             Some(Verdict::Keep) => continue,
@@ -852,10 +890,11 @@ pub fn build_report(
             }
             ram_mb = loose.iter().map(|p| p.ram).sum::<u64>() / MB;
             names = loose.iter().map(|p| p.name.clone()).collect::<BTreeSet<_>>().into_iter().collect();
-            pids = loose.iter().map(|p| p.pid).collect();
+            keys = loose.iter().map(|p| proc_key(p)).collect();
         }
+        let pids: Vec<u32> = keys.iter().map(|&(pid, _)| pid).collect();
         let desc = acc.entry.map(|e| e.description.clone()).unwrap_or_default();
-        let described = if verdict == Verdict::Review && auto { acc.pids.first().and_then(|&pid| describe(pid)) } else { None };
+        let described = if verdict == Verdict::Review && auto { keys.first().and_then(|&(pid, _)| describe(pid)) } else { None };
         let company = described.as_ref().map(|(_, c)| c.trim().to_string()).unwrap_or_default();
         let mut detail = match verdict {
             Verdict::Review if auto => match described {
@@ -926,6 +965,7 @@ pub fn build_report(
         f.has_window = acc.visible > 0;
         f.group = group;
         f.company = company;
+        record_scan_keys(&input.time, &f.id, &f.pids, keys);
         findings.push(f);
     }
 
@@ -966,7 +1006,7 @@ pub fn build_report(
             title,
             detail,
         );
-        f.processes = running.iter().map(|a| a.pids.len()).sum();
+        f.processes = running.iter().map(|a| a.keys.len()).sum();
         f.ram_mb = ram / MB;
         f.committed_mb = committed / MB;
         if switchable {
@@ -982,7 +1022,7 @@ pub fn build_report(
     // ---- Unreal leftovers
     let orphans: Vec<&Proc> = find_orphans(cfg, &input.procs)
         .into_iter()
-        .filter(|p| input.facts.get(&p.pid).map_or(false, |f| f.owned && f.same_session))
+        .filter(|p| input.facts.get(&proc_key(p)).map_or(false, |f| f.owned && f.same_session))
         .collect();
     if !orphans.is_empty() {
         let mut f = Finding::new(
@@ -1002,6 +1042,8 @@ pub fn build_report(
         f.actions.push(Action::new(ActionKind::End, None));
         f.names = orphans.iter().map(|p| p.name.clone()).collect::<BTreeSet<_>>().into_iter().collect();
         f.pids = orphans.iter().map(|p| p.pid).collect();
+        let keys: Vec<ProcKey> = orphans.iter().map(|p| proc_key(p)).collect();
+        record_scan_keys(&input.time, &f.id, &f.pids, keys);
         findings.push(f);
     }
     let editors: Vec<&UeProcess> = input.ue.iter().filter(|p| p.kind == "editor").collect();
@@ -1018,6 +1060,8 @@ pub fn build_report(
         f.committed_mb = (committed_gb * 1024.0) as u64;
         f.ram_mb = (editors.iter().map(|p| p.ram_gb).sum::<f64>() * 1024.0) as u64;
         f.pids = editors.iter().map(|p| p.pid).collect();
+        let keys: Vec<ProcKey> = editors.iter().map(|p| (p.pid, p.created)).collect();
+        record_scan_keys(&input.time, &f.id, &f.pids, keys);
         findings.push(f);
     }
     for p in &editors {
@@ -1038,6 +1082,7 @@ pub fn build_report(
             f.committed_mb = (p.committed_gb * 1024.0) as u64;
             f.ram_mb = (p.ram_gb * 1024.0) as u64;
             f.pids = vec![p.pid];
+            record_scan_keys(&input.time, &f.id, &f.pids, vec![(p.pid, p.created)]);
             findings.push(f);
         }
     }
@@ -1319,15 +1364,9 @@ pub fn doc_drop_redundant_group(doc: &mut toml_edit::DocumentMut, group: &str, b
 }
 
 /// Check an edited settings text before writing it: valid TOML, a valid `[doctor]` table,
-/// and everything else still accepted by `Config`.
+/// and everything else accepted by `Config`.
 pub fn validate_settings(text: &str) -> Result<(), String> {
-    let mut table: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
-    DoctorSettings::from_settings_text(text)?;
-    // `[doctor]` is read by the doctor itself; until the integrator adds it to `Config`'s
-    // schema, check the rest without it.
-    table.remove("doctor");
-    let rest = toml::to_string(&table).map_err(|e| e.to_string())?;
-    Config::parse(&rest).map(|_| ())
+    Config::parse(text).map(|_| ())
 }
 
 /// Read settings.toml, apply `edit`, validate, and write it back atomically. Comments and
@@ -1346,10 +1385,7 @@ fn edit_settings<T>(edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<T, 
         return Ok(result);
     }
     validate_settings(&new_text).map_err(|e| format!("the change would break the settings file: {}", e))?;
-    fs::create_dir_all(paths::data_dir()).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("toml.doctor-tmp");
-    fs::write(&tmp, &new_text).map_err(|e| format!("{}: {}", tmp.display(), e))?;
-    fs::rename(&tmp, &path).map_err(|e| format!("{}: {}", path.display(), e))?;
+    crate::config::write_atomic(&path, &new_text)?;
     Ok(result)
 }
 
@@ -1421,11 +1457,7 @@ impl UndoLog {
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = UndoLog::path();
-        fs::create_dir_all(paths::data_dir()).map_err(|e| e.to_string())?;
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, self.to_text()).map_err(|e| e.to_string())?;
-        fs::rename(&tmp, &path).map_err(|e| e.to_string())
+        crate::config::write_atomic(&UndoLog::path(), &self.to_text())
     }
 
     pub fn push_run(&mut self, run: UndoRun) {
@@ -1536,21 +1568,28 @@ fn check_pick(f: &Finding, action: ActionKind, force: bool) -> Result<(), String
 
 /// The finding's processes that are still running now, and the reasons any are refused.
 fn live_targets<'a>(
+    report_time: &str,
     f: &Finding,
     procs: &'a [Proc],
     ctx: &ActContext,
     cfg: &Config,
 ) -> (Vec<&'a Proc>, Vec<String>) {
-    let orphan_pids: HashSet<u32> =
-        if f.id == "ue:orphans" { find_orphans(cfg, procs).iter().map(|p| p.pid).collect() } else { HashSet::new() };
+    let orphan_keys: HashSet<ProcKey> =
+        if f.id == "ue:orphans" { find_orphans(cfg, procs).into_iter().map(proc_key).collect() } else { HashSet::new() };
+    let expected_keys = lookup_scan_keys(report_time, &f.id, &f.pids);
     let mut ok = Vec::new();
     let mut refused = Vec::new();
-    for &pid in &f.pids {
+    for (idx, &pid) in f.pids.iter().enumerate() {
         let Some(p) = procs.iter().find(|p| p.pid == pid) else { continue };
         if !f.names.iter().any(|n| n.eq_ignore_ascii_case(&p.name)) {
             continue; // PID reused by something else
         }
-        if f.id == "ue:orphans" && !orphan_pids.contains(&pid) {
+        if let Some(expected) = expected_keys.as_ref().and_then(|ks| ks.get(idx).copied()) {
+            if expected.0 == pid && expected.1 != 0 && p.created != 0 && p.created != expected.1 {
+                continue; // PID reused by another instance of the same app
+            }
+        }
+        if f.id == "ue:orphans" && !orphan_keys.contains(&proc_key(p)) {
             refused.push(format!("{} (PID {}) has a parent again.", p.name, pid));
             continue;
         }
@@ -1565,9 +1604,12 @@ fn live_targets<'a>(
 /// The command lines to start an app again: its root processes (whose parent isn't part
 /// of the same app).
 fn relaunch_info(targets: &[&Proc]) -> Vec<Relaunch> {
-    let pids: HashSet<u32> = targets.iter().map(|p| p.pid).collect();
     let mut out: Vec<Relaunch> = Vec::new();
-    for p in targets.iter().filter(|p| !pids.contains(&p.ppid)) {
+    for p in targets.iter().filter(|p| {
+        !targets.iter().any(|parent| {
+            parent.pid == p.ppid && (p.created == 0 || parent.created == 0 || parent.created <= p.created)
+        })
+    }) {
         if let Some(exe) = doctor_win::image_path(p.pid) {
             let command_line = win::command_line(p.pid).unwrap_or_default();
             if !out.iter().any(|r| r.exe.eq_ignore_ascii_case(&exe) && r.command_line == command_line) {
@@ -1610,7 +1652,7 @@ fn run_picks(report: &Report, picks: &[(String, ActionKind)], force: bool, dry: 
         };
         match action {
             ActionKind::Close | ActionKind::End => {
-                let (targets, refused) = live_targets(f, &procs, &ctx, &cfg);
+                let (targets, refused) = live_targets(&report.time, f, &procs, &ctx, &cfg);
                 if !refused.is_empty() {
                     // One refused process refuses the whole app: closing half an app helps nobody.
                     outcomes.push(Outcome::new(id, action, OutcomeKind::Refused, refused[0].clone()));
@@ -1808,12 +1850,51 @@ fn run_picks(report: &Report, picks: &[(String, ActionKind)], force: bool, dry: 
 /// Split a command line into the program and the rest, Windows style.
 fn split_command_line(cmd: &str) -> (String, String) {
     let cmd = cmd.trim_start();
+    if cmd.is_empty() {
+        return (String::new(), String::new());
+    }
     if let Some(rest) = cmd.strip_prefix('"') {
         match rest.find('"') {
             Some(i) => (rest[..i].to_string(), rest[i + 1..].trim_start().to_string()),
             None => (rest.to_string(), String::new()),
         }
     } else {
+        let mut prev_ws = false;
+        for (i, ch) in cmd.char_indices() {
+            if ch.is_whitespace() {
+                if !prev_ws && i > 0 && std::path::Path::new(&cmd[..i]).is_file() {
+                    return (cmd[..i].to_string(), cmd[i..].trim_start().to_string());
+                }
+                prev_ws = true;
+            } else {
+                prev_ws = false;
+            }
+        }
+        if std::path::Path::new(cmd).is_file() {
+            return (cmd.to_string(), String::new());
+        }
+
+        let lower = cmd.to_ascii_lowercase();
+        let mut earliest: Option<usize> = None;
+        for ext in [".exe", ".cmd", ".bat", ".com"] {
+            let mut from = 0;
+            while let Some(rel) = lower[from..].find(ext) {
+                let start = from + rel;
+                let end = start + ext.len();
+                if cmd[..start].contains('"') {
+                    break;
+                }
+                if end == cmd.len() || cmd[end..].starts_with(char::is_whitespace) {
+                    earliest = Some(earliest.map_or(end, |prev| prev.min(end)));
+                    break;
+                }
+                from = start + 1;
+            }
+        }
+        if let Some(end) = earliest {
+            return (cmd[..end].to_string(), cmd[end..].trim_start().to_string());
+        }
+
         match cmd.find(char::is_whitespace) {
             Some(i) => (cmd[..i].to_string(), cmd[i..].trim_start().to_string()),
             None => (cmd.to_string(), String::new()),
@@ -1821,8 +1902,31 @@ fn split_command_line(cmd: &str) -> (String, String) {
     }
 }
 
+fn split_command_line_with_exe(cmd: &str, exe: &str) -> (String, String) {
+    let trimmed = cmd.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('"') || exe.is_empty() {
+        return split_command_line(trimmed);
+    }
+    let no_ext = if exe.len() >= 4 && exe.get(exe.len() - 4..).is_some_and(|t| t.eq_ignore_ascii_case(".exe")) {
+        Some(&exe[..exe.len() - 4])
+    } else {
+        None
+    };
+    for cand in std::iter::once(exe).chain(no_ext) {
+        if !cand.is_empty()
+            && trimmed.len() >= cand.len()
+            && trimmed.is_char_boundary(cand.len())
+            && trimmed[..cand.len()].eq_ignore_ascii_case(cand)
+            && (trimmed.len() == cand.len() || trimmed[cand.len()..].starts_with(char::is_whitespace))
+        {
+            return (trimmed[..cand.len()].to_string(), trimmed[cand.len()..].trim_start().to_string());
+        }
+    }
+    split_command_line(trimmed)
+}
+
 fn relaunch(r: &Relaunch) -> Result<(), String> {
-    let (_, args) = split_command_line(&r.command_line);
+    let (_, args) = split_command_line_with_exe(&r.command_line, &r.exe);
     let mut cmd = std::process::Command::new(&r.exe);
     if !args.is_empty() {
         cmd.raw_arg(&args);
@@ -1922,13 +2026,38 @@ pub enum GuardEvent {
     Close { app: String, pids: Vec<u32> },
 }
 
+const MAX_GUARD_KEYS: usize = 2048;
+static GUARD_KEYS: OnceLock<Mutex<HashMap<(String, u32), u64>>> = OnceLock::new();
+
+fn guard_keys_map() -> &'static Mutex<HashMap<(String, u32), u64>> {
+    GUARD_KEYS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_guard_keys(app: &str, keys: &[ProcKey]) {
+    let app_lower = app.to_ascii_lowercase();
+    let mut map = guard_keys_map().lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() + keys.len() > MAX_GUARD_KEYS {
+        map.clear();
+    }
+    for &(pid, created) in keys {
+        if created != 0 {
+            map.insert((app_lower.clone(), pid), created);
+        }
+    }
+}
+
+fn lookup_guard_created(app: &str, pid: u32) -> Option<u64> {
+    let map = guard_keys_map().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&(app.to_ascii_lowercase(), pid)).copied()
+}
+
 /// Watches for `[doctor] close_while_unreal` apps while the editor, a build or a cook runs.
 /// Each appearance is proposed once; an app the person allowed stays allowed until Unreal
 /// stops. The tray calls `on_tick` every tick and `guard_close` for each event.
 #[derive(Debug, Default)]
 pub struct Guard {
     patterns: Vec<String>,
-    handled: HashSet<u32>,
+    handled: HashSet<ProcKey>,
     allowed: HashSet<String>,
 }
 
@@ -1958,11 +2087,12 @@ impl Guard {
             self.allowed.clear();
             return Vec::new();
         }
-        let alive: HashSet<u32> = procs.iter().map(|p| p.pid).collect();
-        self.handled.retain(|pid| alive.contains(pid));
-        let mut found: BTreeMap<String, (String, Vec<u32>)> = BTreeMap::new();
+        let alive: HashSet<ProcKey> = procs.iter().map(proc_key).collect();
+        self.handled.retain(|k| alive.contains(k));
+        let mut found: BTreeMap<String, (String, Vec<ProcKey>)> = BTreeMap::new();
         for p in procs {
-            if p.pid == 0 || self.handled.contains(&p.pid) || hard_never(&p.name).is_some() {
+            let pk = proc_key(p);
+            if p.pid == 0 || self.handled.contains(&pk) || hard_never(&p.name).is_some() {
                 continue;
             }
             if !any_matches(&self.patterns, &p.name) {
@@ -1972,12 +2102,14 @@ impl Guard {
             if self.allowed.contains(&key) {
                 continue;
             }
-            found.entry(key).or_insert_with(|| (p.name.clone(), Vec::new())).1.push(p.pid);
+            found.entry(key).or_insert_with(|| (p.name.clone(), Vec::new())).1.push(pk);
         }
         found
             .into_values()
-            .map(|(app, pids)| {
-                self.handled.extend(pids.iter().copied());
+            .map(|(app, keys)| {
+                self.handled.extend(keys.iter().copied());
+                record_guard_keys(&app, &keys);
+                let pids = keys.into_iter().map(|(pid, _)| pid).collect();
                 GuardEvent::Close { app, pids }
             })
             .collect()
@@ -1996,6 +2128,11 @@ pub fn guard_close(ev: &GuardEvent) -> Outcome {
     let mut targets = HashSet::new();
     for &pid in pids {
         let Some(p) = procs.iter().find(|p| p.pid == pid && p.name.eq_ignore_ascii_case(app)) else { continue };
+        if let Some(expected_created) = lookup_guard_created(app, pid) {
+            if p.created != 0 && p.created != expected_created {
+                continue; // PID reused by another instance of the same app
+            }
+        }
         if let Some(why) = refusal(&ctx, p, false) {
             return Outcome::new(&id, ActionKind::Close, OutcomeKind::Refused, why);
         }
@@ -2032,7 +2169,7 @@ mod tests {
     }
 
     fn input(procs: Vec<Proc>) -> ScanInput {
-        let facts = procs.iter().map(|p| (p.pid, ProcFacts { owned: true, same_session: true })).collect();
+        let facts = procs.iter().map(|p| (proc_key(p), ProcFacts { owned: true, same_session: true })).collect();
         ScanInput {
             time: "2026-11-14 12:00:00".into(),
             sys: SysInfo {
@@ -2289,8 +2426,8 @@ mod tests {
     #[test]
     fn other_users_and_sessions_are_left_out() {
         let mut inp = input(vec![proc(10, 1, "steam", 900), proc(11, 1, "Spotify", 900), proc(12, 1, "Battle.net", 900)]);
-        inp.facts.insert(10, ProcFacts { owned: false, same_session: true });
-        inp.facts.insert(11, ProcFacts { owned: true, same_session: false });
+        inp.facts.insert(proc_key(&inp.procs[0]), ProcFacts { owned: false, same_session: true });
+        inp.facts.insert(proc_key(&inp.procs[1]), ProcFacts { owned: true, same_session: false });
         let r = report(&inp, &DoctorSettings::default());
         assert!(r.finding("app:steam").is_none());
         assert!(r.finding("app:spotify").is_none());
@@ -2360,7 +2497,7 @@ mod tests {
     #[test]
     fn self_tree_apps_get_no_close_actions() {
         let mut inp = input(vec![proc(10, 1, "steam", 900)]);
-        inp.self_tree.insert(10);
+        inp.self_tree.insert(proc_key(&inp.procs[0]));
         inp.windows.insert(10, WindowFacts { visible: 0, candidates: 1 });
         let r = report(&inp, &DoctorSettings::default());
         let f = r.finding("app:steam").unwrap();
@@ -2463,7 +2600,7 @@ mod tests {
             cfg,
             ds,
             self_tree: HashSet::new(),
-            facts: procs.iter().map(|p| (p.pid, ProcFacts { owned: true, same_session: true })).collect(),
+            facts: procs.iter().map(|p| (proc_key(p), ProcFacts { owned: true, same_session: true })).collect(),
         }
     }
 
@@ -2484,8 +2621,8 @@ mod tests {
             proc(19, 1, "RustDesk", 1),
         ];
         let mut ctx = ctx_for(&cfg, &ds, &procs);
-        ctx.facts.insert(15, ProcFacts { owned: false, same_session: true });
-        ctx.facts.insert(16, ProcFacts { owned: true, same_session: false });
+        ctx.facts.insert(proc_key(&procs[5]), ProcFacts { owned: false, same_session: true });
+        ctx.facts.insert(proc_key(&procs[6]), ProcFacts { owned: true, same_session: false });
         let me = proc(win::current_pid(), 1, "athermemguard-test", 1);
         let r = |p: &Proc| refusal(&ctx, p, false);
         assert_eq!(r(&procs[0]), None);
@@ -2502,7 +2639,7 @@ mod tests {
         assert!(r(&procs[8]).is_some());
         assert_eq!(refusal(&ctx, &procs[8], true), None);
         // Self tree.
-        ctx.self_tree.insert(10);
+        ctx.self_tree.insert(proc_key(&procs[0]));
         assert!(refusal(&ctx, &procs[0], false).unwrap().contains("started from it"));
     }
 
@@ -2517,9 +2654,9 @@ mod tests {
             Proc { pid: 20, ppid: 21, name: "child-of-new".into(), ram: 0, private: 0, committed: 0, created: 50, queryable: true },
             Proc { pid: 21, ppid: 1, name: "recycled".into(), ram: 0, private: 0, committed: 0, created: 60, queryable: true },
         ];
-        assert_eq!(self_tree(&procs, 12), HashSet::from([12, 9, 5, 1]));
-        assert_eq!(self_tree(&procs, 20), HashSet::from([20]));
-        assert_eq!(self_tree(&procs, 777), HashSet::from([777]));
+        assert_eq!(self_tree(&procs, 12), HashSet::from([(12, 40), (9, 30), (5, 20), (1, 10)]));
+        assert_eq!(self_tree(&procs, 20), HashSet::from([(20, 50)]));
+        assert_eq!(self_tree(&procs, 777), HashSet::from([(777, 0)]));
     }
 
     #[test]
@@ -2594,6 +2731,40 @@ mod tests {
         assert_eq!(split_command_line(r"C:\a.exe /bg"), (r"C:\a.exe".into(), "/bg".into()));
         assert_eq!(split_command_line(r#""C:\a.exe""#), (r"C:\a.exe".into(), String::new()));
         assert_eq!(split_command_line(""), (String::new(), String::new()));
+        // Unquoted paths with spaces (Bug #17a)
+        assert_eq!(
+            split_command_line(r#"C:\Program Files\My App\app.exe --flag "arg with space""#),
+            (r"C:\Program Files\My App\app.exe".into(), r#"--flag "arg with space""#.into())
+        );
+        assert_eq!(
+            split_command_line(r"C:\Program Files\My App\app.exe"),
+            (r"C:\Program Files\My App\app.exe".into(), String::new())
+        );
+        assert_eq!(
+            split_command_line(r"C:\dir.exe\My App\app.exe /min"),
+            (r"C:\dir.exe\My App\app.exe".into(), "/min".into())
+        );
+        assert_eq!(
+            split_command_line(r"C:\My Scripts\run.cmd /k foo.exe"),
+            (r"C:\My Scripts\run.cmd".into(), "/k foo.exe".into())
+        );
+        assert_eq!(
+            split_command_line(r#"tool --input "C:\Program Files\other.exe""#),
+            ("tool".into(), r#"--input "C:\Program Files\other.exe""#.into())
+        );
+        assert_eq!(
+            split_command_line_with_exe(r"C:\Program Files\App\app --flag 1", r"C:\Program Files\App\app.exe"),
+            (r"C:\Program Files\App\app".into(), "--flag 1".into())
+        );
+        // Real spaced file on disk (even extensionless or multi-space)
+        let dir = std::env::temp_dir().join(format!("amg-cmd-split-{}", std::process::id()));
+        let sub = dir.join("dir with spaces");
+        std::fs::create_dir_all(&sub).unwrap();
+        let file = sub.join("my tool.bin");
+        std::fs::write(&file, b"ok").unwrap();
+        let full = format!("{} --run arg", file.display());
+        assert_eq!(split_command_line(&full), (file.display().to_string(), "--run arg".into()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- settings edits
@@ -2645,8 +2816,44 @@ mod tests {
     fn validation_rejects_broken_results() {
         assert!(validate_settings("interval_sec = \"ten\"").is_err());
         assert!(validate_settings("[doctor]\nkeep = 1").is_err());
+        assert!(validate_settings("[doctor]\nunknown_doctor_field = true\n").is_err());
         assert!(validate_settings("[doctor]\nkeep = [\"a\"]\n").is_ok());
         assert!(validate_settings("nonsense_key = 1\n").is_err());
+        assert!(DoctorSettings::from_settings_text("[doctor]\nunknown_key = 1\n").is_err());
+        assert!(DoctorSettings::from_settings_text("[doctor]\nkeep = [\"\"]\n").is_err());
+        assert!(DoctorSettings::from_settings_text("[doctor]\nnudge_above_gb = -1.0\n").is_err());
+    }
+
+    #[test]
+    fn guard_and_live_targets_detect_same_name_pid_reuse() {
+        // Guard re-triggers when the same PID is reused with a different creation timestamp.
+        let mut g = Guard::new(vec!["Spotify".into()]);
+        let mut p1 = proc(55, 1, "Spotify", 100);
+        p1.created = 10_000;
+        let ev1 = g.on_tick(std::slice::from_ref(&p1), true);
+        assert_eq!(ev1, vec![GuardEvent::Close { app: "Spotify".into(), pids: vec![55] }]);
+        assert!(g.on_tick(std::slice::from_ref(&p1), true).is_empty());
+
+        let mut p2 = proc(55, 1, "Spotify", 100);
+        p2.created = 20_000;
+        let ev2 = g.on_tick(std::slice::from_ref(&p2), true);
+        assert_eq!(ev2, vec![GuardEvent::Close { app: "Spotify".into(), pids: vec![55] }]);
+
+        // build_report + live_targets rejects a reused PID with the same executable name.
+        let mut s1 = proc(77, 1, "steam", 900);
+        s1.created = 11_111;
+        let inp = input(vec![s1]);
+        let r = build_report(&Config::builtin(), &DoctorSettings::default(), &inp, &mut |_| None);
+        let f = r.finding("app:steam").expect("steam finding");
+        let cfg = Config::builtin();
+        let ds = DoctorSettings::default();
+        let mut s2 = proc(77, 1, "steam", 900);
+        s2.created = 22_222;
+        let live_procs = vec![s2];
+        let ctx = ctx_for(&cfg, &ds, &live_procs);
+        let (targets, refused) = live_targets(&r.time, f, &live_procs, &ctx, &cfg);
+        assert!(targets.is_empty(), "reused PID with newer created timestamp must be skipped");
+        assert!(refused.is_empty());
     }
 
     // ---- guard
@@ -2747,5 +2954,18 @@ mod tests {
         add_ram_findings(&mut r, true, || &below);
         assert_eq!(r.findings.last().unwrap().id, "sys:ram", "system rows come last");
         assert_eq!((r.reclaimable_ram_gb, r.reclaimable_commit_gb), reclaim, "frees nothing");
+    }
+
+    #[test]
+    fn t5_split_command_line_with_exe_utf8_and_mismatched_quote() {
+        // Multi-byte UTF-8 boundary right around exe.len() must never panic.
+        let (prog, args) = split_command_line_with_exe("app café.exe --flag", "app café.exe");
+        assert_eq!(prog, "app café.exe");
+        assert_eq!(args, "--flag");
+
+        // Unclosed leading quote returns full rest cleanly without panicking.
+        let (p2, a2) = split_command_line("\"C:\\dir with space\\tool.exe --arg");
+        assert_eq!(p2, "C:\\dir with space\\tool.exe --arg");
+        assert_eq!(a2, "");
     }
 }

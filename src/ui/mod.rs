@@ -16,6 +16,7 @@ pub mod toast;
 pub mod settings_model;
 pub mod settings;
 pub mod ui_state;
+#[cfg(any(test, feature = "ui-snapshots"))]
 pub mod snapshots;
 pub mod flyout;
 pub mod real_store;

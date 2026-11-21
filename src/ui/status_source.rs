@@ -1,8 +1,12 @@
 //! Where the UI gets the engine's latest `Status` (the tray loop owns the engine).
 
+#[cfg(any(test, feature = "ui-snapshots"))]
 use crate::config::{Cpu, MemPriority};
+#[cfg(any(test, feature = "ui-snapshots"))]
 use crate::breakdown::{AppRam, GroupRam, RamBreakdown};
-use crate::engine::{Activities, Effective, GroupStatus, Level, Status, SystemStatus, UeProcess, UeStatus};
+use crate::engine::Status;
+#[cfg(any(test, feature = "ui-snapshots"))]
+use crate::engine::{Activities, Effective, GroupStatus, Level, SystemStatus, UeProcess, UeStatus};
 
 pub trait StatusSource {
     /// The engine's most recent status, `None` before the first tick.
@@ -10,14 +14,17 @@ pub trait StatusSource {
 }
 
 /// Always returns the same status.
+#[cfg(any(test, feature = "ui-snapshots"))]
 pub struct FakeStatus(pub Option<Status>);
 
+#[cfg(any(test, feature = "ui-snapshots"))]
 impl Default for FakeStatus {
     fn default() -> FakeStatus {
         FakeStatus(Some(sample_status()))
     }
 }
 
+#[cfg(any(test, feature = "ui-snapshots"))]
 impl StatusSource for FakeStatus {
     fn latest(&self) -> Option<Status> {
         self.0.clone()
@@ -33,6 +40,7 @@ impl<F: Fn() -> Option<Status>> StatusSource for F {
 
 /// The numbers drawn in docs/design/mockup.html: editor + build, normal pressure,
 /// 45.1 of 127.7 GB RAM free, 27.6 of 144 GB commit free.
+#[cfg(any(test, feature = "ui-snapshots"))]
 pub fn sample_status() -> Status {
     let group = |name: &str, processes: usize, ram_mb: u64, cap_mb: u64, priority: MemPriority, cpu: Cpu| GroupStatus {
         name: name.to_string(),
@@ -96,6 +104,7 @@ pub fn sample_status() -> Status {
 }
 
 /// The sample's RAM in use (82.6 GB) split up; the parts add up.
+#[cfg(any(test, feature = "ui-snapshots"))]
 pub fn sample_breakdown() -> RamBreakdown {
     let app = |name: &str, processes: usize, ram_gb: f64| AppRam { name: name.into(), processes, ram_gb };
     let group = |name: &str, ram_gb: f64| GroupRam { name: name.into(), ram_gb };

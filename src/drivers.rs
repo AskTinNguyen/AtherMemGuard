@@ -1,26 +1,19 @@
 //! "Windows and drivers": which kernel pool tags, drivers and Windows processes hold the RAM
 //! the flyout's "Windows and drivers" row counts (see `engine::ram_breakdown`).
 //!
-//! Per-driver detail comes from NtQuerySystemInformation(SystemPoolTagInformation): kernel
-//! memory by 4-letter pool tag. A tag is tied to driver files the classic way (`findstr /m /l`):
-//! the .sys files in System32\drivers that contain the tag's 4 bytes. That is a hint, not proof.
+//! Per-driver detail comes from `NtQuerySystemInformation(SystemPoolTagInformation)` via `win`:
+//! kernel memory by 4-letter pool tag. A tag is tied to loaded driver `.sys` files (queried via
+//! `NtQuerySystemInformation(SystemModuleInformation)`) that contain the tag's 4 bytes.
+//! That is a hint, not proof.
 
 use crate::report_page::{esc, esc_rich, page};
 use std::collections::HashMap;
-use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
 use crate::win;
 
-#[link(name = "ntdll")]
-extern "system" {
-    fn NtQuerySystemInformation(class: u32, info: *mut c_void, len: u32, ret: *mut u32) -> i32;
-}
-
-const SYSTEM_POOL_TAG_INFORMATION: u32 = 22;
-const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004u32 as i32;
 const GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const TOP_PROCESSES: usize = 8;
 const TOP_TAGS: usize = 15;
@@ -119,10 +112,13 @@ impl RawTag {
 
 /// x64 SYSTEM_POOLTAG: Tag[4], PagedAllocs, PagedFrees, pad, PagedUsed (8), NonPagedAllocs,
 /// NonPagedFrees, NonPagedUsed (8).
+#[cfg(test)]
 const ENTRY_SIZE: usize = 40;
+#[cfg(test)]
 const ENTRIES_OFFSET: usize = 8;
 
 /// Parse a SYSTEM_POOLTAG_INFORMATION buffer. Entries past the end of `buf` are dropped.
+#[cfg(test)]
 fn parse_pool_tags(buf: &[u8]) -> Vec<RawTag> {
     let u32_at = |o: usize| buf.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
     let u64_at = |o: usize| buf.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
@@ -142,26 +138,11 @@ fn parse_pool_tags(buf: &[u8]) -> Vec<RawTag> {
 
 /// The live pool tag list, or None when Windows refuses (e.g. not allowed).
 fn query_pool_tags() -> Option<Vec<RawTag>> {
-    let mut buf = vec![0u64; 64 * 1024]; // 512 KB
-    for _ in 0..8 {
-        let bytes = (buf.len() * 8) as u32;
-        let mut ret = 0u32;
-        let status = unsafe { NtQuerySystemInformation(SYSTEM_POOL_TAG_INFORMATION, buf.as_mut_ptr() as *mut c_void, bytes, &mut ret) };
-        if status == STATUS_INFO_LENGTH_MISMATCH {
-            let want = (ret as usize).max(buf.len() * 16) + 64 * 1024;
-            buf = vec![0u64; want / 8 + 1];
-            continue;
-        }
-        if status < 0 {
-            return None;
-        }
-        let used = (ret as usize).min(buf.len() * 8);
-        let all = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 8) };
-        // Some Windows versions leave ret at 0 on success; then trust Count.
-        let slice = if used >= ENTRIES_OFFSET { &all[..used] } else { all };
-        return Some(parse_pool_tags(slice));
-    }
-    None
+    win::pool_tag_info().map(|tags| {
+        tags.into_iter()
+            .map(|t| RawTag { tag: t.tag, paged_used: t.paged_used, nonpaged_used: t.nonpaged_used })
+            .collect()
+    })
 }
 
 /// Tag bytes as text: printable ASCII kept (spaces too), anything else as '.'.
@@ -270,25 +251,46 @@ fn contains_each(hay: &[u8], needles: &[[u8; 4]]) -> Vec<bool> {
     found
 }
 
+fn loaded_sys_paths() -> Vec<PathBuf> {
+    let loaded: Vec<PathBuf> = win::loaded_driver_paths()
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("sys")) && p.is_file())
+        .collect();
+    if !loaded.is_empty() {
+        return loaded;
+    }
+    let Ok(rd) = std::fs::read_dir(drivers_dir()) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("sys")) && p.is_file())
+        .collect()
+}
+
 /// Driver files containing each needle, up to DRIVERS_PER_TAG each, in file name order.
-fn scan_drivers(dir: &Path, needles: &[[u8; 4]]) -> Vec<Vec<String>> {
+/// Returns `(file_name, full_path)` pairs so version info is read from each driver's actual location.
+fn scan_driver_paths(paths: &[PathBuf], needles: &[[u8; 4]]) -> Vec<Vec<(String, PathBuf)>> {
     let mut hits = vec![Vec::new(); needles.len()];
     if needles.is_empty() {
         return hits;
     }
-    let Ok(rd) = std::fs::read_dir(dir) else { return hits };
-    let mut files: Vec<PathBuf> = rd
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().map(|x| x.eq_ignore_ascii_case("sys")).unwrap_or(false))
+    let mut files: Vec<PathBuf> = paths
+        .iter()
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("sys")) && p.is_file())
+        .cloned()
         .collect();
-    files.sort_by_key(|p| p.file_name().map(|n| n.to_ascii_lowercase()));
+    files.sort_by(|a, b| {
+        let ka = a.file_name().map(|n| n.to_ascii_lowercase());
+        let kb = b.file_name().map(|n| n.to_ascii_lowercase());
+        ka.cmp(&kb).then_with(|| a.to_string_lossy().to_ascii_lowercase().cmp(&b.to_string_lossy().to_ascii_lowercase()))
+    });
     for path in files {
         let Ok(data) = std::fs::read(&path) else { continue };
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         for (k, yes) in contains_each(&data, needles).into_iter().enumerate() {
             if yes && hits[k].len() < DRIVERS_PER_TAG {
-                hits[k].push(name.clone());
+                hits[k].push((name.clone(), path.clone()));
             }
         }
         if hits.iter().all(|h| h.len() >= DRIVERS_PER_TAG) {
@@ -300,43 +302,9 @@ fn scan_drivers(dir: &Path, needles: &[[u8; 4]]) -> Vec<Vec<String>> {
 
 /// FileDescription from a file's version resource.
 fn file_description(path: &Path) -> Option<String> {
-    use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
-    let wpath = win::wide(&path.to_string_lossy());
-    let mut handle = 0u32;
-    let size = unsafe { GetFileVersionInfoSizeW(wpath.as_ptr(), &mut handle) };
-    if size == 0 {
-        return None;
-    }
-    let mut data = vec![0u8; size as usize];
-    if unsafe { GetFileVersionInfoW(wpath.as_ptr(), 0, size, data.as_mut_ptr() as *mut c_void) } == 0 {
-        return None;
-    }
-    let query = |sub: &str| -> Option<(*const u8, u32)> {
-        let wsub = win::wide(sub);
-        let mut p: *mut c_void = std::ptr::null_mut();
-        let mut len = 0u32;
-        let ok = unsafe { VerQueryValueW(data.as_ptr() as *const c_void, wsub.as_ptr(), &mut p, &mut len) };
-        (ok != 0 && !p.is_null() && len > 0).then_some((p as *const u8, len))
-    };
-    let mut langs: Vec<String> = Vec::new();
-    if let Some((p, len)) = query(r"\VarFileInfo\Translation") {
-        let pairs = unsafe { std::slice::from_raw_parts(p as *const u16, (len as usize / 2) & !1) };
-        for c in pairs.chunks(2) {
-            langs.push(format!("{:04x}{:04x}", c[0], c[1]));
-        }
-    }
-    langs.extend(["040904b0".to_string(), "040904e4".to_string()]);
-    for l in langs {
-        if let Some((p, len)) = query(&format!(r"\StringFileInfo\{}\FileDescription", l)) {
-            // len is in characters for strings, including the terminating null.
-            let s = unsafe { std::slice::from_raw_parts(p as *const u16, len as usize) };
-            let text = String::from_utf16_lossy(s).trim_end_matches('\0').trim().to_string();
-            if !text.is_empty() {
-                return Some(text);
-            }
-        }
-    }
-    None
+    crate::doctor_win::version_strings(&path.to_string_lossy())
+        .map(|(desc, _)| desc)
+        .filter(|d| !d.is_empty())
 }
 
 // ---------------------------------------------------------------- report
@@ -456,14 +424,14 @@ pub fn report() -> DriverReport {
     // Scan only for tags the Windows kernel doesn't own itself.
     let scan: Vec<usize> = (0..top.len()).filter(|&i| !describe(&tag_text(&top[i].tag)).map(|k| k.0).unwrap_or(false)).collect();
     let needles: Vec<[u8; 4]> = scan.iter().map(|&i| top[i].tag).collect();
-    let dir = drivers_dir();
-    let hits = scan_drivers(&dir, &needles);
-    let mut names: HashMap<String, Option<String>> = HashMap::new();
+    let paths = loaded_sys_paths();
+    let hits = scan_driver_paths(&paths, &needles);
+    let mut names: HashMap<PathBuf, Option<String>> = HashMap::new();
     let mut drivers = vec![Vec::new(); top.len()];
     for (k, &i) in scan.iter().enumerate() {
-        for f in &hits[k] {
-            let name = names.entry(f.clone()).or_insert_with(|| file_description(&dir.join(f))).clone();
-            drivers[i].push(DriverFile { file: f.clone(), name });
+        for (file, full_path) in &hits[k] {
+            let name = names.entry(full_path.clone()).or_insert_with(|| file_description(full_path)).clone();
+            drivers[i].push(DriverFile { file: file.clone(), name });
         }
     }
     let tags = tag_rows(&top, drivers);
@@ -585,7 +553,7 @@ pub fn render_html(r: &DriverReport) -> String {
         }
         h.push_str("</tbody></table></div>\n</section>\n");
     }
-    h.push_str("<p class=\"foot\">Read from Windows' own counters and the driver files in System32\\drivers. Nothing was changed.</p>\n");
+    h.push_str("<p class=\"foot\">Read from Windows' own counters and the loaded driver files. Nothing was changed.</p>\n");
     page("Windows and drivers", &h)
 }
 
@@ -740,5 +708,48 @@ mod tests {
         if r.tags_available {
             assert!(!r.tags.is_empty());
         }
+    }
+
+    #[test]
+    fn scan_driver_paths_handles_custom_dirs_and_filters_non_sys() {
+        let dir = std::env::temp_dir().join(format!("amg-drivers-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sub_a = dir.join("DriverStore").join("a");
+        let sub_b = dir.join("Vendor").join("b");
+        std::fs::create_dir_all(&sub_a).unwrap();
+        std::fs::create_dir_all(&sub_b).unwrap();
+
+        let sys_z = sub_a.join("z_first_tag.sys");
+        let sys_a = sub_b.join("a_driver.sys");
+        let sys_b = sub_a.join("b_driver.SYS");
+        let sys_c = sub_b.join("c_driver.sys");
+        let sys_d = sub_a.join("d_driver.sys");
+        let dll = sub_a.join("ignored.dll");
+        let exe = sub_b.join("ignored.exe");
+        let missing = sub_a.join("missing.sys");
+
+        std::fs::write(&sys_z, b"xxAbCdxx").unwrap();
+        std::fs::write(&sys_a, b"xxAbCdxx").unwrap();
+        std::fs::write(&sys_b, b"xxAbCdxx").unwrap();
+        std::fs::write(&sys_c, b"xxAbCdxx").unwrap();
+        std::fs::write(&sys_d, b"xxAbCdxx").unwrap();
+        std::fs::write(&dll, b"xxAbCdxx").unwrap();
+        std::fs::write(&exe, b"xxAbCdxx").unwrap();
+
+        let paths = vec![sys_z.clone(), dll, exe, missing, sys_d, sys_c, sys_b.clone(), sys_a.clone()];
+        let hits = scan_driver_paths(&paths, &[*b"AbCd", *b"Nope"]);
+        assert_eq!(hits.len(), 2);
+        // Sorted case-insensitively by filename, capped at DRIVERS_PER_TAG (3).
+        assert_eq!(
+            hits[0],
+            vec![
+                ("a_driver.sys".to_string(), sys_a),
+                ("b_driver.SYS".to_string(), sys_b),
+                ("c_driver.sys".to_string(), sub_b.join("c_driver.sys")),
+            ]
+        );
+        assert!(hits[1].is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

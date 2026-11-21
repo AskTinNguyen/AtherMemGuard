@@ -45,17 +45,25 @@ foreach ($line in Get-Content Cargo.toml) {
 }
 if (-not $ver) { throw 'Could not read the version from Cargo.toml' }
 
-# 1) The CLI on its own, then the GUI exe carrying it (feature embed-cli). The CLI is copied out of
-#    target\ first: building the GUI would otherwise be reading a file cargo may rewrite.
-Invoke-Native 'cargo' @('build', '--release', '--locked', '--bin', 'memguard')
+# 1) The CLI on its own (--no-default-features), portable GUI without embed-cli, and Setup GUI
+#    carrying the LZNT1-compressed CLI (features gui,embed-cli). Both target\embed\ copies are
+#    kept outside target\release\ so subsequent builds don't overwrite them.
+Invoke-Native 'cargo' @('build', '--release', '--locked', '--no-default-features', '--bin', 'memguard')
 $embedDir = Join-Path $PSScriptRoot 'target\embed'
 New-Item -ItemType Directory -Force $embedDir | Out-Null
 $cli = Join-Path $embedDir 'memguard.exe'
 Copy-Item -Force 'target\release\memguard.exe' $cli
 Invoke-Sign $cli
+
+Remove-Item Env:\MEMGUARD_CLI -ErrorAction SilentlyContinue
+Invoke-Native 'cargo' @('build', '--release', '--locked', '--bin', 'AtherMemGuard')
+$portableGui = Join-Path $embedDir 'AtherMemGuard.exe'
+Copy-Item -Force 'target\release\AtherMemGuard.exe' $portableGui
+Invoke-Sign $portableGui
+
 $env:MEMGUARD_CLI = $cli
 try {
-    Invoke-Native 'cargo' @('build', '--release', '--locked', '--features', 'embed-cli', '--bin', 'AtherMemGuard')
+    Invoke-Native 'cargo' @('build', '--release', '--locked', '--features', 'gui,embed-cli', '--bin', 'AtherMemGuard')
 } finally {
     Remove-Item Env:\MEMGUARD_CLI -ErrorAction SilentlyContinue
 }
@@ -72,7 +80,7 @@ Copy-Item $gui $setup
 
 $stage = Join-Path $dist "AtherMemGuard-$ver"
 New-Item -ItemType Directory $stage | Out-Null
-Copy-Item $gui (Join-Path $stage 'AtherMemGuard.exe')
+Copy-Item $portableGui (Join-Path $stage 'AtherMemGuard.exe')
 Copy-Item $cli (Join-Path $stage 'memguard.exe')
 Set-Content -Encoding ascii (Join-Path $stage 'AtherMemGuard.portable') 'Run AtherMemGuard.exe from this folder without installing. Delete this file to have it offer to install instead.'
 Copy-Item README.md, INSTALL.md $stage

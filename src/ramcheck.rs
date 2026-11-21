@@ -1307,12 +1307,14 @@ pub fn needs_attention(r: &RamReport) -> bool {
 
 /// CPU name and microcode revision from the registry (read-only).
 fn read_cpu_registry() -> (String, Option<u32>) {
-    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
-    let Ok(key) = winreg::RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(r"HARDWARE\DESCRIPTION\System\CentralProcessor\0", KEY_READ) else {
+    let Ok(key) = crate::win::RegKey::open_read(
+        crate::win::RegHive::Hklm,
+        r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+    ) else {
         return (String::new(), None);
     };
-    let name: String = key.get_value("ProcessorNameString").unwrap_or_default();
-    let microcode = key.get_raw_value("Update Revision").ok().and_then(|v| microcode_from_bytes(&v.bytes));
+    let name: String = key.get_string("ProcessorNameString").unwrap_or_default();
+    let microcode = key.get_raw("Update Revision").ok().and_then(|(_, bytes)| microcode_from_bytes(&bytes));
     (name.trim().to_string(), microcode)
 }
 

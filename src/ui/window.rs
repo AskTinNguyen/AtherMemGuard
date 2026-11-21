@@ -14,7 +14,7 @@ use std::mem::{size_of, zeroed};
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{FreeLibrary, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, MonitorFromRect,
@@ -76,6 +76,10 @@ pub enum Event {
     Menu { tag: u32, choice: Option<u32> },
     FileChosen { tag: u32, path: Option<PathBuf> },
     CaptureLost,
+    /// Top-level window activation changed (`true` when active, `false` when deactivated).
+    Focus(bool),
+    /// Window minimized state changed (`true` when minimized, `false` when restored).
+    Minimized(bool),
     /// The window is being destroyed: last chance to save its placement.
     Destroyed,
 }
@@ -252,6 +256,7 @@ struct WinData {
     kind: &'static str,
     min_size: (i32, i32),
     tracking: bool,
+    minimized: bool,
     cursor: Cursor,
     edit: HWND,
     edit_tag: u32,
@@ -291,6 +296,17 @@ pub fn invalidate(kind: &str) {
     }
 }
 
+/// Repaint `r` of a window of `kind`.
+pub fn invalidate_rect(kind: &str, r: Rect) {
+    if r.is_empty() {
+        return;
+    }
+    if let Some(h) = find(kind) {
+        let rc = r.to_win();
+        unsafe { InvalidateRect(h, &rc, 0) };
+    }
+}
+
 /// Make standard popup menus dark (uxtheme's undocumented SetPreferredAppMode, ordinal 135).
 pub(crate) fn allow_dark_menus() {
     use std::sync::Once;
@@ -312,15 +328,24 @@ pub(crate) fn allow_dark_menus() {
 }
 
 fn allow_dark_for_window(hwnd: HWND) {
-    unsafe {
+    use std::sync::OnceLock;
+    type AllowDarkFn = unsafe extern "system" fn(HWND, i32) -> i32;
+    static PROC: OnceLock<Option<AllowDarkFn>> = OnceLock::new();
+    let proc = *PROC.get_or_init(|| unsafe {
         let lib = LoadLibraryW(wide("uxtheme.dll").as_ptr());
         if lib.is_null() {
-            return;
+            return None;
         }
-        if let Some(f) = GetProcAddress(lib, 133usize as *const u8) {
-            let allow: unsafe extern "system" fn(HWND, i32) -> i32 = std::mem::transmute(f);
-            allow(hwnd, 1);
+        match GetProcAddress(lib, 133usize as *const u8) {
+            Some(f) => Some(std::mem::transmute::<_, AllowDarkFn>(f)),
+            None => {
+                FreeLibrary(lib);
+                None
+            }
         }
+    });
+    if let Some(allow) = proc {
+        unsafe { allow(hwnd, 1) };
     }
 }
 
@@ -424,6 +449,7 @@ pub fn open(spec: WindowSpec, surface: Box<dyn Surface>) -> HWND {
             kind: spec.kind,
             min_size: spec.min_size,
             tracking: false,
+            minimized: false,
             cursor: Cursor::Arrow,
             edit: null_mut(),
             edit_tag: 0,
@@ -525,8 +551,10 @@ fn apply(hwnd: HWND, requests: Vec<Request>) {
                     InvalidateRect(hwnd, null(), 0);
                 }
                 Request::InvalidateRect(r) => {
-                    let rc = r.to_win();
-                    InvalidateRect(hwnd, &rc, 0);
+                    if !r.is_empty() {
+                        let rc = r.to_win();
+                        InvalidateRect(hwnd, &rc, 0);
+                    }
                 }
                 Request::Close => {
                     DestroyWindow(hwnd);
@@ -725,39 +753,79 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
         WM_PAINT => {
             let mut ps: PAINTSTRUCT = zeroed();
             let hdc: HDC = BeginPaint(hwnd, &mut ps);
-            if let Ok(mut d) = c.try_borrow_mut() {
-                let mut rc: RECT = zeroed();
-                GetClientRect(hwnd, &mut rc);
-                let d = &mut *d;
-                let kept = d.painted
-                    && d.canvas.width() == rc.right.max(1)
-                    && d.canvas.height() == rc.bottom.max(1)
-                    && d.canvas.scale == d.scale;
-                d.canvas.resize(rc.right, rc.bottom);
-                d.canvas.set_scale(d.scale);
-                // Only part of the window is invalid (a blinking caret) and the canvas still
-                // holds the last frame: redraw just that part.
-                let p = ps.rcPaint;
-                let dirty = Rect::ltrb(p.left, p.top, p.right, p.bottom);
-                let partial = kept && dirty != d.canvas.bounds() && !dirty.is_empty();
-                if partial {
-                    d.canvas.push_clip(dirty);
+            if IsIconic(hwnd) == 0 {
+                if let Ok(mut d) = c.try_borrow_mut() {
+                    let mut rc: RECT = zeroed();
+                    GetClientRect(hwnd, &mut rc);
+                    if rc.right > 0 && rc.bottom > 0 {
+                        let d = &mut *d;
+                        let kept = d.painted
+                            && d.canvas.width() == rc.right
+                            && d.canvas.height() == rc.bottom
+                            && d.canvas.scale == d.scale;
+                        let p = ps.rcPaint;
+                        let dirty = Rect::ltrb(p.left, p.top, p.right, p.bottom);
+                        if !(kept && dirty.is_empty()) {
+                            d.canvas.resize(rc.right, rc.bottom);
+                            d.canvas.set_scale(d.scale);
+                            // Only part of the window is invalid (e.g., blinking caret or progress bar)
+                            // and the canvas still holds the last frame: redraw and blit just that part.
+                            let partial = kept && dirty != d.canvas.bounds() && !dirty.is_empty();
+                            if partial {
+                                d.canvas.push_clip(dirty);
+                            }
+                            d.surface.paint(&mut d.canvas);
+                            if partial {
+                                d.canvas.pop_clip();
+                            }
+                            d.painted = true;
+                            if partial {
+                                d.canvas.blit_rect(hdc, dirty);
+                            } else {
+                                d.canvas.blit(hdc, 0, 0);
+                            }
+                        }
+                    }
                 }
-                d.surface.paint(&mut d.canvas);
-                if partial {
-                    d.canvas.pop_clip();
-                }
-                d.painted = true;
-                d.canvas.blit(hdc, 0, 0);
             }
             EndPaint(hwnd, &ps);
             0
         }
         WM_ERASEBKGND => 1,
         WM_SIZE => {
+            if w as u32 == SIZE_MINIMIZED {
+                let changed = c
+                    .try_borrow_mut()
+                    .map(|mut d| {
+                        let prev = d.minimized;
+                        d.minimized = true;
+                        !prev
+                    })
+                    .unwrap_or(false);
+                if changed {
+                    dispatch(hwnd, Event::Minimized(true));
+                }
+                return 0;
+            }
+            let unminimized = c
+                .try_borrow_mut()
+                .map(|mut d| {
+                    let prev = d.minimized;
+                    d.minimized = false;
+                    prev
+                })
+                .unwrap_or(false);
+            if unminimized {
+                dispatch(hwnd, Event::Minimized(false));
+            }
             dispatch(hwnd, Event::Resized);
             InvalidateRect(hwnd, null(), 0);
             0
+        }
+        WM_ACTIVATE => {
+            let active = (w & 0xFFFF) as u32 != WA_INACTIVE;
+            dispatch(hwnd, Event::Focus(active));
+            DefWindowProcW(hwnd, msg, w, l)
         }
         WM_GETMINMAXINFO => {
             if let Ok(d) = c.try_borrow() {
@@ -899,6 +967,7 @@ pub fn screen_to_client(hwnd: HWND, p: Pt) -> Pt {
 }
 
 /// Save what a window shows (title bar included) as PNG, for manual checks.
+#[cfg(any(test, feature = "ui-snapshots"))]
 pub fn capture_png(hwnd: HWND, path: &std::path::Path) -> Result<(), String> {
     let mut r: RECT = unsafe { zeroed() };
     unsafe { GetWindowRect(hwnd, &mut r) };
@@ -908,4 +977,23 @@ pub fn capture_png(hwnd: HWND, path: &std::path::Path) -> Result<(), String> {
         return Err("PrintWindow failed".into());
     }
     c.save_png(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn focus_minimized_and_invalidate_rect_behave() {
+        let mut h = Host::detached((400, 300), Scale(1.0));
+        h.invalidate_rect(Rect::new(10, 10, 20, 20));
+        h.invalidate();
+        assert_eq!(h.invalidations(), (1, 1));
+        assert_ne!(Event::Focus(true), Event::Focus(false));
+        assert_ne!(Event::Minimized(true), Event::Minimized(false));
+        // Repeated null_mut dark-mode calls safely hit the cached OnceLock proc.
+        allow_dark_for_window(null_mut());
+        allow_dark_for_window(null_mut());
+        invalidate_rect("nonexistent", Rect::default());
+    }
 }

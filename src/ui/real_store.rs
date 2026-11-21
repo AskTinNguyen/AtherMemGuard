@@ -285,15 +285,6 @@ pub fn running_apps_from(procs: &[(String, u64)], groups: &[GroupInfo], protect:
     out
 }
 
-fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
-    let tmp = path.with_extension("toml.tmp");
-    fs::write(&tmp, text).map_err(|e| format!("{}: {}", tmp.display(), e))?;
-    fs::rename(&tmp, path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("{}: {}", path.display(), e)
-    })
-}
-
 // ---------------------------------------------------------------- SettingsStore
 
 impl SettingsStore for RealStore {
@@ -347,7 +338,7 @@ impl SettingsStore for RealStore {
         let new_text = doc.to_string();
         let team = fs::read_to_string(config::team_file()).ok().filter(|t| config::config_from_layers(Some(t), "").is_ok());
         config::config_from_layers(team.as_deref(), &new_text)?;
-        self.after_write(write_atomic(&path, &new_text))
+        self.after_write(config::write_atomic(&path, &new_text))
     }
 
     fn set_group_enabled(&mut self, name: &str, enabled: bool) -> Result<(), String> {
@@ -423,7 +414,7 @@ impl SettingsStore for RealStore {
                 let bak = path.with_file_name("settings.toml.bak");
                 fs::copy(&path, &bak).map_err(|e| format!("{}: {}", bak.display(), e))?;
             }
-            write_atomic(&path, config::DEFAULT_TOML)
+            config::write_atomic(&path, config::DEFAULT_TOML)
         })();
         self.after_write(r)
     }
@@ -742,5 +733,93 @@ pub(crate) mod tests {
         let t: toml::Table = "[general]\npreset = \"gentle\"\n[[group]]\nname = \"A\"\nprocesses = [\"a\"]\n[group.ue]\ncpu = \"idle\"\n".parse().unwrap();
         assert_eq!(count_settings(&t), 3);
         assert!(matches!(to_item(Value::Float(0.1 + 0.2)).as_value().and_then(|v| v.as_float()), Some(f) if f == 0.3));
+    }
+
+    #[test]
+    fn f62a_round_trip_disk_doctor_prime_and_interval() {
+        let _g = data_dir_lock();
+        let dir = temp_data_dir("f62a");
+        let mut s = store();
+
+        // interval_sec (u64)
+        assert_eq!(s.get("interval_sec").unwrap().value.as_f64(), Some(10.0));
+        s.set("interval_sec", Value::Int(15)).unwrap();
+        assert_eq!(s.get("interval_sec").unwrap().value, Value::Int(15));
+        assert_eq!(config::load_layered().unwrap().0.interval_sec, 15);
+        s.reset("interval_sec").unwrap();
+        assert_eq!(s.get("interval_sec").unwrap().value.as_f64(), Some(10.0));
+
+        // prime.*.disk_gb (f64, 0.0 allowed as Off, negative rejected)
+        assert_eq!(s.get("prime.build.disk_gb").unwrap().value.as_f64(), Some(50.0));
+        s.set("prime.build.disk_gb", Value::Float(64.5)).unwrap();
+        s.set("prime.cook.disk_gb", Value::Float(0.0)).unwrap();
+        assert!(s.set("prime.editor.disk_gb", Value::Float(-1.0)).is_err());
+        let (cfg, _) = config::load_layered().unwrap();
+        assert_eq!(cfg.prime.build.disk_gb, Some(64.5));
+        assert_eq!(cfg.prime.cook.disk_gb, Some(0.0));
+        assert_eq!(cfg.prime.editor.disk_gb, Some(20.0));
+        s.reset("prime.build.disk_gb").unwrap();
+        s.reset("prime.cook.disk_gb").unwrap();
+
+        // [doctor] all 6 fields
+        s.set("doctor.keep", Value::List(vec!["Spotify.EXE".into()])).unwrap();
+        s.set("doctor.close", Value::List(vec!["OneDrive".into()])).unwrap();
+        s.set("doctor.close_while_unreal", Value::List(vec!["Discord.exe".into()])).unwrap();
+        s.set("doctor.ignore_below_mb", Value::Int(200)).unwrap();
+        s.set("doctor.review_above_mb", Value::Int(2048)).unwrap();
+        s.set("doctor.nudge_above_gb", Value::Float(3.5)).unwrap();
+        assert!(s.set("doctor.nudge_above_gb", Value::Float(-0.5)).is_err());
+        let (cfg, _) = config::load_layered().unwrap();
+        assert_eq!(cfg.doctor.keep, vec!["Spotify".to_string()]);
+        assert_eq!(cfg.doctor.close, vec!["OneDrive".to_string()]);
+        assert_eq!(cfg.doctor.close_while_unreal, vec!["Discord".to_string()]);
+        assert_eq!(cfg.doctor.ignore_below_mb, 200);
+        assert_eq!(cfg.doctor.review_above_mb, 2048);
+        assert_eq!(cfg.doctor.nudge_above_gb, 3.5);
+
+        // [disk] all 17 fields (including floats that BUILTIN_TOML writes as integer literals)
+        s.set("disk.enabled", Value::Bool(false)).unwrap();
+        s.set("disk.check_dev_drive", Value::Bool(false)).unwrap();
+        s.set("disk.watch", Value::List(vec!["D:\\".into(), "E:\\Builds".into()])).unwrap();
+        s.set("disk.project_dirs", Value::List(vec![r"D:\Projects\MyGame".into()])).unwrap();
+        s.set("disk.lane_dirs", Value::List(vec![r"D:\Lanes".into()])).unwrap();
+        s.set("disk.keep", Value::List(vec![r"D:\Projects\MyGame\Saved\Important.exe".into()])).unwrap();
+        s.set("disk.elevated_free_gb", Value::Float(120.5)).unwrap();
+        s.set("disk.elevated_free_pct", Value::Float(12.5)).unwrap();
+        s.set("disk.critical_free_gb", Value::Float(40.25)).unwrap();
+        s.set("disk.critical_free_pct", Value::Float(4.5)).unwrap();
+        s.set("disk.cache_min_free_gb", Value::Float(25.5)).unwrap();
+        s.set("disk.min_age_hours", Value::Float(0.5)).unwrap();
+        s.set("disk.hold_hours", Value::Float(12.5)).unwrap();
+        s.set("disk.scan_depth", Value::Int(5)).unwrap();
+        s.set("disk.scan_budget_sec", Value::Int(90)).unwrap();
+        s.set("disk.scan_threads", Value::Int(6)).unwrap();
+        s.set("disk.fresh_sec", Value::Int(600)).unwrap();
+
+        // Invalid [disk] values rejected without corrupting settings.toml.
+        assert!(s.set("disk.scan_depth", Value::Int(0)).is_err());
+        assert!(s.set("disk.elevated_free_pct", Value::Float(120.0)).is_err());
+        assert!(s.set("disk.min_age_hours", Value::Float(-1.0)).is_err());
+
+        let (cfg, _) = config::load_layered().unwrap();
+        let d = cfg.disk();
+        assert!(!d.enabled && !d.check_dev_drive);
+        assert_eq!(d.watch, vec!["D:\\", "E:\\Builds"]);
+        assert_eq!(d.project_dirs, vec![r"D:\Projects\MyGame"]);
+        assert_eq!(d.lane_dirs, vec![r"D:\Lanes"]);
+        assert_eq!(d.keep, vec![r"D:\Projects\MyGame\Saved\Important.exe"]);
+        assert_eq!((d.elevated_free_gb, d.elevated_free_pct), (120.5, 12.5));
+        assert_eq!((d.critical_free_gb, d.critical_free_pct), (40.25, 4.5));
+        assert_eq!((d.cache_min_free_gb, d.min_age_hours, d.hold_hours), (25.5, 0.5, 12.5));
+        assert_eq!((d.scan_depth, d.scan_budget_sec, d.scan_threads, d.fresh_sec), (5, 90, 6, 600));
+
+        // Bug #8: rename_group and reset_all leave no stale .toml.tmp file behind.
+        s.add_group("Design", &["Figma".into()]).unwrap();
+        s.rename_group("Design", "Art").unwrap();
+        assert!(s.groups().iter().any(|g| g.name == "Art"));
+        assert!(!dir.join("settings.toml.tmp").exists());
+        s.reset_all().unwrap();
+        assert!(!dir.join("settings.toml.tmp").exists());
+        assert!(config::load_layered().unwrap().0.disk().enabled);
     }
 }

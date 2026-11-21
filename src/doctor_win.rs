@@ -222,7 +222,7 @@ pub fn version_strings(path: &str) -> Option<(String, String)> {
     if unsafe { GetFileVersionInfoW(wpath.as_ptr(), 0, size, data.as_mut_ptr() as *mut c_void) } == 0 {
         return None;
     }
-    let query = |sub: &str| -> Option<Vec<u8>> {
+    let query = |sub: &str, unit_bytes: usize| -> Option<&[u8]> {
         let w = wide(sub);
         let mut ptr: *mut c_void = null_mut();
         let mut len = 0u32;
@@ -233,12 +233,15 @@ pub fn version_strings(path: &str) -> Option<(String, String)> {
         {
             return None;
         }
-        let start = ptr as usize - data.as_ptr() as usize;
-        Some(data.get(start..)?.to_vec())
+        let start = (ptr as usize).checked_sub(data.as_ptr() as usize)?;
+        let byte_len = (len as usize).checked_mul(unit_bytes)?;
+        let end = start.checked_add(byte_len)?.min(data.len());
+        data.get(start..end)
     };
     // Translations: pairs of (language, codepage); fall back to US English / Unicode.
+    // VerQueryValueW returns byte length for `\VarFileInfo\Translation`.
     let mut langs = Vec::new();
-    if let Some(t) = query(r"\VarFileInfo\Translation") {
+    if let Some(t) = query(r"\VarFileInfo\Translation", 1) {
         for c in t.chunks_exact(4).take(4) {
             langs.push(format!("{:04x}{:04x}", u16::from_le_bytes([c[0], c[1]]), u16::from_le_bytes([c[2], c[3]])));
         }
@@ -246,7 +249,8 @@ pub fn version_strings(path: &str) -> Option<(String, String)> {
     langs.extend(["040904b0".to_string(), "040904e4".to_string()]);
     let read = |field: &str| -> String {
         for lang in &langs {
-            if let Some(bytes) = query(&format!(r"\StringFileInfo\{}\{}", lang, field)) {
+            // VerQueryValueW returns UTF-16 WCHAR length (including NUL) for `\StringFileInfo\*`.
+            if let Some(bytes) = query(&format!(r"\StringFileInfo\{}\{}", lang, field), 2) {
                 let units: Vec<u16> =
                     bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&u| u != 0).collect();
                 let s = String::from_utf16_lossy(&units).trim().to_string();
@@ -276,4 +280,19 @@ pub fn open_for_wait(pid: u32) -> Option<Handle> {
 pub fn has_exited(h: &Handle) -> bool {
     // SAFETY: `h` is an open process handle with SYNCHRONIZE access.
     unsafe { WaitForSingleObject(h.0, 0) == WAIT_OBJECT_0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_strings_on_ping_exe_are_untruncated() {
+        let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let ping = format!(r"{}\System32\PING.EXE", windir.trim_end_matches('\\'));
+        let (desc, company) = version_strings(&ping).expect("PING.EXE has version strings");
+        assert!(!desc.is_empty(), "expected non-empty FileDescription");
+        assert_eq!(company, "Microsoft Corporation");
+        assert!(!desc.contains("Microsoft Corporation"), "desc should not leak adjacent version fields: {:?}", desc);
+    }
 }

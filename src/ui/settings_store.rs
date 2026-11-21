@@ -17,6 +17,7 @@
 //! names exactly as in settings.toml: `"balanced"`, `"verylow"`, `"below"`, hotkey
 //! `"Ctrl+Alt+M"`), `List` (process names).
 
+#[cfg(any(test, feature = "ui-snapshots"))]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -152,6 +153,16 @@ pub fn group_path(group: &str, tier: Tier, key: &str) -> String {
     }
 }
 
+/// Trim whitespace and strip a trailing `.exe` (ASCII case-insensitive).
+pub(crate) fn strip_exe(s: &str) -> String {
+    let p = s.trim();
+    if p.len() >= 4 && p.get(p.len() - 4..).is_some_and(|ext| ext.eq_ignore_ascii_case(".exe")) {
+        p[..p.len() - 4].to_string()
+    } else {
+        p.to_string()
+    }
+}
+
 /// Everything the settings window reads and writes. All writes validate and either
 /// succeed completely or return a message for an error toast, leaving settings as they were.
 pub trait SettingsStore {
@@ -200,6 +211,7 @@ pub trait SettingsStore {
 // ---------------------------------------------------------------- FakeStore
 
 /// In-memory store pre-filled with the mockup's values.
+#[cfg(any(test, feature = "ui-snapshots"))]
 #[derive(Debug, Clone)]
 pub struct FakeStore {
     pub builtin: HashMap<String, Value>,
@@ -214,19 +226,23 @@ pub struct FakeStore {
     pub fail_writes: Vec<String>,
 }
 
+#[cfg(any(test, feature = "ui-snapshots"))]
 fn t(s: &str) -> Value {
     Value::Text(s.to_string())
 }
+#[cfg(any(test, feature = "ui-snapshots"))]
 fn list(items: &[&str]) -> Value {
     Value::List(items.iter().map(|s| s.to_string()).collect())
 }
 
+#[cfg(any(test, feature = "ui-snapshots"))]
 impl Default for FakeStore {
     fn default() -> FakeStore {
         FakeStore::mockup()
     }
 }
 
+#[cfg(any(test, feature = "ui-snapshots"))]
 impl FakeStore {
     /// The values drawn in docs/design/mockup.html.
     pub fn mockup() -> FakeStore {
@@ -234,6 +250,7 @@ impl FakeStore {
         let mut put = |k: &str, v: Value| {
             b.insert(k.to_string(), v);
         };
+        put("interval_sec", Value::Int(10));
         put("general.preset", t("balanced"));
         put("general.auto_prime", Value::Bool(true));
         put("general.notifications", Value::Bool(true));
@@ -258,10 +275,34 @@ impl FakeStore {
         put("pressure.elevated_commit_free_pct", Value::Float(12.0));
         put("pressure.critical_ram_free_pct", Value::Float(4.0));
         put("pressure.critical_commit_free_pct", Value::Float(6.0));
-        for (w, ram, commit) in [("editor", 16.0, 24.0), ("build", 24.0, 40.0), ("cook", 32.0, 48.0)] {
+        for (w, ram, commit, disk) in [("editor", 16.0, 24.0, 20.0), ("build", 24.0, 40.0, 50.0), ("cook", 32.0, 48.0, 100.0)] {
             put(&format!("prime.{}.ram_gb", w), Value::Float(ram));
             put(&format!("prime.{}.commit_gb", w), Value::Float(commit));
+            put(&format!("prime.{}.disk_gb", w), Value::Float(disk));
         }
+        put("doctor.keep", list(&[]));
+        put("doctor.close", list(&[]));
+        put("doctor.close_while_unreal", list(&[]));
+        put("doctor.ignore_below_mb", Value::Int(150));
+        put("doctor.review_above_mb", Value::Int(1024));
+        put("doctor.nudge_above_gb", Value::Float(4.0));
+        put("disk.enabled", Value::Bool(true));
+        put("disk.watch", list(&["auto"]));
+        put("disk.elevated_free_gb", Value::Float(150.0));
+        put("disk.elevated_free_pct", Value::Float(10.0));
+        put("disk.critical_free_gb", Value::Float(50.0));
+        put("disk.critical_free_pct", Value::Float(5.0));
+        put("disk.cache_min_free_gb", Value::Float(20.0));
+        put("disk.project_dirs", list(&[]));
+        put("disk.lane_dirs", list(&[]));
+        put("disk.scan_depth", Value::Int(3));
+        put("disk.scan_budget_sec", Value::Int(60));
+        put("disk.scan_threads", Value::Int(4));
+        put("disk.fresh_sec", Value::Int(300));
+        put("disk.min_age_hours", Value::Float(2.0));
+        put("disk.hold_hours", Value::Float(24.0));
+        put("disk.keep", list(&[]));
+        put("disk.check_dev_drive", Value::Bool(true));
         // Built-in groups (percent of RAM, Part B's v2 defaults).
         put("group.Browsers.priority", t("low"));
         put("group.Browsers.trim_above_pct", Value::Float(4.8));
@@ -344,6 +385,7 @@ impl FakeStore {
     }
 }
 
+#[cfg(any(test, feature = "ui-snapshots"))]
 impl SettingsStore for FakeStore {
     fn get(&self, path: &str) -> Option<Setting> {
         let layers = [(Layer::User, &self.user), (Layer::Team, &self.team), (Layer::Builtin, &self.builtin)];
@@ -372,15 +414,25 @@ impl SettingsStore for FakeStore {
 
     fn add_group(&mut self, name: &str, processes: &[String]) -> Result<(), String> {
         let name = name.trim();
-        if name.is_empty() {
-            return Err("A group needs a name.".into());
+        if name.is_empty() || name.contains('.') {
+            return Err("A group needs a name without dots.".into());
         }
         if self.group_list.iter().any(|g| g.name.eq_ignore_ascii_case(name)) {
             return Err(format!("There is already a group called {}.", name));
         }
+        let mut procs: Vec<String> = Vec::new();
+        for p in processes {
+            let n = strip_exe(p);
+            if !n.is_empty() && !procs.iter().any(|x| x.eq_ignore_ascii_case(&n)) {
+                procs.push(n);
+            }
+        }
+        if procs.is_empty() {
+            return Err("a group needs at least one process name".into());
+        }
         self.group_list.push(GroupInfo {
             name: name.to_string(),
-            processes: processes.to_vec(),
+            processes: procs,
             enabled: true,
             builtin: false,
             layer: Layer::User,
@@ -405,8 +457,8 @@ impl SettingsStore for FakeStore {
 
     fn rename_group(&mut self, from: &str, to: &str) -> Result<(), String> {
         let to = to.trim();
-        if to.is_empty() {
-            return Err("A group needs a name.".into());
+        if to.is_empty() || to.contains('.') {
+            return Err("A group needs a name without dots.".into());
         }
         if self.group_list.iter().any(|g| g.name.eq_ignore_ascii_case(to) && g.name != from) {
             return Err(format!("There is already a group called {}.", to));
@@ -435,7 +487,7 @@ impl SettingsStore for FakeStore {
     }
 
     fn add_process(&mut self, group: &str, process: &str) -> Result<(), String> {
-        let p = process.trim().trim_end_matches(".exe").to_string();
+        let p = strip_exe(process);
         if p.is_empty() {
             return Err("Type the app's process name, for example chrome.".into());
         }
@@ -569,9 +621,12 @@ mod tests {
         assert!(s.get(&path).is_none());
 
         // Groups: add, add process, rename, remove.
+        assert!(s.add_group("Empty", &[]).is_err(), "empty process list rejected");
+        assert!(s.add_group("Bad.Name", &["Figma".into()]).is_err(), "dot in name rejected");
         s.add_group("Design", &["Figma".into()]).unwrap();
-        assert!(s.add_group("design", &[]).is_err());
-        s.add_process("Design", "Photoshop.exe").unwrap();
+        assert!(s.add_group("design", &["Other".into()]).is_err());
+        assert!(s.rename_group("Design", "Bad.Name").is_err());
+        s.add_process("Design", "Photoshop.EXE").unwrap();
         s.set(&group_path("Design", Tier::Always, "trim_above_pct"), Value::Float(2.0)).unwrap();
         s.rename_group("Design", "Art").unwrap();
         assert_eq!(s.get("group.Art.trim_above_pct").unwrap().value, Value::Float(2.0));

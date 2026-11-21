@@ -13,6 +13,7 @@
 
 use std::cell::RefCell;
 use std::mem::{size_of, zeroed};
+#[cfg(any(test, feature = "ui-snapshots"))]
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::time::Instant;
@@ -70,8 +71,10 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 struct Fly {
     hwnd: HWND,
     data: FlyoutData,
+    layout: Layout,
     canvas: Canvas,
     mouse: Option<Pt>,
+    hovered: Option<Target>,
     focus: Option<Target>,
     tracking: bool,
     on_command: Box<dyn Fn(UiAction)>,
@@ -139,7 +142,7 @@ pub fn show(data: FlyoutData, anchor: Option<Rect>, on_command: Box<dyn Fn(UiAct
         Rect::new(p.x, p.y, 1, 1)
     });
     let (work, scale) = monitor_at(POINT { x: anchor.cx(), y: anchor.cy() });
-    let canvas = Canvas::new(1, 1, scale);
+    let mut canvas = Canvas::probe(scale);
     let l = layout(&canvas, &data);
     let (x, y) = place(anchor, work, l.width, l.height, scale.s(EDGE_GAP));
     unsafe {
@@ -170,10 +173,9 @@ pub fn show(data: FlyoutData, anchor: Option<Rect>, on_command: Box<dyn Fn(UiAct
         DwmSetWindowAttribute(hwnd, 34 /* DWMWA_BORDER_COLOR */, &border as *const u32 as *const _, 4);
         let dark: i32 = 1;
         DwmSetWindowAttribute(hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark as *const i32 as *const _, 4);
-        let mut canvas = canvas;
         canvas.resize(l.width, l.height);
-        paint(&mut canvas, &data, None, None);
-        FLY.with(|f| *f.borrow_mut() = Some(Fly { hwnd, data, canvas, mouse: None, focus: None, tracking: false, on_command }));
+        paint_with_layout(&mut canvas, &data, &l, None, None);
+        FLY.with(|f| *f.borrow_mut() = Some(Fly { hwnd, data, layout: l, canvas, mouse: None, hovered: None, focus: None, tracking: false, on_command }));
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
     }
@@ -193,8 +195,11 @@ pub fn update(data: FlyoutData) {
         if changed {
             fly.canvas.resize(l.width, l.height);
         }
-        paint(&mut fly.canvas, &fly.data, fly.mouse, fly.focus);
-        Some((fly.hwnd, changed, l.height))
+        let h = l.height;
+        fly.layout = l;
+        fly.hovered = fly.mouse.and_then(|m| hit(&fly.layout, m));
+        paint_with_layout(&mut fly.canvas, &fly.data, &fly.layout, fly.mouse, fly.focus);
+        Some((fly.hwnd, changed, h))
     });
     if let Some((hwnd, changed, h)) = resize {
         unsafe {
@@ -221,7 +226,7 @@ pub fn close() {
 fn repaint(hwnd: HWND) {
     FLY.with(|f| {
         if let Some(fly) = f.borrow_mut().as_mut() {
-            paint(&mut fly.canvas, &fly.data, fly.mouse, fly.focus);
+            paint_with_layout(&mut fly.canvas, &fly.data, &fly.layout, fly.mouse, fly.focus);
         }
     });
     unsafe { InvalidateRect(hwnd, null(), 0) };
@@ -251,10 +256,7 @@ fn finish(action: UiAction) {
 /// it; Esc or a click elsewhere leaves the flyout open.
 fn open_menu(t: Target) {
     let Some((hwnd, items, anchor)) = FLY.with(|f| {
-        f.borrow().as_ref().map(|fly| {
-            let l = layout(&fly.canvas, &fly.data);
-            (fly.hwnd, t.menu(&fly.data), t.rect(&l))
-        })
+        f.borrow().as_ref().map(|fly| (fly.hwnd, t.menu(&fly.data), t.rect(&fly.layout)))
     }) else {
         return;
     };
@@ -298,9 +300,15 @@ unsafe extern "system" fn fly_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
         WM_PAINT => {
             let mut ps: PAINTSTRUCT = zeroed();
             let hdc = BeginPaint(hwnd, &mut ps);
+            let p = ps.rcPaint;
+            let dirty = Rect::ltrb(p.left, p.top, p.right, p.bottom);
             FLY.with(|f| {
                 if let Some(fly) = f.borrow().as_ref() {
-                    fly.canvas.blit(hdc, 0, 0);
+                    if dirty.is_empty() {
+                        fly.canvas.blit(hdc, 0, 0);
+                    } else {
+                        fly.canvas.blit_rect(hdc, dirty);
+                    }
                 }
             });
             EndPaint(hwnd, &ps);
@@ -314,19 +322,29 @@ unsafe extern "system" fn fly_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
         }
         WM_MOUSEMOVE => {
             let p = pt();
-            let over = FLY.with(|f| {
+            let (next, changed) = FLY.with(|f| {
                 let mut f = f.borrow_mut();
-                let fly = f.as_mut()?;
+                let Some(fly) = f.as_mut() else {
+                    return (None, false);
+                };
                 fly.mouse = Some(p);
                 if !fly.tracking {
                     let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
                     TrackMouseEvent(&mut tme);
                     fly.tracking = true;
                 }
-                Some(hit(&layout(&fly.canvas, &fly.data), p).is_some())
+                let next = hit(&fly.layout, p);
+                let changed = next != fly.hovered;
+                if changed {
+                    fly.hovered = next;
+                    paint_with_layout(&mut fly.canvas, &fly.data, &fly.layout, fly.mouse, fly.focus);
+                }
+                (next, changed)
             });
-            SetCursor(LoadCursorW(null_mut(), if over == Some(true) { IDC_HAND } else { IDC_ARROW }));
-            repaint(hwnd);
+            SetCursor(LoadCursorW(null_mut(), if next.is_some() { IDC_HAND } else { IDC_ARROW }));
+            if changed {
+                InvalidateRect(hwnd, null(), 0);
+            }
             return 0;
         }
         WM_SETCURSOR => {
@@ -336,18 +354,28 @@ unsafe extern "system" fn fly_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             }
         }
         WM_MOUSELEAVE => {
-            FLY.with(|f| {
-                if let Some(fly) = f.borrow_mut().as_mut() {
-                    fly.mouse = None;
-                    fly.tracking = false;
+            let changed = FLY.with(|f| {
+                let mut f = f.borrow_mut();
+                let Some(fly) = f.as_mut() else {
+                    return false;
+                };
+                fly.mouse = None;
+                fly.tracking = false;
+                if fly.hovered.take().is_some() {
+                    paint_with_layout(&mut fly.canvas, &fly.data, &fly.layout, None, fly.focus);
+                    true
+                } else {
+                    false
                 }
             });
-            repaint(hwnd);
+            if changed {
+                InvalidateRect(hwnd, null(), 0);
+            }
             return 0;
         }
         WM_LBUTTONUP => {
             let p = pt();
-            let t = FLY.with(|f| f.borrow().as_ref().and_then(|fly| hit(&layout(&fly.canvas, &fly.data), p)));
+            let t = FLY.with(|f| f.borrow().as_ref().and_then(|fly| hit(&fly.layout, p)));
             if let Some(t) = t {
                 activate(t);
             }
@@ -361,7 +389,7 @@ unsafe extern "system" fn fly_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 let back = GetKeyState(VK_SHIFT as i32) < 0;
                 FLY.with(|f| {
                     if let Some(fly) = f.borrow_mut().as_mut() {
-                        let order = tab_order(&layout(&fly.canvas, &fly.data));
+                        let order = tab_order(&fly.layout);
                         let n = order.len();
                         let i = fly.focus.and_then(|t| order.iter().position(|x| *x == t));
                         let next = match (i, back) {
@@ -382,6 +410,16 @@ unsafe extern "system" fn fly_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             }
             return 0;
         }
+        WM_DESTROY => {
+            let _ = FLY.try_with(|f| {
+                if let Ok(mut slot) = f.try_borrow_mut() {
+                    if slot.as_ref().is_some_and(|fly| fly.hwnd == hwnd) {
+                        *slot = None;
+                    }
+                }
+            });
+            return 0;
+        }
         _ => {}
     }
     DefWindowProcW(hwnd, msg, w, l)
@@ -390,6 +428,7 @@ unsafe extern "system" fn fly_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
 // ---------------------------------------------------------------- snapshots
 
 /// Write `flyout-<state>.png` and `flyout-<state>@1.5x.png` into `dir`; returns the files.
+#[cfg(any(test, feature = "ui-snapshots"))]
 pub fn snapshots(dir: &Path) -> Result<Vec<PathBuf>, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
     let mut out = Vec::new();

@@ -5,9 +5,12 @@
 //!
 //! Only protocol messages go to the writer (stdout). Diagnostics go to stderr.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Map, Value};
 
@@ -58,24 +61,167 @@ is not 0. Moves to the bin, tool \
 cleans, logs, cooked output and the shared caches are the person's call (memguard disk clean --fix); lanes and worktrees \
 are never deleted by Ather MemGuard. Mention dev:* findings from memguard_disk once and never claim to have fixed them.";
 
-/// Settings source. The real server reads settings.toml on every call (so edits apply
-/// at once); tests pass the built-in defaults.
-pub type ConfigLoader = Box<dyn Fn() -> Config>;
+/// Settings source. The real server reads settings.toml (cached by file mtime+size);
+/// tests pass the built-in defaults.
+pub type ConfigLoader = Box<dyn Fn() -> Config + Send + Sync>;
 
 /// Memory history source: samples from the last `Duration`. The real server reads the CSV
 /// files in the data folder, like `memguard history --json`; tests pass fixed samples.
-pub type HistoryLoader = Box<dyn Fn(Duration) -> Vec<Sample>>;
+pub type HistoryLoader = Box<dyn Fn(Duration) -> Vec<Sample> + Send + Sync>;
 
 /// How disk counting runs: the low-priority child process, or in-process in tests.
-pub type ScanRunner = Box<dyn Fn(&crate::disk_scan::ScanJob, crate::disk_scan::Progress) -> Result<crate::disk_scan::ScanOutput, String>>;
+pub type ScanRunner = Box<dyn Fn(&crate::disk_scan::ScanJob, crate::disk_scan::Progress) -> Result<crate::disk_scan::ScanOutput, String> + Send + Sync>;
 
 /// The latest disk checkup, for `memguard_disk_plan`.
-pub type CheckupLoader = Box<dyn Fn() -> Option<crate::disk_scan::CachedCheckup>>;
+pub type CheckupLoader = Box<dyn Fn() -> Option<crate::disk_scan::CachedCheckup> + Send + Sync>;
+
+type LayerResolver = Box<dyn Fn(&str) -> crate::config::Layer + Send + Sync>;
+type TeamActiveFn = Box<dyn Fn() -> bool + Send + Sync>;
+type ConfigWarningFn = Box<dyn Fn() -> Option<String> + Send + Sync>;
+
+type FileStamp = Option<(Option<SystemTime>, u64)>;
+
+fn file_stamp(path: &std::path::Path) -> FileStamp {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok(), meta.len()))
+}
+
+struct CachedConfig {
+    cfg_path: PathBuf,
+    team_path: PathBuf,
+    cfg_stamp: FileStamp,
+    team_stamp: FileStamp,
+    cfg: Config,
+}
+
+fn cached_config_loader_for(
+    cfg_path_fn: impl Fn() -> PathBuf + Send + Sync + 'static,
+    team_path_fn: impl Fn() -> PathBuf + Send + Sync + 'static,
+    loader: impl Fn() -> Config + Send + Sync + 'static,
+) -> ConfigLoader {
+    let cache: Mutex<Option<CachedConfig>> = Mutex::new(None);
+    Box::new(move || {
+        let cfg_path = cfg_path_fn();
+        let team_path = team_path_fn();
+        let cfg_stamp = file_stamp(&cfg_path);
+        let team_stamp = file_stamp(&team_path);
+        if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            if hit.cfg_path == cfg_path
+                && hit.team_path == team_path
+                && hit.cfg_stamp == cfg_stamp
+                && hit.team_stamp == team_stamp
+            {
+                return hit.cfg.clone();
+            }
+        }
+        let cfg = loader();
+        // Re-stat after loading: Config::load_or_default() may create settings.toml on first run.
+        let new_cfg_stamp = file_stamp(&cfg_path);
+        let new_team_stamp = file_stamp(&team_path);
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(CachedConfig {
+            cfg_path,
+            team_path,
+            cfg_stamp: new_cfg_stamp,
+            team_stamp: new_team_stamp,
+            cfg: cfg.clone(),
+        });
+        cfg
+    })
+}
+
+struct CancelToken {
+    cancelled: AtomicBool,
+    mu: Mutex<()>,
+    cv: Condvar,
+}
+
+impl CancelToken {
+    fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            mu: Mutex::new(()),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.notify();
+    }
+
+    fn notify(&self) {
+        let _g = self.mu.lock().unwrap_or_else(|e| e.into_inner());
+        self.cv.notify_all();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Wait up to `dur`, returning `true` immediately if cancelled.
+    fn wait_timeout(&self, dur: Duration) -> bool {
+        if self.is_cancelled() {
+            return true;
+        }
+        if dur.is_zero() {
+            return self.is_cancelled();
+        }
+        let guard = self.mu.lock().unwrap_or_else(|e| e.into_inner());
+        let (_guard, _) = self
+            .cv
+            .wait_timeout_while(guard, dur, |_| !self.is_cancelled())
+            .unwrap_or_else(|e| e.into_inner());
+        self.is_cancelled()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum RequestId {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Uint(u64),
+    Str(String),
+    Other(String),
+}
+
+impl RequestId {
+    fn from_value(v: &Value) -> Self {
+        match v {
+            Value::Null => Self::Null,
+            Value::Bool(b) => Self::Bool(*b),
+            Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Self::Int(i)
+                } else if let Some(u) = n.as_u64() {
+                    Self::Uint(u)
+                } else {
+                    Self::Other(n.to_string())
+                }
+            }
+            Value::String(s) => Self::Str(s.clone()),
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
+struct ToolCallWork {
+    id: Value,
+    req_id: RequestId,
+    name: String,
+    args: Map<String, Value>,
+    progress_token: Option<Value>,
+    cancel: Arc<CancelToken>,
+}
 
 pub struct Server {
     load_config: ConfigLoader,
+    resolve_layer: LayerResolver,
+    team_active: TeamActiveFn,
+    config_warning: ConfigWarningFn,
     load_history: HistoryLoader,
-    run_scan: ScanRunner,
+    custom_scan: Option<ScanRunner>,
     load_checkup: CheckupLoader,
     /// Where plans, the undo log and the measured watches are kept.
     disk_files: crate::disk_clean::DiskFiles,
@@ -83,18 +229,39 @@ pub struct Server {
     clean_opts: crate::disk_clean::CleanOpts,
     /// The plans `memguard_disk_plan` made in this server, newest last. `memguard_disk_clean`
     /// acts only on these: a plan file on disk is something an agent could edit.
-    agent_plans: std::cell::RefCell<Vec<crate::disk_clean::PlanRecord>>,
+    agent_plans: Mutex<Vec<crate::disk_clean::PlanRecord>>,
 }
 
 impl Default for Server {
     fn default() -> Self {
-        Server::new(Box::new(|| {
-            let (cfg, err) = Config::load_or_default();
-            if let Some(e) = err {
-                eprintln!("memguard mcp: settings file has a problem, using built-in defaults: {}", e);
+        let last_warning: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let last_warning_loader = Arc::clone(&last_warning);
+        let mut srv = Server::new(cached_config_loader_for(
+            paths::config_file,
+            crate::config::team_file,
+            move || {
+                let (cfg, err) = Config::load_or_default();
+                if let Some(e) = &err {
+                    if crate::config::has_valid_team_file() {
+                        eprintln!("memguard mcp: settings file has a problem, using team/built-in defaults: {}", e);
+                    } else {
+                        eprintln!("memguard mcp: settings file has a problem, using built-in defaults: {}", e);
+                    }
+                }
+                *last_warning_loader.lock().unwrap_or_else(|e| e.into_inner()) = err;
+                cfg
+            },
+        ));
+        srv.resolve_layer = Box::new(|p| {
+            if paths::config_file().is_file() || crate::config::team_file().is_file() {
+                crate::config::value_layer(p)
+            } else {
+                crate::config::Layer::Builtin
             }
-            cfg
-        }))
+        });
+        srv.team_active = Box::new(crate::config::has_valid_team_file);
+        srv.config_warning = Box::new(move || last_warning.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        srv
     }
 }
 
@@ -105,12 +272,15 @@ impl Server {
     pub fn new(load_config: ConfigLoader) -> Self {
         Server {
             load_config,
+            resolve_layer: Box::new(|_| crate::config::Layer::Builtin),
+            team_active: Box::new(|| false),
+            config_warning: Box::new(|| None),
             load_history: Box::new(crate::history::load_since),
-            run_scan: Box::new(|job, progress| crate::disk_scan::run_child(job, progress)),
+            custom_scan: None,
             load_checkup: Box::new(crate::disk_scan::load_cache),
             disk_files: crate::disk_clean::DiskFiles::default(),
             clean_opts: crate::disk_clean::CleanOpts { agent: true, presample_secs: 5, start_watcher: true, ..Default::default() },
-            agent_plans: std::cell::RefCell::new(Vec::new()),
+            agent_plans: Mutex::new(Vec::new()),
         }
     }
 
@@ -123,7 +293,7 @@ impl Server {
 
     /// Use another disk counter and checkup store (tests count in-process).
     pub fn with_disk(mut self, run_scan: ScanRunner, load_checkup: CheckupLoader) -> Self {
-        self.run_scan = run_scan;
+        self.custom_scan = Some(run_scan);
         self.load_checkup = load_checkup;
         self
     }
@@ -134,97 +304,180 @@ impl Server {
         self
     }
 
-    /// Read messages until the reader ends. Each reply is one line on the writer.
-    pub fn serve<R: BufRead, W: Write>(&self, reader: R, mut writer: W) -> io::Result<()> {
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
+    /// Read messages until the reader ends, draining queued tool calls on EOF.
+    pub fn serve<R: BufRead + Send, W: Write + Send>(&self, reader: R, writer: W) -> io::Result<()> {
+        self.serve_inner(reader, writer, false)
+    }
+
+    fn serve_inner<R: BufRead + Send, W: Write + Send>(&self, reader: R, writer: W, cancel_on_eof: bool) -> io::Result<()> {
+        let out = Mutex::new(writer);
+        let in_flight: Mutex<HashMap<RequestId, Vec<Arc<CancelToken>>>> = Mutex::new(HashMap::new());
+        let (tx, rx) = mpsc::channel::<ToolCallWork>();
+
+        std::thread::scope(|scope| {
+            let reader_handle = scope.spawn(|| -> io::Result<()> {
+                let mut reader = reader;
+                let mut buf = String::new();
+                loop {
+                    buf.clear();
+                    let n = match reader.read_line(&mut buf) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            if cancel_on_eof {
+                                cancel_all(&in_flight);
+                            }
+                            drop(tx);
+                            return Err(e);
+                        }
+                    };
+                    if n == 0 {
+                        if cancel_on_eof {
+                            cancel_all(&in_flight);
+                        }
+                        drop(tx);
+                        return Ok(());
+                    }
+                    let line = buf.trim_end_matches(['\r', '\n']);
+                    if line.trim().trim_start_matches('\u{feff}').trim().is_empty() {
+                        continue;
+                    }
+                    match parse_incoming_line(line) {
+                        Incoming::Reply(reply) => {
+                            if let Err(e) = write_sync(&out, &reply) {
+                                if cancel_on_eof {
+                                    cancel_all(&in_flight);
+                                }
+                                drop(tx);
+                                return Err(e);
+                            }
+                        }
+                        Incoming::Ignore => {}
+                        Incoming::Cancel(req_id) => {
+                            let toks = in_flight
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get(&req_id)
+                                .cloned()
+                                .unwrap_or_default();
+                            for t in toks {
+                                t.cancel();
+                            }
+                        }
+                        Incoming::Immediate { id, method, params } => {
+                            let reply = match method.as_str() {
+                                "initialize" => json!({ "jsonrpc": "2.0", "id": id, "result": initialize(&params) }),
+                                "ping" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+                                "tools/list" => json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": tool_list() } }),
+                                _ => error_reply(id, METHOD_NOT_FOUND, &format!("Method not found: {}", method)),
+                            };
+                            if let Err(e) = write_sync(&out, &reply) {
+                                if cancel_on_eof {
+                                    cancel_all(&in_flight);
+                                }
+                                drop(tx);
+                                return Err(e);
+                            }
+                        }
+                        Incoming::ToolCall { id, params } => match validate_tool_call(&params) {
+                            Err((code, message)) => {
+                                let reply = error_reply(id, code, &message);
+                                if let Err(e) = write_sync(&out, &reply) {
+                                    if cancel_on_eof {
+                                        cancel_all(&in_flight);
+                                    }
+                                    drop(tx);
+                                    return Err(e);
+                                }
+                            }
+                            Ok((name, args, progress_token)) => {
+                                let req_id = RequestId::from_value(&id);
+                                let tok = Arc::new(CancelToken::new());
+                                {
+                                    let mut map = in_flight.lock().unwrap_or_else(|e| e.into_inner());
+                                    map.entry(req_id.clone()).or_default().push(tok.clone());
+                                }
+                                let work = ToolCallWork {
+                                    id,
+                                    req_id: req_id.clone(),
+                                    name,
+                                    args,
+                                    progress_token,
+                                    cancel: tok.clone(),
+                                };
+                                if tx.send(work).is_err() {
+                                    remove_if_same(&in_flight, &req_id, &tok);
+                                    break Ok(());
+                                }
+                            }
+                        },
+                    }
+                }
+            });
+
+            let mut worker_err: Option<io::Error> = None;
+            while let Ok(work) = rx.recv() {
+                let outcome = if work.cancel.is_cancelled() {
+                    Err(ToolError("Cancelled.".into()))
+                } else {
+                    self.run_tool(&work.name, &work.args, work.progress_token.clone(), &out, &work.cancel)
+                };
+                remove_if_same(&in_flight, &work.req_id, &work.cancel);
+                let reply = format_tool_reply(work.id, outcome);
+                if let Err(e) = write_sync(&out, &reply) {
+                    if worker_err.is_none() {
+                        worker_err = Some(e);
+                    }
+                    break;
+                }
             }
-            if let Some(reply) = self.handle_line(&line, &mut writer)? {
-                write_message(&mut writer, &reply)?;
+            drop(rx);
+
+            let reader_res = match reader_handle.join() {
+                Ok(r) => r,
+                Err(_) => Err(io::Error::other("MCP reader thread exited unexpectedly")),
+            };
+            reader_res?;
+            if let Some(e) = worker_err {
+                return Err(e);
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Handle one incoming line. Returns the reply, or `None` for notifications and for
     /// responses the client sends us. Progress notifications go straight to `out`.
-    pub fn handle_line<W: Write>(&self, line: &str, out: &mut W) -> io::Result<Option<Value>> {
-        // Some shells put a byte-order mark before the first line they pipe.
-        let line = line.trim_start_matches('\u{feff}');
-        let msg: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(e) => return Ok(Some(error_reply(Value::Null, PARSE_ERROR, &format!("Parse error: {}", e)))),
-        };
-        let Some(obj) = msg.as_object() else {
-            // Batches were removed from MCP in 2025-06-18.
-            return Ok(Some(error_reply(Value::Null, INVALID_REQUEST, "Invalid request: expected one JSON object")));
-        };
-        let id = obj.get("id").cloned();
-        let Some(method) = obj.get("method").and_then(Value::as_str) else {
-            if id.is_some() && (obj.contains_key("result") || obj.contains_key("error")) {
-                return Ok(None); // a response to something we sent; we send no requests
+    pub fn handle_line<W: Write + Send>(&self, line: &str, out: &mut W) -> io::Result<Option<Value>> {
+        let cancel = CancelToken::new();
+        let sync_out = Mutex::new(out);
+        match parse_incoming_line(line) {
+            Incoming::Reply(r) => Ok(Some(r)),
+            Incoming::Ignore | Incoming::Cancel(_) => Ok(None),
+            Incoming::Immediate { id, method, params } => {
+                let reply = match method.as_str() {
+                    "initialize" => json!({ "jsonrpc": "2.0", "id": id, "result": initialize(&params) }),
+                    "ping" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+                    "tools/list" => json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": tool_list() } }),
+                    _ => error_reply(id, METHOD_NOT_FOUND, &format!("Method not found: {}", method)),
+                };
+                Ok(Some(reply))
             }
-            return Ok(Some(error_reply(id.unwrap_or(Value::Null), INVALID_REQUEST, "Invalid request: no method")));
-        };
-        let params = obj.get("params").cloned().unwrap_or(Value::Null);
-
-        let Some(id) = id else {
-            // Notification: never answered. `notifications/initialized` and
-            // `notifications/cancelled` need no action.
-            return Ok(None);
-        };
-
-        let result = match method {
-            "initialize" => Ok(initialize(&params)),
-            "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({ "tools": tool_list() })),
-            "tools/call" => self.call(&params, out),
-            _ => Err((METHOD_NOT_FOUND, format!("Method not found: {}", method))),
-        };
-        Ok(Some(match result {
-            Ok(r) => json!({ "jsonrpc": "2.0", "id": id, "result": r }),
-            Err((code, message)) => error_reply(id, code, &message),
-        }))
-    }
-
-    fn call<W: Write>(&self, params: &Value, out: &mut W) -> Result<Value, (i64, String)> {
-        let bad = |m: &str| (INVALID_PARAMS, m.to_string());
-        let params = params.as_object().ok_or_else(|| bad("tools/call needs params with a tool name"))?;
-        let name = params.get("name").and_then(Value::as_str).ok_or_else(|| bad("tools/call needs a tool name"))?;
-        let empty = Map::new();
-        let args = match params.get("arguments") {
-            None | Some(Value::Null) => &empty,
-            Some(Value::Object(m)) => m,
-            Some(_) => return Err(bad("arguments must be an object")),
-        };
-        if !tool_list().iter().any(|t| t["name"] == name) {
-            return Err((INVALID_PARAMS, format!("Unknown tool: {}", name)));
+            Incoming::ToolCall { id, params } => match validate_tool_call(&params) {
+                Err((code, message)) => Ok(Some(error_reply(id, code, &message))),
+                Ok((name, args, progress_token)) => {
+                    let outcome = self.run_tool(&name, &args, progress_token, &sync_out, &cancel);
+                    Ok(Some(format_tool_reply(id, outcome)))
+                }
+            },
         }
-        let progress_token = params.get("_meta").and_then(|m| m.get("progressToken")).cloned();
-
-        let outcome = catch_unwind(AssertUnwindSafe(|| self.run_tool(name, args, progress_token, out)))
-            .unwrap_or_else(|_| Err(ToolError(format!("{} failed unexpectedly; see stderr for details", name))));
-        Ok(match outcome {
-            Ok(value) => json!({
-                "content": [{ "type": "text", "text": pretty(&value) }],
-                "structuredContent": value,
-                "isError": false,
-            }),
-            Err(ToolError(message)) => json!({
-                "content": [{ "type": "text", "text": message }],
-                "isError": true,
-            }),
-        })
     }
 
-    fn run_tool<W: Write>(
+    fn run_tool<W: Write + Send>(
         &self,
         name: &str,
         args: &Map<String, Value>,
         progress_token: Option<Value>,
-        out: &mut W,
+        out: &Mutex<W>,
+        cancel: &CancelToken,
     ) -> Result<Value, ToolError> {
         match name {
             "memguard_status" => {
@@ -267,19 +520,43 @@ impl Server {
                 if let Some(checks) = disk.as_ref().filter(|c| c.iter().any(|c| !c.ok)) {
                     return to_value(&ops::WaitResult::blocked_by_disk(need, checks.clone()));
                 }
+                if cancel.is_cancelled() {
+                    return Err(ToolError("Cancelled.".into()));
+                }
                 if prime {
                     ops::prime(&cfg, None, false);
                 }
                 let total = timeout.as_secs_f64();
-                let started = std::time::Instant::now();
-                let mut result = ops::wait_for(need, timeout, |sys| {
+                let started = Instant::now();
+                let mut result = loop {
+                    if cancel.is_cancelled() {
+                        return Err(ToolError("Cancelled.".into()));
+                    }
+                    let sys = crate::engine::SystemStatus::from(&win::sys_info());
+                    let ready = sys.ram_free_gb >= need.ram_gb && sys.commit_free_gb >= need.commit_gb;
+                    let elapsed = started.elapsed();
+                    if ready || elapsed >= timeout {
+                        break ops::WaitResult {
+                            ready,
+                            waited_sec: elapsed.as_secs(),
+                            ram_free_gb: sys.ram_free_gb,
+                            commit_free_gb: sys.commit_free_gb,
+                            need_ram_gb: need.ram_gb,
+                            need_commit_gb: need.commit_gb,
+                            blocked_by: if ready { Vec::new() } else { vec!["memory".into()] },
+                            disk_volume: None,
+                            disk_free_gb: None,
+                            need_disk_gb: None,
+                            disk_checks: Vec::new(),
+                        };
+                    }
                     if let Some(token) = &progress_token {
                         let note = json!({
                             "jsonrpc": "2.0",
                             "method": "notifications/progress",
                             "params": {
                                 "progressToken": token,
-                                "progress": started.elapsed().as_secs_f64().min(total),
+                                "progress": elapsed.as_secs_f64().min(total),
                                 "total": total,
                                 "message": format!(
                                     "Waiting: RAM free {:.1} of {:.1} GB, commit free {:.1} of {:.1} GB",
@@ -287,11 +564,14 @@ impl Server {
                                 ),
                             }
                         });
-                        if let Err(e) = write_message(out, &note) {
+                        if let Err(e) = write_sync(out, &note) {
                             eprintln!("memguard mcp: could not send progress: {}", e);
                         }
                     }
-                });
+                    if cancel.wait_timeout(Duration::from_secs(2)) {
+                        return Err(ToolError("Cancelled.".into()));
+                    }
+                };
                 if let Some(checks) = disk {
                     result.set_disk(checks);
                 }
@@ -314,9 +594,30 @@ impl Server {
                         _ => return Err(ToolError("budget_sec must be a number of seconds, 1 or more (at most 300).".into())),
                     },
                 };
+                if cancel.is_cancelled() {
+                    return Err(ToolError("Cancelled.".into()));
+                }
                 let cfg = (self.load_config)();
                 let mut note = progress_writer(&progress_token, out, budget as f64, "Counting");
-                crate::disk_scan::checkup(&cfg, path.as_deref(), refresh, Some(budget), &*self.run_scan, &mut note).map_err(ToolError).and_then(|c| to_value(&c))
+                let runner = |job: &crate::disk_scan::ScanJob, progress: crate::disk_scan::Progress| -> Result<crate::disk_scan::ScanOutput, String> {
+                    if cancel.is_cancelled() {
+                        return Err("Cancelled.".into());
+                    }
+                    let res = match &self.custom_scan {
+                        Some(custom) => custom(job, progress),
+                        None => run_child_cancellable(job, progress, cancel),
+                    };
+                    if cancel.is_cancelled() {
+                        return Err("Cancelled.".into());
+                    }
+                    res
+                };
+                let checkup = crate::disk_scan::checkup(&cfg, path.as_deref(), refresh, Some(budget), &runner, &mut note)
+                    .map_err(ToolError)?;
+                if cancel.is_cancelled() {
+                    return Err(ToolError("Cancelled.".into()));
+                }
+                to_value(&checkup)
             }
             "memguard_disk_plan" => {
                 check_keys(args, &["ids"])?;
@@ -330,11 +631,20 @@ impl Server {
                 let cache = (self.load_checkup)().ok_or_else(|| {
                     ToolError("Call memguard_disk_checkup first: a plan uses the item ids of the latest checkup.".into())
                 })?;
-                let (v, rec) = crate::disk_scan::plan_record(&cfg, &cache, &ids, None, &*self.run_scan, &mut note).map_err(ToolError)?;
+                let runner = |job: &crate::disk_scan::ScanJob, progress: crate::disk_scan::Progress| -> Result<crate::disk_scan::ScanOutput, String> {
+                    if cancel.is_cancelled() {
+                        return Err("Cancelled.".into());
+                    }
+                    match &self.custom_scan {
+                        Some(custom) => custom(job, progress),
+                        None => run_child_cancellable(job, progress, cancel),
+                    }
+                };
+                let (v, rec) = crate::disk_scan::plan_record(&cfg, &cache, &ids, None, &runner, &mut note).map_err(ToolError)?;
                 if let Err(e) = self.disk_files.save_plan(&rec) {
                     eprintln!("memguard mcp: could not save the plan: {}", e);
                 }
-                let mut mine = self.agent_plans.borrow_mut();
+                let mut mine = self.agent_plans.lock().unwrap_or_else(|e| e.into_inner());
                 mine.push(rec);
                 if mine.len() > 10 {
                     mine.remove(0);
@@ -352,7 +662,7 @@ impl Server {
                     return Err(ToolError("plan_id is required: call memguard_disk_plan with exactly the ids you want to clean and pass the plan_id it returns.".into()));
                 };
                 // Only a plan this server made (in memory); never one read back from disk.
-                let plans = self.agent_plans.borrow().clone();
+                let plans = self.agent_plans.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let plan = crate::disk_clean::plan_for_agent(&plans, plan_id.trim(), &ids, crate::disk_clean::unix_now()).map_err(ToolError)?;
                 let picks: Vec<(String, Option<crate::disk_clean::CleanAction>)> = ids.iter().map(|i| (i.clone(), Some(crate::disk_clean::CleanAction::Now))).collect();
                 let r = crate::disk_clean::clean(&(self.load_config)(), &self.disk_files, plan, &picks, &self.clean_opts);
@@ -385,6 +695,134 @@ impl Server {
                 let samples = (self.load_history)(Duration::from_secs_f64(hours * 3600.0));
                 Ok(history_result(hours, samples))
             }
+            // ---- M3b read-only tools
+            "memguard_drivers" => {
+                check_keys(args, &[])?;
+                to_value(&crate::drivers::report())
+            }
+            "memguard_disk_relocate" => {
+                check_keys(args, &["to"])?;
+                let to = str_arg(args, "to")?;
+                if let Some(why) = to.as_deref().and_then(crate::disk_relocate::to_path_problem) {
+                    return Err(ToolError(why));
+                }
+                let to_vol = match to.as_deref() {
+                    Some(t) => {
+                        let existing = std::path::Path::new(t)
+                            .ancestors()
+                            .find(|a| a.exists())
+                            .map(|a| a.display().to_string())
+                            .and_then(|e| crate::disk_win::volume_of(&e).map(|(_, g)| g));
+                        Some(existing.ok_or_else(|| ToolError(format!("{} isn't on a drive this PC has.", t)))?)
+                    }
+                    None => None,
+                };
+                if cancel.is_cancelled() {
+                    return Err(ToolError("Cancelled.".into()));
+                }
+                let store = crate::disk_relocate::RegistryEnv::from_env().map_err(ToolError)?;
+                let cfg = (self.load_config)();
+                let vars = relocate_read_vars_cancellable(&store, cancel)?;
+                let sys = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+                let sys_root = if sys.ends_with('\\') { sys } else { format!("{}\\", sys) };
+                let system = crate::disk_win::volume_of(&sys_root).map(|(_, g)| g);
+                let vols = crate::disk_relocate::dest_volumes();
+                let plan = crate::disk_relocate::plan(
+                    &vars,
+                    system.as_deref(),
+                    &vols,
+                    to.as_deref().zip(to_vol.as_deref()),
+                    &cfg.disk(),
+                );
+                Ok(crate::disk_relocate::plan_json(&plan, &crate::disk_relocate::EnvStore::describe(&store)))
+            }
+            "memguard_disk_bin" => {
+                check_keys(args, &["volume"])?;
+                let volume = match args.get("volume") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
+                    Some(_) => return Err(ToolError("volume must be a drive letter string like \"D:\"".into())),
+                };
+                let mut roots = crate::disk_clean::fixed_roots();
+                if let Some(v) = &volume {
+                    let drive_byte = match v.as_bytes() {
+                        [c] if c.is_ascii_alphabetic() => *c,
+                        [c, b':'] if c.is_ascii_alphabetic() => *c,
+                        [c, b':', b'\\' | b'/'] if c.is_ascii_alphabetic() => *c,
+                        _ => return Err(ToolError(format!("volume \"{}\" must be a drive letter like \"D:\".", v))),
+                    };
+                    let want = (drive_byte as char).to_ascii_uppercase().to_string();
+                    roots.retain(|r| r.trim_end_matches(['\\', '/']).trim_end_matches(':').eq_ignore_ascii_case(&want));
+                }
+                let cfg = (self.load_config)();
+                let hold_hours = cfg.disk().hold_hours;
+                let runs = crate::disk_clean::bin_runs(&self.disk_files, &roots);
+                let expired_run_ids: Vec<String> = crate::disk_clean::expired(&runs, hold_hours, crate::disk_clean::unix_now())
+                    .into_iter()
+                    .map(|r| r.run_id)
+                    .collect();
+                let total_holds_bytes: u64 = runs.iter().map(|r| r.holds).sum();
+                let total_frees_alone_bytes: u64 = runs.iter().map(|r| r.frees_alone).sum();
+                Ok(json!({
+                    "runs": runs,
+                    "hold_hours": hold_hours,
+                    "expired_run_ids": expired_run_ids,
+                    "total_holds_gb": crate::disk_space::gb2(total_holds_bytes),
+                    "total_frees_alone_gb": crate::disk_space::gb2(total_frees_alone_bytes),
+                }))
+            }
+            "memguard_config" => {
+                check_keys(args, &["path"])?;
+                let path = match args.get("path") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
+                    Some(_) => return Err(ToolError("path must be a dotted setting path string, like \"general.preset\".".into())),
+                };
+                let mut cfg = (self.load_config)();
+                if cfg.disk.is_none() {
+                    cfg.disk = Some(cfg.disk());
+                }
+                if let Some(p) = path {
+                    let segs: Vec<&str> = p.split('.').map(str::trim).collect();
+                    if segs.iter().any(|s| s.is_empty()) {
+                        return Err(ToolError(format!(
+                            "\"{}\" is not a settings path (like general.preset or group.Browsers.trim_above_pct).",
+                            p
+                        )));
+                    }
+                    if segs[0] == "group" && segs.len() < 2 {
+                        return Err(ToolError("say which group: group.<name>.<key>".into()));
+                    }
+                    let cfg_val = to_value(&cfg)?;
+                    let found_val = lookup_config_value(&cfg_val, &segs).cloned();
+                    let layer = (self.resolve_layer)(&p);
+                    Ok(json!({
+                        "path": p,
+                        "found": found_val.is_some(),
+                        "value": found_val,
+                        "layer": layer,
+                    }))
+                } else {
+                    let settings_file = paths::config_file();
+                    let team_file = crate::config::team_file();
+                    let mut out = json!({
+                        "settings_file": settings_file.display().to_string(),
+                        "team_file": team_file.display().to_string(),
+                        "team_active": (self.team_active)(),
+                        "config": cfg,
+                    });
+                    if let Some(warn) = (self.config_warning)() {
+                        out["warning"] = Value::String(warn);
+                    }
+                    Ok(out)
+                }
+            }
+            "memguard_session_summary" => {
+                check_keys(args, &["hours"])?;
+                let hours = hours_arg(args)?;
+                let samples = (self.load_history)(Duration::from_secs_f64(hours * 3600.0));
+                to_value(&crate::history::summarize_samples(&samples))
+            }
             _ => Err(ToolError(format!("Unknown tool: {}", name))),
         }
     }
@@ -393,28 +831,297 @@ impl Server {
 /// Serve on this process's stdin and stdout until stdin closes.
 pub fn run_stdio() -> io::Result<()> {
     eprintln!("Ather MemGuard {} MCP server: reading JSON-RPC from stdin", env!("CARGO_PKG_VERSION"));
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    Server::default().serve(stdin.lock(), stdout.lock())
+    Server::default().serve_inner(io::BufReader::new(io::stdin()), io::stdout(), true)
 }
 
 /// Status as `memguard status --json` reports it, including whether the background app runs.
-/// Kept in step with `current_status` in `src/bin/memguard.rs` (duplicated on purpose so
-/// the CLI and `ops.rs` stay untouched by Part C).
 pub fn current_status(cfg: &Config) -> Status {
     let mut st = analyze(cfg, &snapshot());
     st.daemon = win::instance_running(paths::mutex());
     st.disk = crate::disk::status_brief(cfg);
-    // Paused / suspended state only the background app knows: take it from its last report.
+    // Paused / suspended state only the background app knows: take it from its live channel.
     if st.daemon {
-        if let Ok(text) = std::fs::read_to_string(paths::status_file()) {
-            if let Ok(v) = serde_json::from_str::<Value>(&text) {
-                st.paused = v["paused"].as_bool().unwrap_or(false);
-                st.ue.workers_paused = v["ue"]["workers_paused"].as_u64().unwrap_or(0) as usize;
-            }
-        }
+        crate::ipc::apply_live_status(&mut st);
     }
     st
+}
+
+// ---------------------------------------------------------------- cancellation & concurrency helpers
+
+enum Incoming {
+    Reply(Value),
+    Ignore,
+    Cancel(RequestId),
+    Immediate { id: Value, method: String, params: Value },
+    ToolCall { id: Value, params: Value },
+}
+
+fn parse_incoming_line(line: &str) -> Incoming {
+    // Some shells put a byte-order mark before the first line they pipe.
+    let line = line.trim_start_matches('\u{feff}');
+    let msg: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(e) => return Incoming::Reply(error_reply(Value::Null, PARSE_ERROR, &format!("Parse error: {}", e))),
+    };
+    let Some(obj) = msg.as_object() else {
+        // Batches were removed from MCP in 2025-06-18.
+        return Incoming::Reply(error_reply(Value::Null, INVALID_REQUEST, "Invalid request: expected one JSON object"));
+    };
+    let id = obj.get("id").cloned();
+    let Some(method) = obj.get("method").and_then(Value::as_str) else {
+        if id.is_some() && (obj.contains_key("result") || obj.contains_key("error")) {
+            return Incoming::Ignore; // a response to something we sent; we send no requests
+        }
+        return Incoming::Reply(error_reply(id.unwrap_or(Value::Null), INVALID_REQUEST, "Invalid request: no method"));
+    };
+    let params = obj.get("params").cloned().unwrap_or(Value::Null);
+
+    let Some(id) = id else {
+        if method == "notifications/cancelled" {
+            if let Some(req_id) = params.get("requestId") {
+                return Incoming::Cancel(RequestId::from_value(req_id));
+            }
+        }
+        return Incoming::Ignore;
+    };
+
+    if method == "tools/call" {
+        Incoming::ToolCall { id, params }
+    } else {
+        Incoming::Immediate { id, method: method.to_string(), params }
+    }
+}
+
+fn validate_tool_call(params: &Value) -> Result<(String, Map<String, Value>, Option<Value>), (i64, String)> {
+    let bad = |m: &str| (INVALID_PARAMS, m.to_string());
+    let params = params.as_object().ok_or_else(|| bad("tools/call needs params with a tool name"))?;
+    let name = params.get("name").and_then(Value::as_str).ok_or_else(|| bad("tools/call needs a tool name"))?;
+    let args = match params.get("arguments") {
+        None | Some(Value::Null) => Map::new(),
+        Some(Value::Object(m)) => m.clone(),
+        Some(_) => return Err(bad("arguments must be an object")),
+    };
+    if !is_known_tool(name) {
+        return Err((INVALID_PARAMS, format!("Unknown tool: {}", name)));
+    }
+    let progress_token = params.get("_meta").and_then(|m| m.get("progressToken")).cloned();
+    Ok((name.to_string(), args, progress_token))
+}
+
+fn format_tool_reply(id: Value, outcome: Result<Value, ToolError>) -> Value {
+    let result = match outcome {
+        Ok(value) => json!({
+            "content": [{ "type": "text", "text": pretty(&value) }],
+            "structuredContent": value,
+            "isError": false,
+        }),
+        Err(ToolError(message)) => json!({
+            "content": [{ "type": "text", "text": message }],
+            "isError": true,
+        }),
+    };
+    json!({ "jsonrpc": "2.0", "id": id, "result": result })
+}
+
+fn cancel_all(in_flight: &Mutex<HashMap<RequestId, Vec<Arc<CancelToken>>>>) {
+    let tokens: Vec<Arc<CancelToken>> = in_flight
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .flat_map(|v| v.iter().cloned())
+        .collect();
+    for tok in tokens {
+        tok.cancel();
+    }
+}
+
+fn remove_if_same(in_flight: &Mutex<HashMap<RequestId, Vec<Arc<CancelToken>>>>, req_id: &RequestId, tok: &Arc<CancelToken>) {
+    let mut map = in_flight.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(vec) = map.get_mut(req_id) {
+        vec.retain(|cur| !Arc::ptr_eq(cur, tok));
+        if vec.is_empty() {
+            map.remove(req_id);
+        }
+    }
+}
+
+fn run_child_cancellable(
+    job: &crate::disk_scan::ScanJob,
+    progress: crate::disk_scan::Progress,
+    cancel: &CancelToken,
+) -> Result<crate::disk_scan::ScanOutput, String> {
+    let exe = crate::disk_scan::cli_exe().ok_or("memguard.exe was not found, so the disk could not be counted")?;
+    let input = serde_json::to_vec(job).map_err(|e| e.to_string())?;
+    run_child_cancellable_cmd(&exe, &["disk", "scan-child"], Some(&input), progress, cancel)
+}
+
+fn run_child_cancellable_cmd(
+    exe: &std::path::Path,
+    args: &[&str],
+    stdin_bytes: Option<&[u8]>,
+    progress: crate::disk_scan::Progress,
+    cancel: &CancelToken,
+) -> Result<crate::disk_scan::ScanOutput, String> {
+    use std::io::Read;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x4000;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    if cancel.is_cancelled() {
+        return Err("Cancelled.".into());
+    }
+    let mut child = Command::new(exe)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|e| format!("could not start the disk counter: {}", e))?;
+    if let Some(input) = stdin_bytes {
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Err(e) = stdin.write_all(input) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e.to_string());
+            }
+        } else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("no stdin".into());
+        }
+    } else {
+        drop(child.stdin.take());
+    }
+    let mut stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("no stdout".into());
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(s) => s,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("no stderr".into());
+        }
+    };
+
+    let (ptx, prx) = mpsc::channel::<(u64, f64)>();
+    std::thread::scope(|scope| {
+        let stdout_handle = scope.spawn(move || {
+            let mut s = String::new();
+            let _ = stdout.read_to_string(&mut s);
+            s
+        });
+        let stderr_handle = scope.spawn(move || {
+            for line in io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                let mut it = line.split_whitespace();
+                if it.next() == Some("progress") {
+                    if let (Some(f), Some(s)) = (it.next().and_then(|v| v.parse().ok()), it.next().and_then(|v| v.parse().ok())) {
+                        if ptx.send((f, s)).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut cancelled = false;
+        loop {
+            if cancel.is_cancelled() {
+                cancelled = true;
+                let _ = child.kill();
+                break;
+            }
+            match prx.recv_timeout(Duration::from_millis(50)) {
+                Ok((f, s)) => progress(f, s),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        drop(prx);
+        let status = child.wait().map_err(|e| e.to_string())?;
+        let text = stdout_handle.join().map_err(|_| "the disk counter's output was lost".to_string())?;
+        let _ = stderr_handle.join();
+        if cancelled || cancel.is_cancelled() {
+            return Err("Cancelled.".into());
+        }
+        if !status.success() {
+            return Err(format!("the disk counter stopped with exit code {}", status.code().unwrap_or(-1)));
+        }
+        serde_json::from_str(text.trim()).map_err(|e| format!("the disk counter's result could not be read: {}", e))
+    })
+}
+
+fn relocate_read_vars_cancellable(
+    store: &dyn crate::disk_relocate::EnvStore,
+    cancel: &CancelToken,
+) -> Result<Vec<crate::disk_relocate::VarState>, ToolError> {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let stop = Arc::new(AtomicBool::new(cancel.is_cancelled()));
+    let done = AtomicBool::new(false);
+    let vars = std::thread::scope(|s| {
+        let stop_bg = stop.clone();
+        let done_ref = &done;
+        s.spawn(move || {
+            let guard = cancel.mu.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = cancel
+                .cv
+                .wait_while(guard, |_| !done_ref.load(Ordering::SeqCst) && !cancel.is_cancelled())
+                .unwrap_or_else(|e| e.into_inner());
+            if cancel.is_cancelled() {
+                stop_bg.store(true, Ordering::SeqCst);
+            }
+        });
+        let sizer = |path: &str| -> Option<(u64, bool)> {
+            if stop.load(Ordering::SeqCst) || cancel.is_cancelled() {
+                return None;
+            }
+            let vs = crate::disk_win::VolumeScan {
+                cluster: 4096,
+                block_cloning: false,
+                level2: false,
+                threads: 8,
+                deadline,
+                stop: stop.clone(),
+                started_ft: u64::MAX,
+                multi: Mutex::new(HashMap::new()),
+                progress_files: Arc::new(AtomicU64::new(0)),
+            };
+            let (st, _) = crate::disk_win::walk_item(&vs, 0, &[path.to_string()], &[]);
+            Some((st.allocated, !st.cut_short && st.dir_failures == 0))
+        };
+        let res = crate::disk_relocate::read_vars(store, &sizer);
+        done.store(true, Ordering::SeqCst);
+        cancel.notify();
+        res
+    });
+    if cancel.is_cancelled() {
+        return Err(ToolError("Cancelled.".into()));
+    }
+    Ok(vars)
+}
+
+fn lookup_config_value<'a>(root: &'a Value, segs: &[&str]) -> Option<&'a Value> {
+    let (mut cur, rest) = if segs.first().copied() == Some("group") {
+        let name = *segs.get(1)?;
+        let grp = root
+            .get("group")?
+            .as_array()?
+            .iter()
+            .find(|g| g.get("name").and_then(Value::as_str) == Some(name))?;
+        (grp, &segs[2..])
+    } else {
+        (root, segs)
+    };
+    for key in rest {
+        cur = cur.get(*key)?;
+    }
+    Some(cur)
 }
 
 // ---------------------------------------------------------------- protocol helpers
@@ -443,6 +1150,11 @@ fn write_message<W: Write>(out: &mut W, msg: &Value) -> io::Result<()> {
     serde_json::to_writer(&mut *out, msg)?;
     out.write_all(b"\n")?;
     out.flush()
+}
+
+fn write_sync<W: Write>(out: &Mutex<W>, msg: &Value) -> io::Result<()> {
+    let mut guard = out.lock().unwrap_or_else(|e| e.into_inner());
+    write_message(&mut *guard, msg)
 }
 
 fn pretty(v: &Value) -> String {
@@ -503,7 +1215,7 @@ fn str_arg(args: &Map<String, Value>, key: &str) -> Result<Option<String>, ToolE
 }
 
 /// Progress notifications for a disk count, when the client sent a progress token.
-fn progress_writer<'a, W: Write>(token: &'a Option<Value>, out: &'a mut W, total: f64, what: &'a str) -> impl FnMut(u64, f64) + 'a {
+fn progress_writer<'a, W: Write>(token: &'a Option<Value>, out: &'a Mutex<W>, total: f64, what: &'a str) -> impl FnMut(u64, f64) + 'a {
     move |files, secs| {
         if let Some(token) = token {
             let note = json!({
@@ -511,7 +1223,7 @@ fn progress_writer<'a, W: Write>(token: &'a Option<Value>, out: &'a mut W, total
                 "method": "notifications/progress",
                 "params": { "progressToken": token, "progress": secs.min(total), "total": total, "message": format!("{}: {} files", what, files) }
             });
-            if let Err(e) = write_message(out, &note) {
+            if let Err(e) = write_sync(out, &note) {
                 eprintln!("memguard mcp: could not send progress: {}", e);
             }
         }
@@ -556,7 +1268,19 @@ fn timeout_arg(args: &Map<String, Value>) -> Result<Duration, ToolError> {
 
 // ---------------------------------------------------------------- tool list
 
-fn tool_list() -> Vec<Value> {
+fn tool_list() -> &'static [Value] {
+    static TOOLS: OnceLock<Vec<Value>> = OnceLock::new();
+    TOOLS.get_or_init(build_tool_list).as_slice()
+}
+
+fn is_known_tool(name: &str) -> bool {
+    static NAMES: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    NAMES
+        .get_or_init(|| tool_list().iter().filter_map(|t| t.get("name").and_then(Value::as_str)).collect())
+        .contains(name)
+}
+
+fn build_tool_list() -> Vec<Value> {
     let workload = json!({
         "type": "string",
         "enum": ["editor", "build", "cook"],
@@ -749,6 +1473,84 @@ memguard_disk recent_cleanups. Tell the person what you deleted.",
             },
             "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false },
         }),
+        json!({
+            "name": "memguard_drivers",
+            "title": "Windows and drivers",
+            "description": "Read-only breakdown of the RAM used by Windows itself and its drivers: nonpaged pool (memory Windows cannot page out), resident paged pool, Windows kernel code, driver code, top Windows processes, and top kernel pool tags mapped to likely loaded .sys driver files (tags_available is false when not running as administrator). Changes nothing.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
+        }),
+        json!({
+            "name": "memguard_disk_relocate",
+            "title": "Cache relocation plan",
+            "description": "Read-only plan for moving developer caches (UE-LocalDataCachePath, UE-ZenSubprocessDataPath, NuGet, npm, pip, uv, pnpm, Yarn, Bun, vcpkg, sccache) off the system drive onto another fixed SSD by setting user environment variables. Returns the destination drive, per-variable sizes and actions, notes (including variables never moved like CARGO_HOME and TEMP), and any refusal reason. Changes no registry values and copies or deletes nothing; the person applies or undoes via `memguard disk relocate --apply` or `--undo`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "to": {
+                        "type": "string",
+                        "description": "Optional destination folder on a fixed non-system drive (e.g. E:\\DevCaches). When omitted, picks the fixed non-rotating non-system drive with the most free space."
+                    }
+                },
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
+        }),
+        json!({
+            "name": "memguard_disk_bin",
+            "title": "Ather MemGuard bin",
+            "description": "Read-only listing of runs currently held in Ather MemGuard's `.AtherMemGuard-bin` folders across fixed drives: volume root, run_id, moved timestamp, item titles, predicted frees_alone bytes when emptied, logical holds bytes, configured hold_hours, expired_run_ids, and totals. Deletes nothing; use `memguard disk bin --empty` or `memguard disk undo` on the CLI.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "volume": {
+                        "type": "string",
+                        "description": "Optional drive letter to filter by, e.g. \"D:\". When omitted, checks all fixed drives."
+                    }
+                },
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
+        }),
+        json!({
+            "name": "memguard_config",
+            "title": "Effective configuration",
+            "description": "Read-only view of Ather MemGuard's effective layered settings (built-in defaults merged with team.toml and settings.toml): general preset and flags, pressure thresholds and hysteresis, Unreal protect/worker lists, prime targets, doctor rules, disk rules, and all app groups. Optionally pass `path` (e.g. \"general.preset\" or \"group.Browsers.trim_above_pct\") to inspect a single setting and its layer. Changes nothing.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Optional dotted setting path to look up, e.g. \"general.preset\", \"disk.min_age_hours\", or \"group.Browsers.trim_above_pct\"."
+                    }
+                },
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
+        }),
+        json!({
+            "name": "memguard_session_summary",
+            "title": "Memory session summary",
+            "description": "Read-only compact summary of recorded memory history over the requested hours (default 1, max 168): sample count, time span, peak and latest Unreal/editor committed GB, minimum and latest free RAM and commit GB, peak compile workers, minutes spent in normal/elevated/critical pressure, pressure transitions, editor growth rate, and per-group peak and latest RAM GB without dumping raw samples.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "hours": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "maximum": HISTORY_MAX_HOURS,
+                        "default": HISTORY_DEFAULT_HOURS,
+                        "description": "How far back to summarize, in hours. Default 1, at most 168 (a week)."
+                    }
+                },
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
+        }),
     ]
 }
 
@@ -775,7 +1577,9 @@ pub fn agent_setup_text(exe: &std::path::Path) -> String {
     };
     line("Ather MemGuard for AI agents: an MCP server your agent starts by itself (no port, nothing to enable).");
     line("Tools: memguard_status, memguard_prime, memguard_wait, memguard_advise, memguard_doctor, memguard_history, memguard_ram,");
-    line("       memguard_disk, memguard_disk_checkup, memguard_disk_plan, memguard_disk_clean (deletes regenerable build output only).");
+    line("       memguard_drivers, memguard_config, memguard_session_summary,");
+    line("       memguard_disk, memguard_disk_checkup, memguard_disk_plan, memguard_disk_relocate, memguard_disk_bin,");
+    line("       memguard_disk_clean (deletes regenerable build output only).");
     line("");
     line("Claude Code, for all your projects:");
     line(&format!("  claude mcp add --scope user ather-memguard -- \"{}\" mcp", exe));
@@ -867,7 +1671,24 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(
             names,
-            ["memguard_status", "memguard_prime", "memguard_wait", "memguard_advise", "memguard_doctor", "memguard_history", "memguard_ram", "memguard_disk", "memguard_disk_checkup", "memguard_disk_plan", "memguard_disk_clean"]
+            [
+                "memguard_status",
+                "memguard_prime",
+                "memguard_wait",
+                "memguard_advise",
+                "memguard_doctor",
+                "memguard_history",
+                "memguard_ram",
+                "memguard_disk",
+                "memguard_disk_checkup",
+                "memguard_disk_plan",
+                "memguard_disk_clean",
+                "memguard_drivers",
+                "memguard_disk_relocate",
+                "memguard_disk_bin",
+                "memguard_config",
+                "memguard_session_summary",
+            ]
         );
         for t in tools.iter().filter(|t| t["name"].as_str().unwrap().starts_with("memguard_disk")) {
             let deletes = t["name"] == "memguard_disk_clean";
@@ -876,6 +1697,7 @@ mod tests {
         }
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
+            assert_eq!(t["inputSchema"]["additionalProperties"], false, "{}", t["name"]);
             assert!(t["inputSchema"]["properties"].is_object());
             assert!(t["description"].as_str().unwrap().len() > 80);
         }
@@ -1093,7 +1915,7 @@ mod tests {
         // A forged class in the server's own plan (it can't happen through the tools, but the
         // catalogue decides anyway), and cache:old: refused.
         {
-            let mut mine = srv.agent_plans.borrow_mut();
+            let mut mine = srv.agent_plans.lock().unwrap();
             let mut f = mine.last().unwrap().clone();
             f.id = "pclass".into();
             f.items[1].class = "regenerable".into();
@@ -1112,7 +1934,7 @@ mod tests {
         assert!(s["outcomes"][1]["message"].as_str().unwrap().contains("regenerable"), "{}", s);
         assert!(game.join(r"Saved\Logs\Game.log").is_file() && game.join(r"Intermediate\Build\Win64\a.obj").is_file());
         // A stale plan (older than 10 minutes) is refused.
-        for p in srv.agent_plans.borrow_mut().iter_mut() {
+        for p in srv.agent_plans.lock().unwrap().iter_mut() {
             p.unix -= 700;
         }
         assert!(tool_error_text(&run(4, "memguard_disk_clean", json!({ "ids": ["d1"], "plan_id": p1 }))).contains("under 10 minutes"));
@@ -1129,13 +1951,13 @@ mod tests {
         let r = run(7, "memguard_disk_clean", json!({ "ids": ["d1"], "plan_id": p2 }));
         assert!(r["result"]["structuredContent"]["outcomes"][0]["message"].as_str().unwrap().contains("after the plan"), "{}", r);
         // A protected path smuggled into a plan record is refused by the rules at apply time.
-        let mut forged: PlanRecord = srv.agent_plans.borrow().last().unwrap().clone();
+        let mut forged: PlanRecord = srv.agent_plans.lock().unwrap().last().unwrap().clone();
         forged.id = "pforged".into();
         forged.unix = crate::disk_clean::unix_now();
         forged.items[0].paths = vec![game.join("Content").display().to_string()];
         forged.items[0].path_ids = vec![crate::disk_win::identity(&game.join("Content").display().to_string()).map(|x| x.1)];
         forged.items[0].last_write = u64::MAX;
-        srv.agent_plans.borrow_mut().push(forged);
+        srv.agent_plans.lock().unwrap().push(forged);
         let r = run(8, "memguard_disk_clean", json!({ "ids": ["d1"], "plan_id": "pforged" }));
         let s = &r["result"]["structuredContent"];
         assert_eq!(s["outcomes"][0]["result"], "refused", "{}", s);
@@ -1352,5 +2174,411 @@ mod tests {
         // A wait that is satisfied at once (no prime) returns ready.
         let r = one(&call(13, "memguard_wait", json!({ "commit_gb": 0.001, "timeout_sec": 0 })));
         assert_eq!(r["result"]["structuredContent"]["ready"], true);
+    }
+
+    // ---- Streaming reader/writer harness for concurrency & cancellation tests
+
+    struct ChanReader {
+        rx: mpsc::Receiver<Vec<u8>>,
+        cur: Vec<u8>,
+        pos: usize,
+    }
+
+    impl io::Read for ChanReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            while self.pos >= self.cur.len() {
+                match self.rx.recv() {
+                    Ok(chunk) => {
+                        self.cur = chunk;
+                        self.pos = 0;
+                    }
+                    Err(_) => return Ok(0),
+                }
+            }
+            let n = (self.cur.len() - self.pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.cur[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    struct ChanWriter {
+        tx: mpsc::Sender<Value>,
+        buf: Vec<u8>,
+    }
+
+    impl io::Write for ChanWriter {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            self.buf.extend_from_slice(data);
+            while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = self.buf.drain(..=pos).collect();
+                let s = String::from_utf8(line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                if !s.trim().is_empty() {
+                    let v: Value = serde_json::from_str(s.trim()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    let _ = self.tx.send(v);
+                }
+            }
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn spawn_stream_server(srv: Arc<Server>, cancel_on_eof: bool) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Value>, std::thread::JoinHandle<io::Result<()>>) {
+        let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>();
+        let (out_tx, out_rx) = mpsc::channel::<Value>();
+        let reader = io::BufReader::new(ChanReader { rx: in_rx, cur: Vec::new(), pos: 0 });
+        let writer = ChanWriter { tx: out_tx, buf: Vec::new() };
+        let handle = std::thread::spawn(move || srv.serve_inner(reader, writer, cancel_on_eof));
+        (in_tx, out_rx, handle)
+    }
+
+    fn send_json_line(tx: &mpsc::Sender<Vec<u8>>, msg: &Value) {
+        let mut bytes = serde_json::to_vec(msg).unwrap();
+        bytes.push(b'\n');
+        tx.send(bytes).unwrap();
+    }
+
+    fn recv_until_id(rx: &mpsc::Receiver<Value>, id: &Value, timeout: Duration) -> (Vec<Value>, Value) {
+        let deadline = Instant::now() + timeout;
+        let mut notes = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero(), "timed out waiting for id {}", id);
+            let msg = rx.recv_timeout(left).unwrap_or_else(|_| panic!("timed out waiting for id {}", id));
+            if msg.get("id") == Some(id) {
+                return (notes, msg);
+            }
+            notes.push(msg);
+        }
+    }
+
+    #[test]
+    fn ping_does_not_block_while_wait_is_running() {
+        let srv = Arc::new(server());
+        let (in_tx, out_rx, handle) = spawn_stream_server(srv, true);
+
+        send_json_line(&in_tx, &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "memguard_wait",
+                "arguments": { "ram_gb": 1.0e9, "timeout_sec": 15 },
+                "_meta": { "progressToken": "wp" }
+            }
+        }));
+        let first_note = out_rx.recv_timeout(Duration::from_secs(2)).expect("first progress note");
+        assert_eq!(first_note["method"], "notifications/progress");
+
+        let t0 = Instant::now();
+        send_json_line(&in_tx, &json!({ "jsonrpc": "2.0", "id": 2, "method": "ping" }));
+        let (_notes, ping_reply) = recv_until_id(&out_rx, &json!(2), Duration::from_secs(1));
+        assert!(t0.elapsed() < Duration::from_millis(500), "ping blocked: {:?}", t0.elapsed());
+        assert_eq!(ping_reply["result"], json!({}));
+
+        send_json_line(&in_tx, &json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": 1 }
+        }));
+        let (_notes, cancel_reply) = recv_until_id(&out_rx, &json!(1), Duration::from_secs(1));
+        assert_eq!(cancel_reply["result"]["isError"], true);
+        drop(in_tx);
+        handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn cancelled_aborts_wait_with_int_and_string_ids_and_ignores_unknown() {
+        let srv = Arc::new(server());
+        let (in_tx, out_rx, handle) = spawn_stream_server(srv, true);
+
+        // 1) Active wait with integer ID cancelled after progress starts.
+        send_json_line(&in_tx, &json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "tools/call",
+            "params": {
+                "name": "memguard_wait",
+                "arguments": { "ram_gb": 1.0e9, "timeout_sec": 20 },
+                "_meta": { "progressToken": "p42" }
+            }
+        }));
+        let _ = out_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let t0 = Instant::now();
+        send_json_line(&in_tx, &json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": 42 }
+        }));
+        let (_notes, r42) = recv_until_id(&out_rx, &json!(42), Duration::from_secs(1));
+        assert!(t0.elapsed() < Duration::from_millis(500));
+        assert_eq!(r42["result"]["isError"], true);
+
+        // 2) Back-to-back tools/call + notifications/cancelled with string ID.
+        let t1 = Instant::now();
+        send_json_line(&in_tx, &json!({
+            "jsonrpc": "2.0",
+            "id": "str-99",
+            "method": "tools/call",
+            "params": {
+                "name": "memguard_wait",
+                "arguments": { "ram_gb": 1.0e9, "timeout_sec": 20 }
+            }
+        }));
+        send_json_line(&in_tx, &json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": "str-99" }
+        }));
+        let (notes, r_str) = recv_until_id(&out_rx, &json!("str-99"), Duration::from_secs(1));
+        assert!(notes.is_empty());
+        assert!(t1.elapsed() < Duration::from_millis(500));
+        assert_eq!(r_str["result"]["isError"], true);
+
+        // 3) Unknown and already-completed requestIds are silent no-ops.
+        send_json_line(&in_tx, &json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 99999 } }));
+        send_json_line(&in_tx, &json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 42 } }));
+        send_json_line(&in_tx, &json!({ "jsonrpc": "2.0", "id": 77, "method": "ping" }));
+        let (notes, r77) = recv_until_id(&out_rx, &json!(77), Duration::from_secs(1));
+        assert!(notes.is_empty());
+        assert_eq!(r77["result"], json!({}));
+
+        drop(in_tx);
+        handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn eof_with_cancel_on_eof_aborts_active_wait() {
+        let srv = Arc::new(server());
+        let (in_tx, out_rx, handle) = spawn_stream_server(srv, true);
+        send_json_line(&in_tx, &json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "memguard_wait",
+                "arguments": { "ram_gb": 1.0e9, "timeout_sec": 30 },
+                "_meta": { "progressToken": "eof" }
+            }
+        }));
+        let _ = out_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let t0 = Instant::now();
+        drop(in_tx);
+        handle.join().unwrap().unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(1), "EOF did not cancel wait promptly");
+        let (_notes, reply) = recv_until_id(&out_rx, &json!(10), Duration::from_secs(1));
+        assert_eq!(reply["result"]["isError"], true);
+    }
+
+    #[test]
+    fn cancelled_aborts_disk_checkup_and_kills_child() {
+        // 1) Back-to-back cancel aborts memguard_disk_checkup without touching scan runner.
+        let root = std::env::temp_dir().join(format!("amg-mcp-chk-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(r"Game\Intermediate")).unwrap();
+        std::fs::write(root.join(r"Game\Game.uproject"), br#"{ "FileVersion": 3 }"#).unwrap();
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_flag = ran.clone();
+        let srv = Arc::new(server().with_disk(
+            Box::new(move |job, p| {
+                ran_flag.store(true, Ordering::SeqCst);
+                Ok(crate::disk_scan::run_job(job, p))
+            }),
+            Box::new(|| None),
+        ));
+        let (in_tx, out_rx, handle) = spawn_stream_server(srv, true);
+        send_json_line(&in_tx, &json!({
+            "jsonrpc": "2.0",
+            "id": "chk1",
+            "method": "tools/call",
+            "params": {
+                "name": "memguard_disk_checkup",
+                "arguments": { "path": root.display().to_string(), "refresh": true, "budget_sec": 30 }
+            }
+        }));
+        send_json_line(&in_tx, &json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": "chk1" }
+        }));
+        let (_notes, reply) = recv_until_id(&out_rx, &json!("chk1"), Duration::from_secs(2));
+        assert_eq!(reply["result"]["isError"], true);
+        assert!(!ran.load(Ordering::SeqCst), "pre-cancelled checkup must not launch scan");
+        drop(in_tx);
+        handle.join().unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        // 2) Active long-running child process is killed promptly on CancelToken::cancel().
+        let tok = Arc::new(CancelToken::new());
+        let tok_bg = tok.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            tok_bg.cancel();
+        });
+        let started = Instant::now();
+        let ps = std::path::Path::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let exe = if ps.is_file() { ps } else { std::path::Path::new("cmd.exe") };
+        let args: &[&str] = if ps.is_file() {
+            &["-NoProfile", "-Command", "Start-Sleep -Seconds 15"]
+        } else {
+            &["/C", "ping -n 15 127.0.0.1 >nul"]
+        };
+        let res = run_child_cancellable_cmd(exe, args, None, &mut |_, _| {}, &tok);
+        assert!(res.is_err());
+        assert!(started.elapsed() < Duration::from_secs(2), "child kill took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn config_mtime_cache_hits_and_invalidates_on_edits() {
+        let root = std::env::temp_dir().join(format!("amg-mcp-cfg-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let cfg_path = root.join("settings.toml");
+        let team_path = root.join("team.toml");
+
+        let loads = Arc::new(AtomicU64::new(0));
+        let loads_c = loads.clone();
+        let cp = cfg_path.clone();
+        let tp = team_path.clone();
+        let loader = cached_config_loader_for(
+            move || cp.clone(),
+            move || tp.clone(),
+            move || {
+                loads_c.fetch_add(1, Ordering::SeqCst);
+                Config::builtin()
+            },
+        );
+
+        let _ = loader();
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        let _ = loader();
+        assert_eq!(loads.load(Ordering::SeqCst), 1, "cache hit when neither file exists");
+
+        std::fs::write(&cfg_path, b"interval_sec = 10\n").unwrap();
+        let _ = loader();
+        assert_eq!(loads.load(Ordering::SeqCst), 2, "invalidates when settings.toml created");
+        let _ = loader();
+        assert_eq!(loads.load(Ordering::SeqCst), 2, "cache hit when settings.toml unchanged");
+
+        std::fs::write(&cfg_path, b"interval_sec = 15\n# changed length\n").unwrap();
+        let _ = loader();
+        assert_eq!(loads.load(Ordering::SeqCst), 3, "invalidates when settings.toml edited");
+
+        std::fs::write(&team_path, b"interval_sec = 20\n").unwrap();
+        let _ = loader();
+        assert_eq!(loads.load(Ordering::SeqCst), 4, "invalidates when team.toml created");
+        let _ = loader();
+        assert_eq!(loads.load(Ordering::SeqCst), 4, "cache hit when both unchanged");
+
+        std::fs::remove_file(&team_path).unwrap();
+        let _ = loader();
+        assert_eq!(loads.load(Ordering::SeqCst), 5, "invalidates when team.toml removed");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn request_id_normalizes_types_cleanly() {
+        assert_eq!(RequestId::from_value(&json!(42)), RequestId::Int(42));
+        assert_eq!(RequestId::from_value(&json!(u64::MAX)), RequestId::Uint(u64::MAX));
+        assert_eq!(RequestId::from_value(&json!("abc")), RequestId::Str("abc".into()));
+        assert_ne!(RequestId::from_value(&json!(42)), RequestId::from_value(&json!("42")));
+        assert_eq!(RequestId::from_value(&json!(true)), RequestId::Bool(true));
+        assert_eq!(RequestId::from_value(&Value::Null), RequestId::Null);
+    }
+
+    #[test]
+    fn new_m3_tools_work_and_validate_arguments() {
+        // 1) memguard_drivers
+        let r = one(&call(1, "memguard_drivers", json!({})));
+        assert_eq!(r["result"]["isError"], false, "{}", r);
+        let sc = &r["result"]["structuredContent"];
+        assert!(sc["total_gb"].is_number());
+        assert!(sc["tags_available"].is_boolean());
+        tool_error_text(&one(&call(2, "memguard_drivers", json!({ "extra": 1 }))));
+
+        // 2) memguard_disk_relocate (validation & negative paths without touching registry)
+        tool_error_text(&one(&call(3, "memguard_disk_relocate", json!({ "to": "relative\\path" }))));
+        tool_error_text(&one(&call(4, "memguard_disk_relocate", json!({ "to": r"Q:\NoSuchDrive\Cache" }))));
+        tool_error_text(&one(&call(5, "memguard_disk_relocate", json!({ "apply": true }))));
+
+        // 3) memguard_disk_bin (isolated DiskFiles in temp dir)
+        let root = std::env::temp_dir().join(format!("amg-mcp-bin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let files = crate::disk_clean::DiskFiles::in_dir(root.join("data"));
+        let bin_srv = server().with_clean(files, crate::disk_clean::CleanOpts::default());
+        let mut out = Vec::new();
+        let reqs = format!(
+            "{}\n{}\n{}\n",
+            call(6, "memguard_disk_bin", json!({})),
+            call(7, "memguard_disk_bin", json!({ "volume": "badvol" })),
+            call(8, "memguard_disk_bin", json!({ "empty": true }))
+        );
+        bin_srv.serve(reqs.as_bytes(), &mut out).unwrap();
+        let replies: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(replies[0]["result"]["isError"], false, "{}", replies[0]);
+        assert!(replies[0]["result"]["structuredContent"]["runs"].is_array());
+        assert!(replies[0]["result"]["structuredContent"]["hold_hours"].is_number());
+        assert!(replies[0]["result"]["structuredContent"]["expired_run_ids"].is_array());
+        assert_eq!(replies[1]["result"]["isError"], true);
+        assert_eq!(replies[2]["result"]["isError"], true);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // 4) memguard_config (injected ConfigLoader -> never writes %APPDATA%)
+        let cfg_srv = Server::new(Box::new(|| {
+            let mut c = Config::builtin();
+            c.interval_sec = 42;
+            c
+        }));
+        let run_cfg = |line: &str| -> Value {
+            let mut o = Vec::new();
+            cfg_srv.serve(line.as_bytes(), &mut o).unwrap();
+            serde_json::from_str(String::from_utf8(o).unwrap().trim()).unwrap()
+        };
+        let r_all = run_cfg(&call(9, "memguard_config", json!({})));
+        assert_eq!(r_all["result"]["isError"], false, "{}", r_all);
+        let sc = &r_all["result"]["structuredContent"];
+        assert_eq!(sc["config"]["interval_sec"], 42);
+        assert!(sc["config"]["disk"].is_object());
+        assert!(sc["settings_file"].is_string());
+        assert!(sc["team_file"].is_string());
+        assert!(sc["team_active"].is_boolean());
+
+        let r_path = run_cfg(&call(10, "memguard_config", json!({ "path": "interval_sec" })));
+        assert_eq!(r_path["result"]["structuredContent"]["found"], true);
+        assert_eq!(r_path["result"]["structuredContent"]["value"], 42);
+        assert_eq!(r_path["result"]["structuredContent"]["layer"], "builtin");
+
+        let r_grp = run_cfg(&call(11, "memguard_config", json!({ "path": "group.Browsers.trim_above_pct" })));
+        assert_eq!(r_grp["result"]["structuredContent"]["found"], true);
+
+        let r_miss = run_cfg(&call(12, "memguard_config", json!({ "path": "no.such.key" })));
+        assert_eq!(r_miss["result"]["structuredContent"]["found"], false);
+        assert_eq!(r_miss["result"]["structuredContent"]["value"], Value::Null);
+
+        tool_error_text(&run_cfg(&call(13, "memguard_config", json!({ "path": "group." }))));
+        tool_error_text(&run_cfg(&call(14, "memguard_config", json!({ "path": "" }))));
+        tool_error_text(&run_cfg(&call(15, "memguard_config", json!({ "extra": true }))));
+
+        // 5) memguard_session_summary
+        let sum_srv = server().with_history(Box::new(|_| (0..3).map(|i| sample(1000 + i * 60)).collect()));
+        let mut o = Vec::new();
+        let reqs = format!(
+            "{}\n{}\n{}\n",
+            call(16, "memguard_session_summary", json!({})),
+            call(17, "memguard_session_summary", json!({ "hours": 0 })),
+            call(18, "memguard_session_summary", json!({ "days": 1 }))
+        );
+        sum_srv.serve(reqs.as_bytes(), &mut o).unwrap();
+        let sum_replies: Vec<Value> = String::from_utf8(o).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(sum_replies[0]["result"]["isError"], false, "{}", sum_replies[0]);
+        let ss = &sum_replies[0]["result"]["structuredContent"];
+        assert_eq!(ss["sample_count"], 3);
+        assert_eq!(ss["peak_ue_committed_gb"], 20.0);
+        assert_eq!(ss["groups"][0]["name"], "Browsers");
+        assert_eq!(sum_replies[1]["result"]["isError"], true);
+        assert_eq!(sum_replies[2]["result"]["isError"], true);
     }
 }

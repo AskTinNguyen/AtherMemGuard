@@ -1,6 +1,8 @@
 //! Tray icon, menu, flyout, toasts and the background loop (docs/UI.md section 3).
 //!
-//! One hidden window on the UI thread owns the engine and a 1-second timer. Everything the
+//! One hidden window on the UI thread owns the engine, driven by an event-driven
+//! `MsgWaitForMultipleObjectsEx` wait loop (exit, settings, control IPC, config directory watch,
+//! and low-memory handles) and a `SetCoalescableTimer` coalesced to `interval_sec`. Everything the
 //! person can do arrives as a `Command` posted to that window (menu, flyout, toasts, the prime
 //! hotkey, the settings window) and goes through `dispatch`, the one place commands are carried
 //! out. Slow work (freeing memory, update checks and downloads) runs on worker threads, which
@@ -25,11 +27,14 @@ use windows_sys::Win32::UI::Shell::{
     NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, NOTIFYICON_VERSION_4,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DispatchMessageW, GetCursorPos,
-    GetMessageW, GetSystemMetrics, KillTimer, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SendMessageTimeoutW,
-    SetForegroundWindow, SetTimer, TrackPopupMenu, TranslateMessage, HICON, HWND_BROADCAST, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG,
-    SMTO_ABORTIFHUNG, SM_CXSMICON, SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY,
-    WM_LBUTTONDBLCLK, WM_NULL, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
+    DestroyWindow, DispatchMessageW, GetCursorPos, GetSystemMetrics, KillTimer, PeekMessageW,
+    PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SendMessageTimeoutW,
+    SetForegroundWindow, TrackPopupMenu, TranslateMessage, HICON, HWND_BROADCAST, MF_CHECKED,
+    MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, PM_REMOVE, SMTO_ABORTIFHUNG, SM_CXSMICON,
+    SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU,
+    WM_DESTROY, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_NULL, WM_QUIT, WM_SETTINGCHANGE, WM_TIMER,
+    WNDCLASSW,
 };
 
 use crate::engine::{Engine, Event, Level, Status};
@@ -39,7 +44,7 @@ use crate::ui::toast::{self, catalog, ToastId};
 use crate::ui::Command;
 use crate::updater::{CheckResult, Manifest};
 use crate::win::{self, wide, Handle};
-use crate::{ops, paths, updater};
+use crate::{ipc, ops, paths, updater};
 
 pub use model::*;
 
@@ -48,6 +53,7 @@ const WM_TRAY: u32 = WM_APP + 1;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 const WM_RUN_COMMAND: u32 = WM_APP + 2;
 const WM_WORK: u32 = WM_APP + 3;
+const WM_IPC_WAKE: u32 = WM_APP + 4;
 const TIMER_ID: usize = 1;
 const HOTKEY_ID: i32 = 1;
 const FIRST_UPDATE_CHECK: Duration = Duration::from_secs(60);
@@ -435,11 +441,7 @@ fn tray_state(key: &str) -> Option<toml::Value> {
 fn set_tray_state(key: &str, value: toml::Value) {
     let path = crate::ui::ui_state::file();
     let text = with_tray_value(&std::fs::read_to_string(&path).unwrap_or_default(), key, value);
-    let _ = std::fs::create_dir_all(paths::data_dir());
-    let tmp = path.with_extension("toml.tmp");
-    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    let _ = crate::config::write_atomic(&path, &text);
 }
 
 /// Send a command to the tray loop (from any UI on the tray thread).
@@ -487,27 +489,23 @@ impl crate::ui::history::HistorySource for TrayHistory {
 
 pub fn open_history_window() {
     flyout::close();
+    with_app(|a| a.dialog_open = true);
+    win::set_self_eco_qos(false);
     crate::ui::history::open_history(Box::new(TrayHistory::default()));
 }
 
 /// The checkup window on `tab` (an open one switches to it).
 pub fn open_doctor_window(tab: crate::ui::doctor::Tab) {
     flyout::close();
+    with_app(|a| a.dialog_open = true);
+    win::set_self_eco_qos(false);
     let tray = TRAY_HWND.load(Ordering::SeqCst);
     crate::ui::doctor::open_doctor(Box::new(RealDoctor::new(tray)), Box::new(post_command), Some(tab));
 }
 
 /// Write the RAM report page to `path` (atomically, creating the folder).
 pub fn write_ram_report(path: &Path, r: &crate::ramcheck::RamReport) -> Result<(), String> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
-    }
-    let tmp = path.with_extension("html.tmp");
-    std::fs::write(&tmp, crate::ramcheck::render_html(r)).map_err(|e| format!("{}: {}", tmp.display(), e))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("{}: {}", path.display(), e)
-    })
+    crate::config::write_atomic(path, &crate::ramcheck::render_html(r))
 }
 
 /// "Show me how" on the RAM check's toast and checkup row: write the report page to the data
@@ -1040,9 +1038,15 @@ struct App {
     hwnd: HWND,
     icon: HICON,
     icon_key: (Level, bool),
+    last_tip: String,
+    run_at_startup: bool,
+    timer_interval_ms: u32,
+    dialog_open: bool,
     last_tick: Option<Instant>,
     /// The latest status, shared with the settings window.
     status: Rc<RefCell<Option<Status>>>,
+    status_pub: ipc::StatusPublisher,
+    control: Option<ipc::ControlServer>,
     exit_event: Option<Handle>,
     /// `AtherMemGuard.exe --settings` signals this to open the settings window.
     settings_event: Option<Handle>,
@@ -1127,12 +1131,19 @@ fn icon_rect(hwnd: HWND) -> Option<crate::ui::geom::Rect> {
 }
 
 impl App {
-    fn add_icon(&self) {
+    fn add_icon(&mut self) {
         let mut nid = notify_data(self.hwnd);
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
         nid.uCallbackMessage = WM_TRAY;
         nid.hIcon = self.icon;
-        copy_to(&mut nid.szTip, &self.status.borrow().as_ref().map(|_| tooltip(&self.view())).unwrap_or_else(|| "Ather MemGuard".into()));
+        let tip = self
+            .status
+            .borrow()
+            .as_ref()
+            .map(|_| tooltip(&self.view()))
+            .unwrap_or_else(|| "Ather MemGuard".into());
+        copy_to(&mut nid.szTip, &tip);
+        self.last_tip = tip;
         unsafe {
             Shell_NotifyIconW(NIM_ADD, &nid);
             nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
@@ -1153,16 +1164,25 @@ impl App {
             hotkey: self.engine.cfg.general.prime_hotkey.trim().to_string(),
             update_version: self.updates.available.as_ref().map(|m| m.version.clone()),
             updating: self.updates.downloading,
-            run_at_startup: crate::install::is_run_at_startup(),
+            run_at_startup: self.run_at_startup,
         }
     }
 
     fn update_icon(&mut self) {
         let Some((level, paused)) = self.status.borrow().as_ref().map(|s| (s.pressure, self.engine.paused)) else { return };
+        let tip = tooltip(&self.view());
+        let icon_changed = self.icon_key != (level, paused);
+        let tip_changed = self.last_tip != tip;
+        if !icon_changed && !tip_changed {
+            return;
+        }
         let mut nid = notify_data(self.hwnd);
-        nid.uFlags = NIF_TIP | NIF_SHOWTIP;
-        copy_to(&mut nid.szTip, &tooltip(&self.view()));
-        let old = (self.icon_key != (level, paused)).then(|| {
+        if tip_changed {
+            nid.uFlags |= NIF_TIP | NIF_SHOWTIP;
+            copy_to(&mut nid.szTip, &tip);
+            self.last_tip = tip;
+        }
+        let old = icon_changed.then(|| {
             let old = self.icon;
             self.icon = make_icon(level, paused);
             self.icon_key = (level, paused);
@@ -1229,21 +1249,128 @@ impl App {
         }
     }
 
+    fn target_timer_ms(&self) -> u32 {
+        let base_ms = self.engine.cfg.interval_sec.max(1).saturating_mul(1000).min(u32::MAX as u64) as u32;
+        if let Some(rem) = self.engine.pause_remaining(Instant::now()) {
+            let rem_ms = rem.as_millis().clamp(50, u32::MAX as u128) as u32;
+            base_ms.min(rem_ms)
+        } else {
+            base_ms
+        }
+    }
+
+    fn sync_timer(&mut self) {
+        let want = self.target_timer_ms();
+        if want != self.timer_interval_ms {
+            let tol = (want / 10).clamp(50, 1000);
+            if win::set_coalescable_timer(self.hwnd, TIMER_ID, want, tol) {
+                self.timer_interval_ms = want;
+            }
+        }
+    }
+
+    fn handle_engine_events(&mut self, events: &[Event], st: Option<&Status>) {
+        for ev in events {
+            if let Some(s) = st {
+                log_event(ev, s);
+            }
+            if matches!(ev, Event::SettingsReloaded) {
+                self.apply_settings();
+                self.guard.set_patterns(crate::doctor::DoctorSettings::load().close_while_unreal);
+                self.sync_timer();
+            }
+            if let Some(s) = st {
+                if let Some(t) = self.brain.toast_for(ev, s) {
+                    toast::show(t);
+                }
+            } else if let Event::SettingsError(message) = ev {
+                toast::show(catalog::settings_problem(message));
+            }
+        }
+    }
+
+    fn on_config_watch(&mut self) {
+        self.engine.mark_config_dirty();
+        self.engine.reload(false);
+        let events = self.engine.take_events();
+        if events.is_empty() {
+            return;
+        }
+        let reloaded = events.iter().any(|e| matches!(e, Event::SettingsReloaded));
+        let cur_st = self.status.borrow().clone();
+        self.handle_engine_events(&events, cur_st.as_ref());
+        if reloaded {
+            self.tick();
+            self.sync_timer();
+        }
+    }
+
+    fn handle_control_requests(&mut self) {
+        let reqs: Vec<ipc::ControlRequest> = self
+            .control
+            .as_ref()
+            .into_iter()
+            .flat_map(|c| std::iter::from_fn(|| c.try_recv()))
+            .collect();
+        for req in reqs {
+            match req.cmd {
+                ipc::ControlCmd::Pause { minutes } => {
+                    if let Some(m) = minutes {
+                        self.engine.pause_for(Duration::from_secs(m.saturating_mul(60)));
+                    } else {
+                        self.engine.set_paused(true);
+                    }
+                    self.tick();
+                    self.sync_timer();
+                    req.respond(Ok(()));
+                }
+                ipc::ControlCmd::Resume => {
+                    self.engine.set_paused(false);
+                    self.tick();
+                    self.sync_timer();
+                    req.respond(Ok(()));
+                }
+                ipc::ControlCmd::Reload => {
+                    self.engine.mark_config_dirty();
+                    self.engine.reload(true);
+                    let events = self.engine.take_events();
+                    let cur_st = self.status.borrow().clone();
+                    self.handle_engine_events(&events, cur_st.as_ref());
+                    self.tick();
+                    self.sync_timer();
+                    req.respond(Ok(()));
+                }
+            }
+        }
+    }
+
+    fn drain_pending(&mut self) {
+        for w in PENDING.with(|p| std::mem::take(&mut *p.borrow_mut())) {
+            self.on_work(w);
+        }
+    }
+
+    fn check_dialog_closed(&mut self) {
+        if self.dialog_open {
+            let any = crate::ui::window::find(crate::ui::settings::KIND).is_some()
+                || crate::ui::window::find(crate::ui::history::KIND).is_some()
+                || crate::ui::window::find(crate::ui::doctor::KIND).is_some();
+            if !any {
+                self.dialog_open = false;
+                self.engine.shrink_idle();
+                win::set_self_eco_qos(true);
+                win::self_trim();
+            }
+        }
+    }
+
     fn tick(&mut self) {
         let st = self.engine.tick();
         let events = self.engine.take_events();
         *self.status.borrow_mut() = Some(st.clone());
+        self.status_pub.publish(&st);
         self.update_icon();
-        for ev in &events {
-            log_event(ev, &st);
-            if matches!(ev, Event::SettingsReloaded) {
-                self.apply_settings();
-                self.guard.set_patterns(crate::doctor::DoctorSettings::load().close_while_unreal);
-            }
-            if let Some(t) = self.brain.toast_for(ev, &st) {
-                toast::show(t);
-            }
-        }
+        self.handle_engine_events(&events, Some(&st));
         if flyout::is_open() {
             if let Some(d) = self.flyout_data() {
                 flyout::update(d);
@@ -1264,15 +1391,26 @@ impl App {
             if self.engine.cfg.disk().enabled {
                 self.disk_polling = true;
                 let (cfg, prev) = (self.engine.cfg.clone(), self.disk_watch.clone());
+                let files = crate::disk_clean::DiskFiles::default();
+                let needs_pids = files.watches().iter().any(|w| w.measured.is_none());
+                let pids: Vec<u32> = if needs_pids {
+                    self.engine.last_procs().iter().map(|p| p.pid).collect()
+                } else {
+                    Vec::new()
+                };
                 spawn_work(self.hwnd, move || {
                     let vols = crate::disk::read_volumes(&cfg, &prev);
-                    let pids: Vec<u32> = win::list_processes().iter().map(|p| p.pid).collect();
-                    let hk = crate::disk_clean::housekeeping(&crate::disk_clean::DiskFiles::default(), cfg.disk().hold_hours, &pids);
+                    let hk = crate::disk_clean::housekeeping(&files, cfg.disk().hold_hours, &pids);
                     Work::DiskPolled(vols, hk)
                 });
             } else {
                 self.engine.set_disk(None);
             }
+        }
+        self.engine.clear_last_procs();
+        if !st.activities.any() && !self.dialog_open {
+            self.engine.shrink_idle();
+            win::self_trim();
         }
         if self.engine.cfg.updates.check_automatically && now >= self.updates.next_auto && !self.updates.checking && !self.updates.downloading {
             self.updates.next_auto = now + UPDATE_EVERY;
@@ -1399,6 +1537,7 @@ impl App {
                 self.priming = false;
                 self.engine.forget_applied(); // prime set memory priorities of its own
                 toast::show(catalog::freed_manual(r.trimmed_processes, r.before.ram_free_gb, r.after.ram_free_gb));
+                self.tick();
             }
             Work::Checked { manual, result } => {
                 self.updates.checking = false;
@@ -1510,6 +1649,11 @@ impl App {
                         toast::show(t);
                     }
                 }
+                if !self.dialog_open {
+                    self.engine.shrink_idle();
+                    win::self_trim();
+                    win::set_self_eco_qos(true);
+                }
             }
             Work::Downloaded(r) => {
                 let installed = r.and_then(|path| updater::install_staged(&path));
@@ -1534,7 +1678,9 @@ impl App {
                 UnregisterHotKey(self.hwnd, HOTKEY_ID);
             }
         }
+        self.control = None;
         self.engine.restore_all();
+        self.engine.flush_history();
         let nid = notify_data(self.hwnd);
         unsafe {
             Shell_NotifyIconW(NIM_DELETE, &nid);
@@ -1595,6 +1741,7 @@ fn dispatch(hwnd: HWND, cmd: Command) {
             with_app(|a| {
                 a.engine.pause_for(Duration::from_secs(30 * 60));
                 a.tick();
+                a.sync_timer();
                 toast::show(catalog::paused_30(&clock_after(Duration::from_secs(30 * 60))));
             });
         }
@@ -1602,6 +1749,7 @@ fn dispatch(hwnd: HWND, cmd: Command) {
             with_app(|a| {
                 a.engine.set_paused(true);
                 a.tick();
+                a.sync_timer();
                 toast::show(catalog::paused());
             });
         }
@@ -1609,6 +1757,7 @@ fn dispatch(hwnd: HWND, cmd: Command) {
             with_app(|a| {
                 a.engine.set_paused(false);
                 a.tick();
+                a.sync_timer();
                 toast::show(catalog::resumed());
             });
         }
@@ -1641,6 +1790,7 @@ fn dispatch(hwnd: HWND, cmd: Command) {
             let on = !crate::install::is_run_at_startup();
             match crate::install::set_run_at_startup(on) {
                 Ok(()) => {
+                    with_app(|a| a.run_at_startup = on);
                     toast::show(catalog::startup_toggled(on));
                 }
                 Err(e) => {
@@ -1667,9 +1817,9 @@ fn dispatch(hwnd: HWND, cmd: Command) {
                 spawn_work(h, || {
                     let path = paths::data_dir().join(DRIVER_REPORT_FILE);
                     let html = crate::drivers::render_html(&crate::drivers::report());
-                    match std::fs::create_dir_all(paths::data_dir()).and_then(|_| std::fs::write(&path, html)) {
+                    match crate::config::write_atomic(&path, &html) {
                         Ok(()) => Work::OpenPage(path),
-                        Err(e) => Work::Toast(catalog::driver_report_failed(&format!("{}: {}", path.display(), e))),
+                        Err(e) => Work::Toast(catalog::driver_report_failed(&e)),
                     }
                 });
             }
@@ -1685,7 +1835,13 @@ fn dispatch(hwnd: HWND, cmd: Command) {
 }
 
 fn open_settings_window() {
-    let Some((status, update)) = with_app(|a| (a.status.clone(), a.updates.state.clone())) else { return };
+    let Some((status, update)) = with_app(|a| {
+        a.dialog_open = true;
+        (a.status.clone(), a.updates.state.clone())
+    }) else {
+        return;
+    };
+    win::set_self_eco_qos(false);
     flyout::close();
     crate::ui::settings::open_settings(SettingsHost {
         store: Box::new(crate::ui::real_store::RealStore::new()),
@@ -1697,7 +1853,12 @@ fn open_settings_window() {
 }
 
 fn show_menu(hwnd: HWND) {
-    let Some(entries) = with_app(|a| menu(&a.view())) else { return };
+    let Some(entries) = with_app(|a| {
+        a.run_at_startup = crate::install::is_run_at_startup();
+        menu(&a.view())
+    }) else {
+        return;
+    };
     flyout::close();
     let id = unsafe {
         let m = CreatePopupMenu();
@@ -1803,28 +1964,15 @@ fn leftovers_toast(r: crate::doctor::EndLeftovers) -> crate::ui::toast::Toast {
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_TIMER => {
-            let mut open_settings = false;
-            let quit = with_app(|a| {
-                if a.exit_event.as_ref().is_some_and(win::event_is_set) {
-                    return true;
-                }
-                open_settings = a.settings_event.as_ref().is_some_and(win::event_is_set);
-                let due = a.last_tick.map_or(true, |t| t.elapsed().as_secs() >= a.engine.cfg.interval_sec);
-                if due {
-                    a.tick();
-                }
-                for w in PENDING.with(|p| std::mem::take(&mut *p.borrow_mut())) {
-                    a.on_work(w);
-                }
-                false
+            with_app(|a| {
+                a.tick();
+                a.sync_timer();
+                a.drain_pending();
             });
-            if quit == Some(true) {
-                crate::log::write("asked to stop");
-                PostQuitMessage(0);
-            } else if open_settings {
-                // Outside the app borrow: opening a window runs its own messages.
-                dispatch(hwnd, Command::OpenSettings);
-            }
+            0
+        }
+        WM_IPC_WAKE => {
+            with_app(|a| a.handle_control_requests());
             0
         }
         WM_TRAY => {
@@ -1864,7 +2012,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             0
         }
         WM_DESTROY => {
-            PostQuitMessage(0);
+            if TRAY_HWND.load(Ordering::SeqCst) != 0 {
+                PostQuitMessage(0);
+            }
             0
         }
         _ => {
@@ -1914,6 +2064,7 @@ fn run_with(after_update: bool, open_settings: bool) {
     crate::disk_scan::allow_cache_writes();
     let exit_event = win::create_event(paths::exit_event());
     let settings_event = win::create_event(paths::settings_event());
+    let low_mem_event = win::low_memory_event();
 
     unsafe {
         let class = wide("AtherMemGuardTrayWindow");
@@ -1932,14 +2083,28 @@ fn run_with(after_update: bool, open_settings: bool) {
         TRAY_HWND.store(hwnd as isize, Ordering::SeqCst);
         crate::ui::window::allow_dark_menus();
 
+        let hwnd_raw = hwnd as isize;
+        let control = ipc::ControlServer::start(Some(Box::new(move || {
+            let cur = TRAY_HWND.load(Ordering::SeqCst);
+            if cur == hwnd_raw && cur != 0 {
+                PostMessageW(cur as HWND, WM_IPC_WAKE, 0, 0);
+            }
+        })));
+
         let created = wide("TaskbarCreated");
-        let app = App {
+        let mut app = App {
             engine: Engine::new(),
             hwnd,
             icon: make_icon(Level::Normal, false),
             icon_key: (Level::Normal, false),
+            last_tip: String::new(),
+            run_at_startup: crate::install::is_run_at_startup(),
+            timer_interval_ms: 0,
+            dialog_open: false,
             last_tick: None,
             status: Rc::new(RefCell::new(None)),
+            status_pub: ipc::StatusPublisher::new(),
+            control,
             exit_event,
             settings_event,
             taskbar_created: RegisterWindowMessageW(created.as_ptr()),
@@ -1975,6 +2140,7 @@ fn run_with(after_update: bool, open_settings: bool) {
         with_app(|a| {
             a.apply_settings();
             a.tick();
+            a.sync_timer();
             // The settings problem at start (if any) came before the first tick: show it.
             let first_run = tray_state("first_run_done").and_then(|v| v.as_bool()) != Some(true);
             if after_update {
@@ -1986,116 +2152,143 @@ fn run_with(after_update: bool, open_settings: bool) {
                 set_tray_state("first_run_done", toml::Value::Boolean(true));
             }
         });
-        SetTimer(hwnd, TIMER_ID, 1000, None);
         if open_settings {
             post_command(Command::OpenSettings);
+        } else {
+            win::set_self_eco_qos(true);
+            win::self_trim();
         }
 
-        let mut msg: MSG = zeroed();
-        while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        #[derive(Clone, Copy)]
+        enum TrayWait {
+            Exit,
+            Settings,
+            Control,
+            ConfigWatch,
+            LowMem,
         }
+
+        let mut low_mem_suppress_until: Option<Instant> = None;
+        let mut msg: MSG = zeroed();
+        let mut quit = false;
+        loop {
+            while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                if msg.message == WM_QUIT {
+                    quit = true;
+                    break;
+                }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            if quit {
+                break;
+            }
+
+            with_app(|a| {
+                a.drain_pending();
+                a.handle_control_requests();
+                a.check_dialog_closed();
+            });
+
+            if exit_event_signaled() {
+                crate::log::write("asked to stop");
+                break;
+            }
+
+            let now = Instant::now();
+            let mut handles: Vec<win::WaitHandle> = Vec::with_capacity(5);
+            let mut kinds: Vec<TrayWait> = Vec::with_capacity(5);
+            with_app(|a| {
+                if let Some(h) = &a.exit_event {
+                    handles.push(h.wait_handle());
+                    kinds.push(TrayWait::Exit);
+                }
+                if let Some(h) = &a.settings_event {
+                    handles.push(h.wait_handle());
+                    kinds.push(TrayWait::Settings);
+                }
+                if let Some(c) = &a.control {
+                    handles.push(c.event_wait_handle());
+                    kinds.push(TrayWait::Control);
+                }
+                if let Some(w) = a.engine.config_watch_wait() {
+                    handles.push(w);
+                    kinds.push(TrayWait::ConfigWatch);
+                }
+                if let Some(h) = &low_mem_event {
+                    if low_mem_suppress_until.is_some_and(|t| now >= t) {
+                        if win::event_is_set(h) {
+                            let cd = Duration::from_secs(a.engine.cfg.interval_sec.max(5));
+                            low_mem_suppress_until = Some(now + cd);
+                        } else {
+                            low_mem_suppress_until = None;
+                        }
+                    }
+                    if low_mem_suppress_until.is_none() {
+                        handles.push(h.wait_handle());
+                        kinds.push(TrayWait::LowMem);
+                    }
+                }
+            });
+
+            let timeout_ms = low_mem_suppress_until
+                .map(|t| t.saturating_duration_since(now).as_millis().min(u32::MAX as u128 - 1) as u32)
+                .unwrap_or(win::WAIT_INFINITE);
+
+            match win::msg_wait_any(&handles, timeout_ms) {
+                win::WaitOutcome::Signaled(idx) => match kinds.get(idx).copied() {
+                    Some(TrayWait::Exit) => {
+                        crate::log::write("asked to stop");
+                        break;
+                    }
+                    Some(TrayWait::Settings) => {
+                        dispatch(hwnd, Command::OpenSettings);
+                    }
+                    Some(TrayWait::Control) => {
+                        with_app(|a| a.handle_control_requests());
+                    }
+                    Some(TrayWait::ConfigWatch) => {
+                        with_app(|a| a.on_config_watch());
+                    }
+                    Some(TrayWait::LowMem) => {
+                        with_app(|a| {
+                            let cd = Duration::from_secs(a.engine.cfg.interval_sec.max(5));
+                            low_mem_suppress_until = Some(Instant::now() + cd);
+                            a.tick();
+                            a.sync_timer();
+                        });
+                    }
+                    None => {}
+                },
+                win::WaitOutcome::Message | win::WaitOutcome::Timeout => {}
+                win::WaitOutcome::Failed => break,
+            }
+        }
+
+        // Bug #15: clear TRAY_HWND first, shut down, drain queued WM_WORK pointers, and destroy the window.
+        TRAY_HWND.store(0, Ordering::SeqCst);
         flyout::close();
         toast::dismiss_all();
         with_app(|a| a.shutdown());
-        APP.with(|cell| *cell.borrow_mut() = None);
-        TRAY_HWND.store(0, Ordering::SeqCst);
-    }
-}
-
-// ---------------------------------------------------------------- CLI helpers
-
-pub fn status_text(st: &Status) -> String {
-    let mut s = format!(
-        "Mode: {}    Pressure: {}{}\n\nRAM: {:.1} GB free of {:.1} GB\nCommit: {:.1} GB free of {:.1} GB\n",
-        st.mode,
-        st.pressure.label(),
-        if st.paused { "    (PAUSED)" } else { "" },
-        st.system.ram_free_gb,
-        st.system.ram_total_gb,
-        st.system.commit_free_gb,
-        st.system.commit_limit_gb
-    );
-    let r = &st.ram;
-    if r.in_use_gb > 0.0 {
-        let mut parts: Vec<(String, f64)> = r.parts().into_iter().map(|(p, gb)| (r.label(p), gb)).collect();
-        parts.push(("Unreal".into(), r.unreal_gb));
-        parts.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let list: Vec<String> = parts.iter().filter(|p| p.1 >= 0.05).map(|(n, gb)| format!("{} {:.1}", n, gb)).collect();
-        s.push_str(&format!("RAM in use: {:.1} GB = {} (GB)\n", r.in_use_gb, list.join(", ")));
-    }
-    if !st.ue.processes.is_empty() || st.ue.workers > 0 {
-        s.push_str("\nUnreal\n");
-        for p in &st.ue.processes {
-            s.push_str(&format!(
-                "  {} ({}, PID {}): {:.1} GB committed, {:.1} GB RAM, up {} h {} min\n",
-                p.name,
-                p.kind,
-                p.pid,
-                p.committed_gb,
-                p.ram_gb,
-                p.uptime_min / 60,
-                p.uptime_min % 60
-            ));
-        }
-        if st.ue.workers > 0 {
-            s.push_str(&format!(
-                "  {} compile/shader workers, {:.1} GB committed{}\n",
-                st.ue.workers,
-                st.ue.workers_committed_gb,
-                if st.ue.workers_paused > 0 { format!(", {} paused", st.ue.workers_paused) } else { String::new() }
-            ));
-        }
-    }
-    s.push_str("\nGroups\n");
-    for g in &st.groups {
-        s.push_str(&format!(
-            "  {}: {} processes, {} MB RAM, {} MB committed{}\n",
-            g.name,
-            g.processes,
-            g.ram_mb,
-            g.committed_mb,
-            if g.suspended { ", suspended" } else { "" }
-        ));
-    }
-    if !st.advice.is_empty() {
-        s.push_str("\nAdvice\n");
-        for a in &st.advice {
-            s.push_str(&format!("  - {}\n", a));
-        }
-    }
-    s
-}
-
-/// Headless loop for `memguard daemon`: same engine, no tray icon, logs to the console.
-pub fn run_headless() {
-    let Some(_instance) = win::acquire_instance(paths::mutex(), 8000) else {
-        eprintln!("Ather MemGuard is already running.");
-        return;
-    };
-    let exit_event = win::create_event(paths::exit_event());
-    let mut engine = Engine::new();
-    crate::log::write(&format!("Ather MemGuard {} started (headless)", env!("CARGO_PKG_VERSION")));
-    loop {
-        let st = engine.tick();
-        println!(
-            "{}  {}  pressure {}  RAM free {:.1} GB  commit free {:.1} GB",
-            st.time,
-            st.mode,
-            st.pressure.label(),
-            st.system.ram_free_gb,
-            st.system.commit_free_gb
-        );
-        for _ in 0..engine.cfg.interval_sec {
-            if exit_event.as_ref().is_some_and(win::event_is_set) {
-                engine.restore_all();
-                crate::log::write("Ather MemGuard stopped, apps restored to normal");
-                return;
+        let mut drain: MSG = zeroed();
+        while PeekMessageW(&mut drain, null_mut(), WM_WORK, WM_WORK, PM_REMOVE) != 0 {
+            if drain.lParam != 0 {
+                drop(Box::from_raw(drain.lParam as *mut Work));
             }
-            std::thread::sleep(std::time::Duration::from_secs(1));
         }
+        DestroyWindow(hwnd);
+        while PeekMessageW(&mut drain, null_mut(), WM_WORK, WM_WORK, PM_REMOVE) != 0 {
+            if drain.lParam != 0 {
+                drop(Box::from_raw(drain.lParam as *mut Work));
+            }
+        }
+        PENDING.with(|p| p.borrow_mut().clear());
+        APP.with(|cell| *cell.borrow_mut() = None);
     }
+}
+
+fn exit_event_signaled() -> bool {
+    with_app(|a| a.exit_event.as_ref().is_some_and(win::event_is_set)) == Some(true)
 }
 
 // ---------------------------------------------------------------- tests

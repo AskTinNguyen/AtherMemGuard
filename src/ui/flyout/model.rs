@@ -487,6 +487,7 @@ fn fix_text(br: &RamBreakdown) -> String {
 
 /// The four sample states (snapshot name, data). Normal and paused use the mockup's numbers;
 /// critical is a 96 GB PC with 3.4 GB free where the editor has 47 GB committed.
+#[cfg(any(test, feature = "ui-snapshots"))]
 pub fn samples() -> Vec<(&'static str, FlyoutData)> {
     use crate::ui::status_source::sample_status;
     use crate::breakdown::{AppRam, GroupRam, RamBreakdown};

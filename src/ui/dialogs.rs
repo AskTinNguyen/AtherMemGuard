@@ -7,7 +7,7 @@ use std::ptr::null_mut;
 
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
+use windows_sys::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
 
 use crate::win::wide;
 
@@ -67,10 +67,21 @@ struct ShellItemVtbl {
     get_display_name: unsafe extern "system" fn(*mut c_void, i32, *mut *mut u16) -> i32,
 }
 
+struct ComGuard(bool);
+
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
 /// Show a file dialog; `filters` are (label, pattern) pairs such as ("TOML files", "*.toml").
 fn run(owner: HWND, save: bool, title: &str, file_name: &str, filters: &[(&str, &str)]) -> Option<PathBuf> {
     unsafe {
-        CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED as u32);
+        let hr = CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED as u32);
+        let _com = ComGuard(hr >= 0);
         let mut obj: *mut c_void = null_mut();
         let (clsid, iid) = if save { (&CLSID_FILE_SAVE, &IID_FILE_SAVE) } else { (&CLSID_FILE_OPEN, &IID_FILE_OPEN) };
         if CoCreateInstance(clsid, null_mut(), CLSCTX_INPROC_SERVER, iid, &mut obj) < 0 || obj.is_null() {

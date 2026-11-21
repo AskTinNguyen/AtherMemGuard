@@ -18,8 +18,9 @@
 //! claimed as caused by the cleanup
 //! (`Measure`, also pure). Undo is `disk-undo.json`, the same shape as `doctor-undo.json`.
 //!
-//! No `unsafe` here: deletes and moves use `std::fs`, which never follows a junction when it
-//! removes one (a junction is removed as a link).
+//! No `unsafe` here: permanent deletes use `disk_win::delete_tree` (multi-threaded `\\?\`
+//! POSIX unlink with reparse-safe fallback) and bin moves use `std::fs::rename`, neither of
+//! which follows a junction when removing or moving it.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -98,17 +99,31 @@ pub fn tool_command(tool: &str) -> Option<ToolCommand> {
         "npm" => Some(ToolCommand { exe: "npm", args: &["cache", "clean", "--force"] }),
         "pip" => Some(ToolCommand { exe: "pip", args: &["cache", "purge"] }),
         "dotnet" => Some(ToolCommand { exe: "dotnet", args: &["nuget", "locals", "http-cache", "--clear"] }),
+        "uv" => Some(ToolCommand { exe: "uv", args: &["cache", "prune"] }),
+        "pnpm" => Some(ToolCommand { exe: "pnpm", args: &["store", "prune"] }),
+        "yarn" => Some(ToolCommand { exe: "yarn", args: &["cache", "clean"] }),
+        "zen" => Some(ToolCommand { exe: "zen", args: &["gc"] }),
+        "git-lfs" => Some(ToolCommand { exe: "git", args: &["lfs", "prune"] }),
+        "git-maintenance" => Some(ToolCommand { exe: "git", args: &["maintenance", "run", "--task=loose-objects", "--task=incremental-repack"] }),
+        "git-repack" => Some(ToolCommand { exe: "git", args: &["repack", "-ad"] }),
+        "git-prune-tmp" => Some(ToolCommand { exe: "git", args: &["prune", "--expire=1.hour.ago"] }),
+        "git-reflog" => Some(ToolCommand { exe: "git", args: &["reflog", "expire", "--expire=30.days.ago", "--expire-unreachable=now", "--all"] }),
+        "git-worktree-prune" => Some(ToolCommand { exe: "git", args: &["worktree", "prune"] }),
         _ => None,
     }
 }
 
-/// What an item offers, the default first. Zen, lanes, worktrees and `review` items offer
-/// nothing; `bin` only where the bin can be made on that volume.
+/// What an item offers, the default first. Zen, lanes, worktrees and `review` items never
+/// offer `now` or `bin`, and only offer `tool` when a safe tool command exists; `bin` only
+/// where the bin can be made on that volume.
 pub fn offered_actions(key: &str, class: &str, tool: Option<&str>, bin_ok: bool) -> Vec<CleanAction> {
-    if key == "ue:zen" || key == "lane" || key == "git:lfs" || key == "memguard:bin" || class == "review" {
+    if key == "lane" || key == "memguard:bin" {
         return Vec::new();
     }
     let tool = tool.and_then(tool_command).map(|_| CleanAction::Tool);
+    if key == "ue:zen" || key.starts_with("git:") || class == "review" {
+        return tool.into_iter().collect();
+    }
     let bin = bin_ok.then_some(CleanAction::Bin);
     match class {
         "regenerable" => [Some(CleanAction::Now), bin, tool].into_iter().flatten().collect(),
@@ -123,9 +138,23 @@ pub fn no_action_reason(key: &str, class: &str) -> Option<&'static str> {
         ("ue:zen", _) => Some("Zen is cleaned by Zen's own garbage collection, never file by file."),
         ("lane", _) => Some("Ather MemGuard never removes lanes or worktrees. Use git worktree remove, or delete it yourself."),
         ("memguard:bin", _) => Some("Empty it with memguard disk bin --empty."),
+        ("wsl:vhdx" | "wsl:vhdx_local", _) => Some("Virtual disk: never deleted. Use `wsl --manage <Distro> --set-sparse true` or `Optimize-VHD -Mode Full` (as admin) to reclaim space."),
+        ("docker:vhdx" | "docker:vhdx_legacy", _) => Some("Virtual disk: never deleted. Use `docker builder prune` / `docker system prune` or compact the VHDX."),
+        ("sys:winsxs", _) => Some("Windows component store: inspect and clean safely with `dism /Online /Cleanup-Image /AnalyzeComponentStore` and `/StartComponentCleanup` (as administrator)."),
+        ("sys:windows_update", _) => Some("Windows Update cache: use Disk Cleanup (cleanmgr) or `dism /Online /Cleanup-Image /StartComponentCleanup`."),
+        ("sys:memory_dmp" | "sys:minidump", _) => Some("Kernel/crash dump: review or remove manually if no longer needed for debugging."),
+        ("ue:pdb", _) => Some("Debug symbols inside Binaries\\Win64: review and remove stale PDBs manually if no longer needed for crash symbolication."),
         (_, "review") => Some("This one is your call; Ather MemGuard doesn't remove it."),
         _ => None,
     }
+}
+
+/// Like `no_action_reason`, returning `None` when a `tool` action is offered for the item.
+pub fn no_action_reason_for(key: &str, class: &str, tool: Option<&str>) -> Option<&'static str> {
+    if key != "lane" && key != "memguard:bin" && tool.and_then(tool_command).is_some() {
+        return None;
+    }
+    no_action_reason(key, class)
 }
 
 /// The `actions` list of a checkup item (proposal section 5).
@@ -162,6 +191,88 @@ pub fn parse_pick(s: &str) -> Result<(String, Option<CleanAction>), String> {
 
 // ---------------------------------------------------------------- files in the data folder
 
+static WRITE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WRITE_STRIPES: std::sync::OnceLock<[std::sync::Mutex<()>; 64]> = std::sync::OnceLock::new();
+
+fn write_stripe(path: &Path) -> &'static std::sync::Mutex<()> {
+    let stripes = WRITE_STRIPES.get_or_init(|| std::array::from_fn(|_| std::sync::Mutex::new(())));
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map(|d| d.join(path)).unwrap_or_else(|_| path.to_path_buf())
+    };
+    let key = norm(&abs.display().to_string());
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in key.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    &stripes[(h as usize) & 63]
+}
+
+/// Atomically write `data` to `path` via a unique PID+nonce temp file in the same directory
+/// (`create_new(true)`), closed before rename, serialized per-path in-process and with Windows
+/// sharing/access retry and cleanup.
+pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::sync::atomic::Ordering;
+
+    let _guard = write_stripe(path).lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(dir) = path.parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+    }
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+    let pid = std::process::id();
+    let mut tmp_file = None;
+    let mut tmp_path = PathBuf::new();
+    let mut used_nonce = 0u64;
+    for _ in 0..8 {
+        let nonce = WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let cand = path.with_file_name(format!(".{}.{}.{}.tmp", name, pid, nonce));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&cand) {
+            Ok(f) => {
+                used_nonce = nonce;
+                tmp_path = cand;
+                tmp_file = Some(f);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    let mut f = tmp_file.ok_or_else(|| format!("couldn't allocate temp file for {}", path.display()))?;
+    if let Err(e) = f.write_all(data).and_then(|()| f.flush()) {
+        drop(f);
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.to_string());
+    }
+    drop(f);
+
+    let delays_ms = [2u64, 5, 10, 20, 40, 80, 120, 150, 200, 250];
+    let mut last_err = None;
+    for (attempt, delay) in std::iter::once(&0u64).chain(delays_ms.iter()).enumerate() {
+        if attempt > 0 {
+            let jitter = (used_nonce.wrapping_add(attempt as u64)) % 7;
+            std::thread::sleep(Duration::from_millis(*delay + jitter));
+        }
+        match std::fs::rename(&tmp_path, path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied || matches!(e.raw_os_error(), Some(5 | 32)) => {
+                last_err = Some(e);
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e.to_string());
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&tmp_path);
+    Err(last_err.map_or_else(|| "rename failed".into(), |e| e.to_string()))
+}
+
 /// Where the cleanup keeps its records: the data folder, or a test folder.
 #[derive(Debug, Clone)]
 pub struct DiskFiles {
@@ -193,11 +304,8 @@ impl DiskFiles {
         if !self.writable {
             return Ok(());
         }
-        std::fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
-        let p = self.path(name);
-        let tmp = p.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(v).unwrap_or_default()).map_err(|e| e.to_string())?;
-        std::fs::rename(&tmp, &p).map_err(|e| e.to_string())
+        let bytes = serde_json::to_vec_pretty(v).map_err(|e| e.to_string())?;
+        write_atomic(&self.path(name), &bytes)
     }
 
     pub fn plans(&self) -> Vec<PlanRecord> {
@@ -285,6 +393,8 @@ pub struct PlannedItem {
     pub tool: Option<String>,
     #[serde(default)]
     pub unmeasurable: Option<String>,
+    #[serde(default)]
+    pub logical_size: Option<u64>,
 }
 
 /// The `frees_together` of one volume's items in a plan.
@@ -468,15 +578,48 @@ pub fn never_touch(rel: &str) -> Option<String> {
 }
 
 /// Does `rel` match the catalogue path of a project item? Plugin items match
-/// `Plugins\...\<leaf>` (the plugin folder can be nested).
+/// `Plugins\...\<leaf>` (the plugin folder can be nested); `...` segments (e.g. `.vs\...\ipch`)
+/// match one or more intermediate folders.
 pub fn rel_matches_catalog(rel: &str, cat_path: &str, plugins: bool) -> bool {
     let r = norm(rel);
     let c = norm(cat_path);
-    if !plugins {
-        return r == c;
+    if plugins {
+        let parts: Vec<&str> = r.split('\\').collect();
+        return parts.len() >= 3 && parts[0] == "plugins" && r.ends_with(&format!("\\{}", c));
     }
-    let parts: Vec<&str> = r.split('\\').collect();
-    parts.len() >= 3 && parts[0] == "plugins" && r.ends_with(&format!("\\{}", c))
+    if let Some((prefix, suffix)) = c.split_once(r"\...\") {
+        let r_parts: Vec<&str> = r.split('\\').filter(|s| !s.is_empty()).collect();
+        let p_parts: Vec<&str> = prefix.split('\\').filter(|s| !s.is_empty()).collect();
+        let s_parts: Vec<&str> = suffix.split('\\').filter(|s| !s.is_empty()).collect();
+        return r_parts.len() >= p_parts.len() + 1 + s_parts.len()
+            && r_parts.starts_with(&p_parts)
+            && r_parts.ends_with(&s_parts);
+    }
+    r == c
+}
+
+fn rel_matches_git_catalog(rel: &str, cat_path: &str, key: &str) -> bool {
+    let r = norm(rel);
+    let c = norm(cat_path);
+    if r == c {
+        return true;
+    }
+    if key == "git:tmp_packs" && (r.starts_with(r".git\objects\pack\tmp_") || r.starts_with(r"objects\pack\tmp_")) {
+        return true;
+    }
+    let bare_c = c.strip_prefix(r".git\").unwrap_or(&c);
+    if r == bare_c {
+        return true;
+    }
+    if let Some(after_mod) = r.strip_prefix(r".git\modules\") {
+        if after_mod == bare_c || after_mod.ends_with(&format!("\\{}", bare_c)) {
+            return true;
+        }
+        if key == "git:tmp_packs" && after_mod.contains(r"\objects\pack\tmp_") {
+            return true;
+        }
+    }
+    false
 }
 
 /// The answer of `git ls-files` for an item.
@@ -510,6 +653,7 @@ pub struct PathFacts {
     /// The path itself is a checkout: it holds a `.uproject` or a `.git`.
     pub is_checkout: bool,
     pub in_profile: bool,
+    pub in_programdata: bool,
     /// The cloud sync root it is inside, if any.
     pub sync_root: Option<String>,
     /// Cloud placeholder attributes on the root.
@@ -527,6 +671,10 @@ pub struct PathFacts {
 pub struct ItemCheck {
     pub key: String,
     pub class: String,
+    /// Action requested (`None` in legacy/pure-rule tests).
+    pub action: Option<CleanAction>,
+    /// Only true when `clean()` runs `CleanAction::Tool` on a `git:*` entry.
+    pub allow_git_tool: bool,
     /// A shared cache (`[[global]]`): allowed only at its catalogue path, inside the profile.
     pub global: bool,
     /// Project items: the catalogue path (`Intermediate`, `Saved\Logs`) and whether it is per plugin.
@@ -559,7 +707,22 @@ pub struct ItemCheck {
 /// The first rule an item breaks, in plain words, or `None` when it may be cleaned. The whole
 /// item is refused when any one of its paths breaks a rule.
 pub fn refusal(item: &ItemCheck, paths: &[PathFacts]) -> Option<String> {
-    if let Some(why) = no_action_reason(&item.key, &item.class) {
+    let is_tool = item.action == Some(CleanAction::Tool);
+    if item.key.starts_with("git:") && !(is_tool && item.allow_git_tool) {
+        return Some("Git store items can only be cleaned with their git tool command.".into());
+    }
+    if is_tool {
+        if item.key == "lane" || item.key == "memguard:bin" {
+            return no_action_reason(&item.key, &item.class).map(str::to_string);
+        }
+        let has_tool = catalog_class(&item.key)
+            .and_then(|(_, t)| t)
+            .and_then(|t| tool_command(&t))
+            .is_some();
+        if !has_tool {
+            return Some(no_action_reason(&item.key, &item.class).unwrap_or("No clean command is known for this item.").into());
+        }
+    } else if let Some(why) = no_action_reason(&item.key, &item.class) {
         return Some(why.into());
     }
     if paths.is_empty() {
@@ -574,9 +737,11 @@ pub fn refusal(item: &ItemCheck, paths: &[PathFacts]) -> Option<String> {
     let Some(now_lw) = item.now_last_write else {
         return Some("Ather MemGuard couldn't check every file in it for recent writes, so it leaves it alone.".into());
     };
-    let age_ft = (item.min_age_hours.max(0.0) * 3600.0 * FT_PER_SEC as f64) as u64;
-    if now_lw > item.now_ft.saturating_sub(age_ft) {
-        return Some(format!("Something in it was written in the last {} hours, so it may be in use. Nothing in it was touched.", fmt_hours(item.min_age_hours)));
+    if !(item.allow_git_tool && item.key.starts_with("git:")) {
+        let age_ft = (item.min_age_hours.max(0.0) * 3600.0 * FT_PER_SEC as f64) as u64;
+        if now_lw > item.now_ft.saturating_sub(age_ft) {
+            return Some(format!("Something in it was written in the last {} hours, so it may be in use. Nothing in it was touched.", fmt_hours(item.min_age_hours)));
+        }
     }
     if item.planned_last_write > 0 && now_lw > item.planned_last_write {
         return Some("Something in it was written after the plan was made. Make a new plan first.".into());
@@ -595,7 +760,7 @@ pub fn refusal(item: &ItemCheck, paths: &[PathFacts]) -> Option<String> {
     None
 }
 
-fn path_refusal(item: &ItemCheck, p: &PathFacts, planned_id: Option<u128>) -> Option<String> {
+fn pre_git_path_refusal(item: &ItemCheck, p: &PathFacts) -> Option<String> {
     if !p.exists {
         return Some(format!("{} isn't there any more.", p.path));
     }
@@ -608,11 +773,15 @@ fn path_refusal(item: &ItemCheck, p: &PathFacts, planned_id: Option<u128>) -> Op
     }
     // Allow-list only, under a recognised root (projects) or at the catalogue path (caches).
     if item.global {
-        let np = norm(&p.path);
-        if !p.in_profile && !item.relocated.contains(&np) {
+        if crate::disk_scan::is_protected_system_root(Path::new(&p.path)) {
+            return Some("It is a protected system folder, so Ather MemGuard doesn't touch it.".into());
+        }
+        let pd_ok = p.in_programdata
+            && crate::disk_scan::catalog_info(&item.key).is_some_and(|ci| ci.path.to_ascii_uppercase().starts_with("%PROGRAMDATA%"));
+        if !p.in_profile && !item.relocated.iter().any(|r| is_within(&np, r)) && !pd_ok {
             return Some("It is outside your user folder and outside any Unreal project, so Ather MemGuard doesn't touch it.".into());
         }
-        let listed = item.allowed_paths.iter().any(|a| *a == np)
+        let listed = item.allowed_paths.contains(&np)
             || item.allowed_parent.as_deref().is_some_and(|par| Path::new(&np).parent().map(|x| norm(&x.display().to_string())) == Some(par.to_string()));
         if !listed {
             return Some("It isn't at a place Ather MemGuard knows is safe to clean.".into());
@@ -621,14 +790,21 @@ fn path_refusal(item: &ItemCheck, p: &PathFacts, planned_id: Option<u128>) -> Op
         let (Some(_), Some(rel)) = (&p.recognised_root, &p.rel) else {
             return Some("It isn't inside a folder with a .uproject (or an engine with Engine\\Build\\Build.version).".into());
         };
-        if let Some(what) = never_touch(rel) {
-            return Some(format!("It is {}, which Ather MemGuard never touches.", what));
-        }
+        let git_tool = item.allow_git_tool && item.key.starts_with("git:");
         let Some(cat) = &item.catalog_rel else {
             return Some("It isn't on the list of folders Ather MemGuard may clean.".into());
         };
-        if !rel_matches_catalog(rel, cat, item.plugins) {
-            return Some("It isn't on the list of folders Ather MemGuard may clean.".into());
+        if git_tool {
+            if !rel_matches_git_catalog(rel, cat, &item.key) {
+                return Some("It isn't on the list of folders Ather MemGuard may clean.".into());
+            }
+        } else {
+            if let Some(what) = never_touch(rel) {
+                return Some(format!("It is {}, which Ather MemGuard never touches.", what));
+            }
+            if !rel_matches_catalog(rel, cat, item.plugins) {
+                return Some("It isn't on the list of folders Ather MemGuard may clean.".into());
+            }
         }
     }
     if let Some((link, _)) = p.chain.iter().find(|(_, r)| *r) {
@@ -637,17 +813,27 @@ fn path_refusal(item: &ItemCheck, p: &PathFacts, planned_id: Option<u128>) -> Op
     if p.cloud_attrs || p.sync_root.is_some() {
         return Some("It is inside a cloud-synced folder; deleting there deletes the cloud copy too.".into());
     }
-    match &p.git {
-        Some(GitCheck::Tracked(n)) => return Some(format!("Git tracks {} file{} in it, so it is part of the project, not a cache.", n, if *n == 1 { "" } else { "s" })),
-        Some(GitCheck::TimedOut) => return Some("Git didn't answer within 5 seconds, so Ather MemGuard can't be sure git doesn't track it.".into()),
-        Some(GitCheck::Failed(why)) => return Some(format!("Ather MemGuard couldn't ask git whether it tracks files in it ({}).", why)),
-        _ => {}
+    None
+}
+
+fn path_refusal(item: &ItemCheck, p: &PathFacts, planned_id: Option<u128>) -> Option<String> {
+    if let Some(why) = pre_git_path_refusal(item, p) {
+        return Some(why);
     }
-    if p.holds_repo {
-        return Some("It holds a git repository (a .git folder) inside it, so Ather MemGuard leaves it alone.".into());
-    }
-    if p.repo_walk_incomplete {
-        return Some("Ather MemGuard couldn't check every folder in it for a git repository, so it leaves it alone.".into());
+    let git_tool = item.allow_git_tool && item.key.starts_with("git:");
+    if !git_tool {
+        match &p.git {
+            Some(GitCheck::Tracked(n)) => return Some(format!("Git tracks {} file{} in it, so it is part of the project, not a cache.", n, if *n == 1 { "" } else { "s" })),
+            Some(GitCheck::TimedOut) => return Some("Git didn't answer within 5 seconds, so Ather MemGuard can't be sure git doesn't track it.".into()),
+            Some(GitCheck::Failed(why)) => return Some(format!("Ather MemGuard couldn't ask git whether it tracks files in it ({}).", why)),
+            _ => {}
+        }
+        if p.holds_repo {
+            return Some("It holds a git repository (a .git folder) inside it, so Ather MemGuard leaves it alone.".into());
+        }
+        if p.repo_walk_incomplete {
+            return Some("Ather MemGuard couldn't check every folder in it for a git repository, so it leaves it alone.".into());
+        }
     }
     if let Some(planned) = planned_id {
         if p.file_id != Some(planned) {
@@ -693,14 +879,25 @@ pub fn sync_roots() -> Vec<String> {
             }
         }
     }
-    let hklm = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE);
-    if let Ok(mgr) = hklm.open_subkey(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager") {
-        for name in mgr.enum_keys().flatten() {
-            if let Ok(roots) = mgr.open_subkey(format!(r"{}\UserSyncRoots", name)) {
-                for (_, v) in roots.enum_values().flatten() {
-                    let s = v.to_string();
-                    if !s.trim().is_empty() {
-                        out.push(norm(s.trim()));
+    if let Ok(mgr) = crate::win::RegKey::open_read(
+        crate::win::RegHive::Hklm,
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager",
+    ) {
+        if let Ok(names) = mgr.enum_keys() {
+            for name in names {
+                let sub = format!(
+                    r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager\{}\UserSyncRoots",
+                    name
+                );
+                if let Ok(roots) = crate::win::RegKey::open_read(crate::win::RegHive::Hklm, &sub) {
+                    if let Ok(vals) = roots.enum_values() {
+                        for (_, vtype, bytes) in vals {
+                            if let Some(s) = crate::win::reg_value_to_string(vtype, &bytes) {
+                                if !s.trim().is_empty() {
+                                    out.push(norm(s.trim()));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -725,50 +922,14 @@ pub fn git_check(path: &Path) -> GitCheck {
 
 /// `git_check` with extra environment variables for git (tests).
 pub fn git_check_env(path: &Path, env: &[(&str, &str)]) -> GitCheck {
-    let repos: Vec<&Path> = path.ancestors().skip(1).filter(|a| std::fs::symlink_metadata(a.join(".git")).is_ok()).collect();
-    if repos.is_empty() {
-        return GitCheck::NotRepo;
-    }
-    let mut tracked = 0;
-    for repo in repos {
-        match git_ls(repo, path, env) {
-            GitCheck::Tracked(n) => tracked += n,
-            GitCheck::Clean | GitCheck::NotRepo => {}
-            other => return other,
-        }
-    }
-    if tracked > 0 {
-        GitCheck::Tracked(tracked)
-    } else {
-        GitCheck::Clean
-    }
+    resolve_git_checks_env(&[(path, false)], None, env).into_iter().next().unwrap_or(GitCheck::NotRepo)
 }
 
 /// Environment variables that would point git at another repository or index.
 const GIT_ENV_CLEARED: &[&str] = &["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM", "GIT_NAMESPACE", "GIT_OBJECT_DIRECTORY"];
+const MAX_GIT_CMD_UTF16: usize = 24_576;
 
-fn git_ls(repo: &Path, path: &Path, env: &[(&str, &str)]) -> GitCheck {
-    let rel = path.strip_prefix(repo).map(|r| r.display().to_string()).unwrap_or_default();
-    let repo_s = repo.display().to_string();
-    let spec = format!(":(literal,icase){}", rel.replace('\\', "/"));
-    // No fsmonitor: a repository's config must not get to run a program here.
-    let args = ["-c", "core.fsmonitor=false", "-C", repo_s.as_str(), "ls-files", "-z", "--", spec.as_str()];
-    let mut envs: Vec<(&str, Option<&str>)> = GIT_ENV_CLEARED.iter().map(|k| (*k, None)).collect();
-    envs.extend(env.iter().map(|(k, v)| (*k, Some(*v))));
-    match run_cmd(Path::new("git"), &args, GIT_TIMEOUT, &envs) {
-        Ok((code, out, err)) => git_answer(code, &out, &err),
-        Err(RunError::TimedOut) => GitCheck::TimedOut,
-        Err(RunError::NotFound) => GitCheck::Failed("git isn't installed or isn't on PATH".into()),
-        Err(RunError::Other(e)) => GitCheck::Failed(e),
-    }
-}
-
-/// What `git ls-files -z` said, from its exit code, stdout and stderr (pure).
-pub fn git_answer(code: i32, out: &[u8], err: &[u8]) -> GitCheck {
-    if code == 0 {
-        let n = out.split(|b| *b == 0).filter(|s| !s.is_empty()).count();
-        return if n == 0 { GitCheck::Clean } else { GitCheck::Tracked(n) };
-    }
+fn git_error(code: i32, err: &[u8]) -> GitCheck {
     let e = String::from_utf8_lossy(err).to_ascii_lowercase();
     if e.contains("dubious ownership") || e.contains("safe.directory") {
         return GitCheck::Failed("git won't read this repository because another user owns it (safe.directory)".into());
@@ -778,6 +939,216 @@ pub fn git_answer(code: i32, out: &[u8], err: &[u8]) -> GitCheck {
         Some(l) => format!("git stopped with exit code {}: {}", code, l),
         None => format!("git stopped with exit code {}", code),
     })
+}
+
+fn ancestor_repos<'a>(path: &'a Path, global: bool, profile_norm: Option<&str>) -> Vec<(&'a Path, String)> {
+    let mut out = Vec::new();
+    for anc in path.ancestors().skip(1) {
+        if global {
+            if let Some(p_norm) = profile_norm {
+                if norm(&anc.display().to_string()) == p_norm {
+                    break;
+                }
+            }
+        }
+        if std::fs::symlink_metadata(anc.join(".git")).is_ok() {
+            let rel = path.strip_prefix(anc).map(|r| r.display().to_string()).unwrap_or_default();
+            let rel_slash = rel.replace('\\', "/");
+            let rel_trimmed = rel_slash.trim_end_matches('/');
+            if !rel_trimmed.is_empty() {
+                out.push((anc, rel_trimmed.to_string()));
+            }
+        }
+    }
+    out
+}
+
+fn parse_git_ls_batch(out: &[u8], unique_queries: &[(String, String)], counts: &mut [usize]) {
+    let mut entry_norm = String::new();
+    for s in out.split(|b| *b == 0) {
+        if s.is_empty() {
+            continue;
+        }
+        let entry = String::from_utf8_lossy(s);
+        crate::disk_space::norm_into(&entry, &mut entry_norm);
+        for (idx, (_, q_norm)) in unique_queries.iter().enumerate() {
+            if is_within(&entry_norm, q_norm) {
+                counts[idx] += 1;
+            }
+        }
+    }
+}
+
+fn git_ls_repo_batch(repo: &Path, rels: &[String], env: &[(&str, &str)]) -> (Vec<GitCheck>, bool) {
+    use std::collections::HashMap;
+    if rels.is_empty() {
+        return (Vec::new(), false);
+    }
+    struct UniqueSpec {
+        spec: String,
+        norm_rel: String,
+        indices: Vec<usize>,
+    }
+    let mut unique_map: HashMap<String, usize> = HashMap::new();
+    let mut uniques: Vec<UniqueSpec> = Vec::new();
+    for (idx, rel) in rels.iter().enumerate() {
+        let q_norm = norm(rel);
+        if let Some(&u) = unique_map.get(&q_norm) {
+            uniques[u].indices.push(idx);
+        } else {
+            let u = uniques.len();
+            unique_map.insert(q_norm.clone(), u);
+            uniques.push(UniqueSpec { spec: format!(":(literal,icase){}", rel), norm_rel: q_norm, indices: vec![idx] });
+        }
+    }
+
+    let mut out_checks = vec![GitCheck::Clean; rels.len()];
+    let repo_s = repo.display().to_string();
+    let base_cost = 64 + repo_s.encode_utf16().count() * 2;
+    let mut envs: Vec<(&str, Option<&str>)> = GIT_ENV_CLEARED.iter().map(|k| (*k, None)).collect();
+    envs.extend(env.iter().map(|(k, v)| (*k, Some(*v))));
+
+    let mut pos = 0usize;
+    let mut not_found = false;
+    while pos < uniques.len() {
+        let start = pos;
+        let mut used = base_cost;
+        while pos < uniques.len() {
+            let cost = uniques[pos].spec.encode_utf16().count() * 2 + 4;
+            if pos > start && used + cost > MAX_GIT_CMD_UTF16 {
+                break;
+            }
+            used += cost;
+            pos += 1;
+        }
+        let mut args: Vec<&str> = Vec::with_capacity(6 + (pos - start));
+        args.extend(["-c", "core.fsmonitor=false", "-C", repo_s.as_str(), "ls-files", "-z", "--"]);
+        for u in &uniques[start..pos] {
+            args.push(u.spec.as_str());
+        }
+        match run_cmd(Path::new("git"), &args, GIT_TIMEOUT, &envs) {
+            Ok((0, out, _)) => {
+                let chunk_queries: Vec<(String, String)> = uniques[start..pos].iter().map(|u| (u.spec.clone(), u.norm_rel.clone())).collect();
+                let mut counts = vec![0usize; pos - start];
+                parse_git_ls_batch(&out, &chunk_queries, &mut counts);
+                for (local_i, u) in uniques[start..pos].iter().enumerate() {
+                    let ans = if counts[local_i] == 0 { GitCheck::Clean } else { GitCheck::Tracked(counts[local_i]) };
+                    for &idx in &u.indices {
+                        out_checks[idx] = ans.clone();
+                    }
+                }
+            }
+            Ok((code, _, err)) => {
+                let fail = git_error(code, &err);
+                for u in &uniques[start..] {
+                    for &idx in &u.indices {
+                        out_checks[idx] = fail.clone();
+                    }
+                }
+                break;
+            }
+            Err(RunError::TimedOut) => {
+                for u in &uniques[start..] {
+                    for &idx in &u.indices {
+                        out_checks[idx] = GitCheck::TimedOut;
+                    }
+                }
+                break;
+            }
+            Err(RunError::NotFound) => {
+                let fail = GitCheck::Failed("git isn't installed or isn't on PATH".into());
+                for u in &uniques[start..] {
+                    for &idx in &u.indices {
+                        out_checks[idx] = fail.clone();
+                    }
+                }
+                not_found = true;
+                break;
+            }
+            Err(RunError::Other(e)) => {
+                let fail = GitCheck::Failed(e);
+                for u in &uniques[start..] {
+                    for &idx in &u.indices {
+                        out_checks[idx] = fail.clone();
+                    }
+                }
+                break;
+            }
+        }
+    }
+    (out_checks, not_found)
+}
+
+fn resolve_git_checks_env(queries: &[(&Path, bool)], profile: Option<&str>, env: &[(&str, &str)]) -> Vec<GitCheck> {
+    use std::collections::HashMap;
+    let profile_norm = profile.map(norm);
+    let mut repos_order: Vec<String> = Vec::new();
+    let mut repo_map: HashMap<String, (PathBuf, Vec<String>)> = HashMap::new();
+    let mut query_refs: Vec<Vec<(String, usize)>> = vec![Vec::new(); queries.len()];
+
+    for (qi, &(path, global)) in queries.iter().enumerate() {
+        for (anc, rel_trimmed) in ancestor_repos(path, global, profile_norm.as_deref()) {
+            let repo_key = norm(&anc.display().to_string());
+            if !repo_map.contains_key(&repo_key) {
+                repos_order.push(repo_key.clone());
+                repo_map.insert(repo_key.clone(), (anc.to_path_buf(), Vec::new()));
+            }
+            let entry = repo_map.get_mut(&repo_key).unwrap();
+            let slot = entry.1.len();
+            entry.1.push(rel_trimmed);
+            query_refs[qi].push((repo_key, slot));
+        }
+    }
+
+    let mut repo_results: HashMap<String, Vec<GitCheck>> = HashMap::new();
+    let mut git_missing = false;
+    for repo_key in repos_order {
+        let (repo_path, rels) = &repo_map[&repo_key];
+        if git_missing {
+            repo_results.insert(repo_key, vec![GitCheck::Failed("git isn't installed or isn't on PATH".into()); rels.len()]);
+            continue;
+        }
+        let (res, not_found) = git_ls_repo_batch(repo_path, rels, env);
+        if not_found {
+            git_missing = true;
+        }
+        repo_results.insert(repo_key, res);
+    }
+
+    let mut out = Vec::with_capacity(queries.len());
+    for refs in &query_refs {
+        if refs.is_empty() {
+            out.push(GitCheck::NotRepo);
+            continue;
+        }
+        let mut tracked = 0usize;
+        let mut failure = None;
+        for (repo_key, slot) in refs {
+            match &repo_results[repo_key][*slot] {
+                GitCheck::Tracked(n) => tracked += n,
+                GitCheck::Clean | GitCheck::NotRepo => {}
+                other => {
+                    failure = Some(other.clone());
+                    break;
+                }
+            }
+        }
+        out.push(match failure {
+            Some(f) => f,
+            None if tracked > 0 => GitCheck::Tracked(tracked),
+            None => GitCheck::Clean,
+        });
+    }
+    out
+}
+
+/// What `git ls-files -z` said, from its exit code, stdout and stderr (pure).
+pub fn git_answer(code: i32, out: &[u8], err: &[u8]) -> GitCheck {
+    if code == 0 {
+        let n = out.split(|b| *b == 0).filter(|s| !s.is_empty()).count();
+        return if n == 0 { GitCheck::Clean } else { GitCheck::Tracked(n) };
+    }
+    git_error(code, err)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -798,6 +1169,8 @@ pub fn run_cmd(exe: &Path, args: &[&str], timeout: Duration, env: &[(&str, Optio
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    disk_win::stop_std_handle_inheritance();
+    let job = disk_win::ProcessJob::new().ok();
     let mut cmd = Command::new(exe);
     cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).creation_flags(CREATE_NO_WINDOW);
     for (k, v) in env {
@@ -807,6 +1180,7 @@ pub fn run_cmd(exe: &Path, args: &[&str], timeout: Duration, env: &[(&str, Optio
         };
     }
     let mut child = cmd.spawn().map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { RunError::NotFound } else { RunError::Other(e.to_string()) })?;
+    let job_assigned = job.as_ref().is_some_and(|j| j.assign_pid(child.id()).is_ok());
     let read_all = |mut r: Box<dyn Read + Send>| {
         std::thread::spawn(move || {
             let mut s = Vec::new();
@@ -824,11 +1198,27 @@ pub fn run_cmd(exe: &Path, args: &[&str], timeout: Duration, env: &[(&str, Optio
             Ok(Some(st)) => break st.code().unwrap_or(-1),
             Ok(None) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(25)),
             Ok(None) => {
+                if let Some(j) = &job {
+                    j.terminate();
+                }
                 let _ = child.kill();
                 let _ = child.wait();
+                drop(job);
+                if job_assigned {
+                    let _ = out_reader.join();
+                    let _ = err_reader.join();
+                }
                 return Err(RunError::TimedOut);
             }
-            Err(e) => return Err(RunError::Other(e.to_string())),
+            Err(e) => {
+                if let Some(j) = &job {
+                    j.terminate();
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                drop(job);
+                return Err(RunError::Other(e.to_string()));
+            }
         }
     };
     let out = out_reader.join().unwrap_or_default();
@@ -839,30 +1229,32 @@ pub fn run_cmd(exe: &Path, args: &[&str], timeout: Duration, env: &[(&str, Optio
 /// Does `root` hold a git repository (a `.git` file or folder) anywhere inside it? Links are
 /// not followed. `None` when the walk couldn't read everything before `deadline`.
 pub fn holds_repo(root: &Path, deadline: Instant) -> Option<bool> {
-    use std::os::windows::fs::MetadataExt;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        if Instant::now() > deadline {
-            return None;
-        }
-        let rd = std::fs::read_dir(&d).ok()?;
-        for e in rd {
-            let e = e.ok()?;
-            if e.file_name().to_string_lossy().eq_ignore_ascii_case(".git") {
-                return Some(true);
-            }
-            let Ok(m) = std::fs::symlink_metadata(e.path()) else { continue };
-            let a = m.file_attributes();
-            if a & disk_win::A_DIR != 0 && a & disk_win::A_REPARSE == 0 {
-                stack.push(e.path());
-            }
-        }
-    }
-    Some(false)
+    disk_win::holds_repo(&root.display().to_string(), deadline)
 }
 
-/// Read every fact the rules need about one path, now.
-pub fn path_facts(path: &str, global: bool, profile: Option<&str>, syncs: &[String], check_git: bool) -> PathFacts {
+fn is_recognised_root_for(dir: &Path, key: &str, marker: Option<&str>) -> bool {
+    if key.starts_with("git:") {
+        return is_recognised_root(dir)
+            || dir.join(".git").exists()
+            || (dir.join("HEAD").is_file() && dir.join("objects").is_dir() && dir.join("refs").is_dir());
+    }
+    if key == "vs:ipch" {
+        let has_sln = std::fs::read_dir(dir)
+            .map(|rd| rd.flatten().any(|e| e.file_name().to_string_lossy().to_ascii_lowercase().ends_with(".sln")))
+            .unwrap_or(false);
+        return is_recognised_root(dir) || dir.join(".git").exists() || has_sln;
+    }
+    if let Some(m) = marker {
+        return is_recognised_root(dir) || dir.join(m).is_file();
+    }
+    is_recognised_root(dir)
+}
+
+fn path_facts_base(path: &str, global: bool, profile: Option<&str>, syncs: &[String]) -> PathFacts {
+    path_facts_base_for(path, global, profile, syncs, "", None)
+}
+
+fn path_facts_base_for(path: &str, global: bool, profile: Option<&str>, syncs: &[String], key: &str, marker: Option<&str>) -> PathFacts {
     let p = Path::new(path);
     let np = norm(path);
     let mut f = PathFacts { path: path.to_string(), ..Default::default() };
@@ -871,8 +1263,10 @@ pub fn path_facts(path: &str, global: bool, profile: Option<&str>, syncs: &[Stri
     f.cloud_attrs = a & (disk_win::A_RECALL_OPEN | disk_win::A_RECALL_DATA | disk_win::A_OFFLINE) != 0;
     f.sync_root = syncs.iter().find(|s| is_within(&np, s)).cloned();
     f.in_profile = profile.map(norm).is_some_and(|pr| is_within(&np, &pr) && np != pr);
+    let pd = std::env::var("ProgramData").or_else(|_| std::env::var("PROGRAMDATA")).ok().map(|v| norm(&v));
+    f.in_programdata = pd.is_some_and(|pr| is_within(&np, &pr) && np != pr);
     f.is_checkout = std::fs::symlink_metadata(p.join(".git")).is_ok() || crate::disk_scan::has_any_uproject(p);
-    f.recognised_root = p.ancestors().skip(1).find(|a| is_recognised_root(a)).map(|r| r.display().to_string());
+    f.recognised_root = p.ancestors().skip(1).find(|a| is_recognised_root_for(a, key, marker)).map(|r| r.display().to_string());
     if let Some(root) = &f.recognised_root {
         f.rel = p.strip_prefix(root).ok().map(|r| r.display().to_string());
     }
@@ -892,46 +1286,32 @@ pub fn path_facts(path: &str, global: bool, profile: Option<&str>, syncs: &[Stri
             break;
         }
     }
-    if check_git {
-        f.git = Some(git_check(p));
+    f.file_id = disk_win::identity(path).map(|(_, id, _)| id);
+    f
+}
+
+/// Read every fact the rules need about one path, now.
+pub fn path_facts(path: &str, global: bool, profile: Option<&str>, syncs: &[String], check_git: bool) -> PathFacts {
+    let mut f = path_facts_base(path, global, profile, syncs);
+    if f.exists && check_git {
+        let p = Path::new(path);
+        f.git = resolve_git_checks_env(&[(p, global)], profile, &[]).into_iter().next();
         match holds_repo(p, Instant::now() + Duration::from_secs(60)) {
             Some(h) => f.holds_repo = h,
             None => f.repo_walk_incomplete = true,
         }
     }
-    f.file_id = disk_win::identity(path).map(|(_, id, _)| id);
     f
 }
 
 /// The newest write under `paths`, read now without following links. `None` when the walk
 /// couldn't read everything in `budget`.
 pub fn newest_write(paths: &[String], budget: Duration) -> Option<u64> {
-    use std::sync::atomic::{AtomicBool, AtomicU64};
-    use std::sync::{Arc, Mutex};
-    let vs = disk_win::VolumeScan {
-        cluster: 4096,
-        block_cloning: false,
-        level2: false,
-        threads: 4,
-        deadline: Instant::now() + budget,
-        stop: Arc::new(AtomicBool::new(false)),
-        started_ft: u64::MAX,
-        multi: Mutex::new(std::collections::HashMap::new()),
-        progress_files: Arc::new(AtomicU64::new(0)),
-    };
-    let (st, _) = disk_win::walk_item(&vs, 0, paths, &[]);
-    if st.cut_short || st.dir_failures > 0 {
+    let sts = disk_win::walk_clean_paths(paths, 4, Instant::now() + budget, false);
+    if sts.iter().any(|st| st.cut_short || st.dir_failures > 0) {
         return None;
     }
-    // The roots' own write times count too (a folder renamed in, or emptied).
-    let own = paths.iter().filter_map(|p| std::fs::symlink_metadata(p).ok()).filter_map(|m| m.modified().ok()).map(filetime_of).max().unwrap_or(0);
-    Some(st.last_write.max(own))
-}
-
-fn filetime_of(t: std::time::SystemTime) -> u64 {
-    // FILETIME counts from 1601; UNIX from 1970: 11644473600 s apart.
-    let unix = t.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() / 100) as u64;
-    unix + 11_644_473_600 * FT_PER_SEC
+    Some(sts.iter().map(|st| st.last_write).max().unwrap_or(0))
 }
 
 // ---------------------------------------------------------------- deleting, moving, tools
@@ -958,10 +1338,6 @@ pub struct DeleteReport {
 }
 
 impl DeleteReport {
-    fn fail(&mut self, p: &Path, e: &std::io::Error) {
-        self.fail_why(p, &e.to_string());
-    }
-
     fn fail_why(&mut self, p: &Path, why: &str) {
         self.failed_count += 1;
         if self.failed.len() < 20 {
@@ -1079,97 +1455,19 @@ pub fn delete_tree_checked(root: &Path, planned: Option<u128>) -> Result<DeleteR
 
 /// Delete `root` and everything in it, never following a reparse point: a junction or
 /// symbolic link inside is removed as a link and its target is left alone. Read-only files
-/// are made writable first. Reports exactly what was removed and what remains.
+/// with a single link are removed; read-only hard-linked files are preserved.
 pub fn delete_tree(root: &Path) -> DeleteReport {
-    use std::os::windows::fs::MetadataExt;
-    let mut r = DeleteReport::default();
-    // The callers' checks refuse a root that is a link, but the root can change between that
-    // check and now (and the bin's expiry has no such check): never walk into a link's target.
-    if let Ok(m) = std::fs::symlink_metadata(root) {
-        let a = m.file_attributes();
-        if a & disk_win::A_REPARSE != 0 {
-            let res = if a & disk_win::A_DIR != 0 { std::fs::remove_dir(root) } else { std::fs::remove_file(root) };
-            match res {
-                Ok(()) => r.links += 1,
-                Err(err) => r.fail(root, &err),
-            }
-            r.remains = std::fs::symlink_metadata(root).is_ok();
-            return r;
-        }
-    }
-    delete_dir(root, &mut r);
-    r.remains = std::fs::symlink_metadata(root).is_ok();
-    r
-}
-
-fn clear_readonly(p: &Path, m: &std::fs::Metadata) {
-    let mut perm = m.permissions();
-    if perm.readonly() {
-        #[allow(clippy::permissions_set_readonly_false)]
-        perm.set_readonly(false);
-        let _ = std::fs::set_permissions(p, perm);
-    }
-}
-
-fn delete_dir(dir: &Path, r: &mut DeleteReport) {
-    use std::os::windows::fs::MetadataExt;
-    match std::fs::read_dir(dir) {
-        Ok(rd) => {
-            for e in rd {
-                let e = match e {
-                    Ok(e) => e,
-                    Err(err) => {
-                        r.fail(dir, &err);
-                        continue;
-                    }
-                };
-                let p = e.path();
-                let Ok(m) = std::fs::symlink_metadata(&p) else { continue };
-                let a = m.file_attributes();
-                if a & disk_win::A_REPARSE != 0 {
-                    // A link: remove the link itself, never what it points to.
-                    let res = if a & disk_win::A_DIR != 0 { std::fs::remove_dir(&p) } else { std::fs::remove_file(&p) };
-                    match res {
-                        Ok(()) => r.links += 1,
-                        Err(err) => r.fail(&p, &err),
-                    }
-                } else if a & disk_win::A_DIR != 0 {
-                    delete_dir(&p, r);
-                } else {
-                    // Read-only is a property of the file, not of the name: clearing it on a file
-                    // with another name outside the item would change that file too.
-                    if m.permissions().readonly() && disk_win::link_count(&p.display().to_string()).is_none_or(|n| n > 1) {
-                        r.linked += 1;
-                        r.linked_bytes += m.len();
-                        continue;
-                    }
-                    clear_readonly(&p, &m);
-                    match std::fs::remove_file(&p) {
-                        Ok(()) => {
-                            r.files += 1;
-                            r.bytes += m.len();
-                        }
-                        Err(err) => r.fail(&p, &err),
-                    }
-                }
-            }
-        }
-        Err(err) => {
-            r.fail(dir, &err);
-            return;
-        }
-    }
-    if let Ok(m) = std::fs::symlink_metadata(dir) {
-        clear_readonly(dir, &m);
-    }
-    match std::fs::remove_dir(dir) {
-        Ok(()) => r.dirs += 1,
-        Err(err) => {
-            // A folder that still holds something that failed is already counted there.
-            if std::fs::read_dir(dir).map(|mut d| d.next().is_none()).unwrap_or(false) {
-                r.fail(dir, &err);
-            }
-        }
+    let st = disk_win::delete_tree(root);
+    DeleteReport {
+        files: st.files,
+        dirs: st.dirs,
+        bytes: st.bytes,
+        links: st.links,
+        linked: st.linked,
+        linked_bytes: st.linked_bytes,
+        failed: st.failed,
+        failed_count: st.failed_count,
+        remains: st.remains,
     }
 }
 
@@ -1267,17 +1565,20 @@ fn locate_args(exe: &str) -> Option<&'static [&'static str]> {
         "npm" => Some(&["config", "get", "cache"]),
         "pip" => Some(&["cache", "dir"]),
         "dotnet" => Some(&["nuget", "locals", "http-cache", "--list"]),
+        "uv" => Some(&["cache", "dir"]),
+        "pnpm" => Some(&["store", "path"]),
+        "yarn" => Some(&["cache", "dir"]),
         _ => None,
     }
 }
 
 /// The folder a tool's clean command empties, from its answer to `locate_args` (pure). npm's
-/// clean empties `<cache>\_cacache`; pip prints the folder; dotnet prints `http-cache: <folder>`.
+/// clean empties `<cache>\_cacache`; pip/uv/pnpm/yarn print the folder; dotnet prints `http-cache: <folder>`.
 pub fn parse_tool_location(exe: &str, out: &str) -> Option<String> {
     let line = |s: &str| s.lines().map(str::trim).filter(|l| !l.is_empty()).last().map(str::to_string);
     let p = match exe {
         "npm" => line(out).map(|c| format!("{}\\_cacache", c.trim_end_matches(['\\', '/']))),
-        "pip" => line(out),
+        "pip" | "uv" | "pnpm" | "yarn" => line(out),
         "dotnet" => out.lines().find_map(|l| l.trim().split_once("http-cache:").map(|(_, p)| p.trim().to_string())),
         _ => None,
     }?;
@@ -1287,6 +1588,12 @@ pub fn parse_tool_location(exe: &str, out: &str) -> Option<String> {
 
 /// Ask the tool where its cache is (30 s limit).
 pub fn tool_location(cmd: &ToolCommand, path_var: Option<&str>) -> Result<String, String> {
+    if cmd.exe == "zen" {
+        return crate::disk::ue_cache_dirs()
+            .1
+            .map(|p| p.display().to_string())
+            .ok_or_else(|| "couldn't determine Zen's data directory".into());
+    }
     let exe = find_tool(cmd, path_var)?;
     let args = locate_args(cmd.exe).ok_or_else(|| format!("Ather MemGuard can't ask {} where its cache is", cmd.exe))?;
     match run_with_timeout(&exe, args, Duration::from_secs(30)) {
@@ -1296,6 +1603,62 @@ pub fn tool_location(cmd: &ToolCommand, path_var: Option<&str>) -> Result<String
         Err(RunError::NotFound) => Err(format!("{} isn't installed", cmd.exe)),
         Err(RunError::Other(e)) => Err(e),
     }
+}
+
+/// Derive `(repo_dir_for_git_C, is_submodule)` from an item path inside a `.git` or bare repo dir.
+fn derive_git_repo_dir(item_path: &Path) -> Option<(PathBuf, bool)> {
+    let mut saw_modules = false;
+    for anc in item_path.ancestors() {
+        let name = anc.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if anc.join("HEAD").is_file() && anc.join("objects").is_dir() {
+            if name.eq_ignore_ascii_case(".git") {
+                if saw_modules {
+                    continue;
+                }
+                return anc.parent().map(|p| (p.to_path_buf(), false));
+            }
+            // Bare repo or `.git\modules\<sub_name>`
+            let is_sub = anc.ancestors().any(|a| a.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("modules")));
+            return Some((anc.to_path_buf(), is_sub));
+        }
+        if name.eq_ignore_ascii_case("modules") {
+            saw_modules = true;
+        }
+    }
+    None
+}
+
+fn git_tool_env() -> Vec<(&'static str, Option<&'static str>)> {
+    let mut env: Vec<(&'static str, Option<&'static str>)> = GIT_ENV_CLEARED.iter().map(|k| (*k, None)).collect();
+    env.push(("GIT_TERMINAL_PROMPT", Some("0")));
+    env.push(("GCM_INTERACTIVE", Some("never")));
+    env
+}
+
+fn validate_git_tool_target(exe: &Path, repo_dir: &Path, is_submodule: bool, item_path: &Path) -> Result<(), String> {
+    let rs = repo_dir.display().to_string();
+    let flag = if is_submodule { "--git-dir" } else { "--git-common-dir" };
+    let env = git_tool_env();
+    let (code, out, err) = match run_cmd(exe, &["-C", &rs, "rev-parse", flag], Duration::from_secs(10), &env) {
+        Ok(x) => x,
+        Err(RunError::TimedOut) => return Err("git rev-parse timed out".into()),
+        Err(RunError::NotFound) => return Err("git isn't installed".into()),
+        Err(RunError::Other(e)) => return Err(e),
+    };
+    if code != 0 {
+        let msg = String::from_utf8_lossy(&err).trim().to_string();
+        return Err(if msg.is_empty() { format!("git rev-parse exited with {}", code) } else { msg });
+    }
+    let raw = String::from_utf8_lossy(&out).trim().replace('/', "\\");
+    if raw.is_empty() {
+        return Err("git rev-parse returned an empty path".into());
+    }
+    let p = Path::new(&raw);
+    let resolved = crate::disk_scan::normalize_lexical(&if p.is_absolute() { p.to_path_buf() } else { repo_dir.join(p) });
+    if !is_within(&norm(&item_path.display().to_string()), &norm(&resolved.display().to_string())) {
+        return Err(format!("{} is not inside git's resolved directory {}", item_path.display(), resolved.display()));
+    }
+    Ok(())
 }
 
 /// What a tool clean did to the checked item.
@@ -1308,11 +1671,75 @@ pub struct ToolClean {
     pub predicted: u64,
 }
 
-/// Run a tool's clean on the checked item only: first ask the tool where its cache is and refuse
-/// when that isn't the item's folder (it would clean somewhere else); afterwards size the item
-/// again and report what was actually removed, even when the tool said it succeeded.
+/// Run a tool's clean on the checked item only: first ask the tool where its cache is (or verify
+/// `git rev-parse --git-common-dir` for git tools) and refuse when that isn't the item's folder;
+/// afterwards size the item again and report what was actually removed.
 pub fn tool_clean(cmd: &ToolCommand, path_var: Option<&str>, paths: &[String], frees_alone: Option<u64>) -> ToolClean {
     let refuse = |m: String| ToolClean { result: "refused".into(), message: m, predicted: 0 };
+    if cmd.exe == "git" {
+        if paths.is_empty() {
+            return refuse("No target path for git tool.".into());
+        }
+        let exe = match find_tool(cmd, path_var) {
+            Ok(e) => e,
+            Err(e) => return refuse(format!("{} ({}), so nothing was run.", e, cmd.display())),
+        };
+        let first = Path::new(&paths[0]);
+        let Some((repo_dir, is_sub)) = derive_git_repo_dir(first) else {
+            return refuse(format!("Couldn't find the git repository for {}.", paths[0]));
+        };
+        for p in paths {
+            if let Err(e) = validate_git_tool_target(&exe, &repo_dir, is_sub, Path::new(p)) {
+                return refuse(format!("Ather MemGuard couldn't verify git target {} ({}), so nothing was run.", p, e));
+            }
+        }
+        let rs = repo_dir.display().to_string();
+        let env = git_tool_env();
+        let mut owned_args: Vec<&str> = vec!["-C", &rs];
+        owned_args.extend_from_slice(cmd.args);
+        if cmd.args == ["lfs", "prune"] {
+            let has_remote = matches!(run_cmd(&exe, &["-C", &rs, "remote"], Duration::from_secs(5), &env), Ok((0, ref o, _)) if !String::from_utf8_lossy(o).trim().is_empty());
+            if has_remote {
+                owned_args.push("--verify-remote");
+            }
+        }
+        let before: u64 = paths.iter().map(|p| dir_size(Path::new(p))).sum();
+        let run_res = run_cmd(&exe, &owned_args, Duration::from_secs(120), &env);
+        return match run_res {
+            Err(RunError::TimedOut) => ToolClean { result: "failed".into(), message: format!("{} didn't finish within 2 minutes", cmd.display()), predicted: 0 },
+            Err(RunError::NotFound) => ToolClean { result: "failed".into(), message: "git isn't installed".into(), predicted: 0 },
+            Err(RunError::Other(e)) => ToolClean { result: "failed".into(), message: e, predicted: 0 },
+            Ok((code, _, err)) if code != 0 => {
+                let msg = String::from_utf8_lossy(&err).lines().next().unwrap_or("").trim().to_string();
+                ToolClean { result: "failed".into(), message: format!("{} stopped with exit code {}{}", cmd.display(), code, if msg.is_empty() { String::new() } else { format!(": {}", msg) }), predicted: 0 }
+            }
+            Ok((0, _, _)) => {
+                let left: u64 = paths.iter().map(|p| dir_size(Path::new(p))).sum();
+                let removed = before.saturating_sub(left);
+                if removed == 0 {
+                    ToolClean {
+                        result: "done".into(),
+                        message: format!("Ran {} in {} (nothing old or unreferenced to prune).", cmd.display(), repo_dir.display()),
+                        predicted: 0,
+                    }
+                } else if left > 0 {
+                    ToolClean {
+                        result: "done".into(),
+                        message: format!("Ran {} in {}. It removed {}; {} retained. This can't be undone.", cmd.display(), repo_dir.display(), size_words(removed), size_words(left)),
+                        predicted: scaled_prediction(frees_alone, removed, left),
+                    }
+                } else {
+                    ToolClean {
+                        result: "done".into(),
+                        message: format!("Ran {} in {}. It removed {}. This can't be undone.", cmd.display(), repo_dir.display(), size_words(removed)),
+                        predicted: frees_alone.unwrap_or(0),
+                    }
+                }
+            }
+            _ => unreachable!(),
+        };
+    }
+
     let loc = match tool_location(cmd, path_var) {
         Ok(l) => l,
         Err(e) => return refuse(format!("Ather MemGuard couldn't ask {} where its cache is ({}), so nothing was run.", cmd.exe, e)),
@@ -1466,6 +1893,7 @@ pub struct Outcome {
 /// Move entries back out of the bin. A folder that is back at its old place (rebuilt) is not
 /// overwritten: the moved copy stays in the bin and the outcome says where.
 pub fn undo(files: &DiskFiles, id: Option<&str>) -> Vec<Outcome> {
+    use std::collections::HashMap;
     let mut log = files.undo_log();
     let picked = log.select(id);
     if picked.is_empty() {
@@ -1476,6 +1904,8 @@ pub fn undo(files: &DiskFiles, id: Option<&str>) -> Vec<Outcome> {
         return vec![Outcome { id: id.unwrap_or("").into(), title: String::new(), action: CleanAction::Bin, result: "refused".into(), message: msg, undo_id: None, predicted_now: 0, deleted: None }];
     }
     let mut out = Vec::new();
+    // run_dir -> Vec<(entry_id, restored_slots, entry_fully_undone)>
+    let mut touched_runs: HashMap<PathBuf, Vec<(String, Vec<String>, bool)>> = HashMap::new();
     for (r, e) in picked {
         let entry = log.runs[r].entries[e].clone();
         let mut o = Outcome { id: entry.finding_id.clone(), title: entry.title.clone(), action: entry.action, result: "failed".into(), message: String::new(), undo_id: Some(entry.id.clone()), predicted_now: 0, deleted: None };
@@ -1493,11 +1923,20 @@ pub fn undo(files: &DiskFiles, id: Option<&str>) -> Vec<Outcome> {
         };
         let mut problems = Vec::new();
         let mut back = 0;
+        let mut restored_by_run: HashMap<PathBuf, Vec<String>> = HashMap::new();
         for m in moves {
             let (from, to) = (Path::new(&m.from), Path::new(&m.to));
+            let record_slot = |map: &mut HashMap<PathBuf, Vec<String>>| {
+                if let Some(slot_dir) = to.parent() {
+                    if let (Some(run_dir), Some(slot_name)) = (slot_dir.parent(), slot_dir.file_name()) {
+                        map.entry(run_dir.to_path_buf()).or_default().push(slot_name.to_string_lossy().into_owned());
+                    }
+                }
+            };
             if !to.exists() && from.exists() {
                 // Put back by an earlier try (a retry after a partial undo).
                 back += 1;
+                record_slot(&mut restored_by_run);
             } else if !to.exists() {
                 problems.push(format!("{} is no longer in the bin and isn't back at its place (the bin was emptied, or it was removed)", m.from));
             } else if from.exists() {
@@ -1509,16 +1948,18 @@ pub fn undo(files: &DiskFiles, id: Option<&str>) -> Vec<Outcome> {
                 match std::fs::rename(to, from) {
                     Ok(()) => {
                         back += 1;
+                        record_slot(&mut restored_by_run);
                         if let Some(n) = to.parent() {
                             let _ = std::fs::remove_dir(n);
-                            if let Some(run) = n.parent() {
-                                let _ = std::fs::remove_dir(run); // only when empty
-                            }
                         }
                     }
                     Err(err) => problems.push(format!("couldn't move {} back: {}", m.to, err)),
                 }
             }
+        }
+        let fully_undone = problems.is_empty() || (back > 0 && back == moves.len());
+        for (run_dir, slots) in restored_by_run {
+            touched_runs.entry(run_dir).or_default().push((entry.id.clone(), slots, fully_undone));
         }
         if problems.is_empty() {
             log.runs[r].entries[e].undone = true;
@@ -1535,6 +1976,37 @@ pub fn undo(files: &DiskFiles, id: Option<&str>) -> Vec<Outcome> {
         }
         out.push(o);
     }
+    for (run_dir, changes) in touched_runs {
+        if !run_dir.is_dir() {
+            continue;
+        }
+        if run_dir_only_metadata(&run_dir) {
+            let _ = std::fs::remove_file(run_dir.join(BIN_MANIFEST));
+            let _ = std::fs::remove_file(run_dir.join(BIN_IN_PROGRESS));
+            let _ = std::fs::remove_dir(&run_dir);
+        } else if let Some(mut manifest) = read_bin_manifest(&run_dir) {
+            for (eid, slots, full) in changes {
+                if full {
+                    manifest.entries.retain(|en| en.entry_id != eid);
+                } else if let Some(en) = manifest.entries.iter_mut().find(|en| en.entry_id == eid) {
+                    en.slots.retain(|s| !slots.contains(s));
+                    if en.slots.is_empty() {
+                        manifest.entries.retain(|x| x.entry_id != eid);
+                    } else {
+                        en.bytes = en.slots.iter().map(|s| dir_size(&run_dir.join(s))).sum();
+                    }
+                }
+            }
+            manifest.holds = if manifest.entries.is_empty() {
+                run_dir_size(&run_dir).0
+            } else {
+                manifest.entries.iter().map(|en| en.bytes).sum()
+            };
+            if let Ok(bytes) = serde_json::to_vec_pretty(&manifest) {
+                let _ = write_atomic(&run_dir.join(BIN_MANIFEST), &bytes);
+            }
+        }
+    }
     if let Err(e) = files.save_undo_log(&log) {
         crate::log::write(&format!("disk: could not write the undo log: {}", e));
     }
@@ -1542,6 +2014,88 @@ pub fn undo(files: &DiskFiles, id: Option<&str>) -> Vec<Outcome> {
 }
 
 // ---------------------------------------------------------------- the bin
+
+pub const BIN_MANIFEST: &str = "manifest.json";
+const BIN_IN_PROGRESS: &str = ".in_progress";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BinManifestEntry {
+    #[serde(default)]
+    pub entry_id: String,
+    #[serde(default)]
+    pub slots: Vec<String>,
+    #[serde(default)]
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BinManifest {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub run_id: String,
+    #[serde(default)]
+    pub created_unix: u64,
+    /// Total logical bytes held in this `<bin>\<run>` directory.
+    #[serde(default)]
+    pub holds: u64,
+    #[serde(default)]
+    pub entries: Vec<BinManifestEntry>,
+}
+
+fn is_bin_meta_file(name: &str) -> bool {
+    name.eq_ignore_ascii_case(BIN_MANIFEST)
+        || name.eq_ignore_ascii_case(BIN_IN_PROGRESS)
+        || name.to_ascii_lowercase().ends_with(".tmp")
+}
+
+fn read_bin_manifest(run_dir: &Path) -> Option<BinManifest> {
+    std::fs::read_to_string(run_dir.join(BIN_MANIFEST)).ok().and_then(|t| serde_json::from_str(&t).ok())
+}
+
+fn run_dir_only_metadata(run_dir: &Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(run_dir) else { return false };
+    for e in rd.flatten() {
+        let Ok(m) = std::fs::symlink_metadata(e.path()) else { return false };
+        if m.is_dir() {
+            return false;
+        }
+        let name = e.file_name().to_string_lossy().to_string();
+        if !is_bin_meta_file(&name) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Logical size of user entries in `<bin>\<run>`, skipping metadata files (`manifest.json`,
+/// `.in_progress`, `*.tmp`) ONLY at the `<bin>\<run>\` root (never inside `<slot>\<name>\`).
+fn run_dir_size(run_dir: &Path) -> (u64, bool) {
+    let mut total = 0u64;
+    let mut has_user = false;
+    let Ok(rd) = std::fs::read_dir(run_dir) else { return (0, false) };
+    for e in rd.flatten() {
+        let p = e.path();
+        let Ok(m) = std::fs::symlink_metadata(&p) else { continue };
+        if m.file_type().is_symlink() {
+            continue;
+        }
+        if m.is_dir() {
+            has_user = true;
+            use std::os::windows::fs::MetadataExt;
+            if m.file_attributes() & disk_win::A_REPARSE == 0 {
+                total += dir_size(&p);
+            }
+        } else {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !is_bin_meta_file(&name) {
+                has_user = true;
+                total += m.len();
+            }
+        }
+    }
+    (total, has_user)
+}
 
 /// One run's folder in a bin.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1558,20 +2112,26 @@ pub struct BinRun {
 }
 
 fn dir_size(p: &Path) -> u64 {
+    use std::os::windows::fs::MetadataExt;
+    let lp = disk_win::long_path(p);
+    let Ok(rm) = std::fs::symlink_metadata(&lp) else { return 0 };
+    if rm.file_type().is_symlink() || rm.file_attributes() & disk_win::A_REPARSE != 0 {
+        return 0;
+    }
+    if !rm.is_dir() {
+        return rm.len();
+    }
     let mut total = 0;
-    let mut stack = vec![p.to_path_buf()];
+    let mut stack = vec![lp];
     while let Some(d) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&d) else { continue };
         for e in rd.flatten() {
             let Ok(m) = std::fs::symlink_metadata(e.path()) else { continue };
-            if m.file_type().is_symlink() {
+            if m.file_type().is_symlink() || m.file_attributes() & disk_win::A_REPARSE != 0 {
                 continue;
             }
             if m.is_dir() {
-                use std::os::windows::fs::MetadataExt;
-                if m.file_attributes() & disk_win::A_REPARSE == 0 {
-                    stack.push(e.path());
-                }
+                stack.push(e.path());
             } else {
                 total += m.len();
             }
@@ -1592,6 +2152,15 @@ pub fn bin_runs(files: &DiskFiles, volume_roots: &[String]) -> Vec<BinRun> {
             if !p.is_dir() {
                 continue;
             }
+            let in_progress_fresh = std::fs::symlink_metadata(p.join(BIN_IN_PROGRESS))
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age < Duration::from_secs(300));
+            let manifest = read_bin_manifest(&p);
+            if in_progress_fresh && manifest.is_none() {
+                continue;
+            }
             let run_id = e.file_name().to_string_lossy().to_string();
             let run = log.runs.iter().find(|r| r.id == run_id);
             let mut titles = Vec::new();
@@ -1606,10 +2175,28 @@ pub fn bin_runs(files: &DiskFiles, volume_roots: &[String]) -> Vec<BinRun> {
                     }
                 }
             }
-            let moved_unix = run.map(|r| r.unix).filter(|u| *u > 0).unwrap_or_else(|| {
-                e.metadata().and_then(|m| m.created()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs())
-            });
-            out.push(BinRun { volume_root: root.clone(), run_id, path: p.display().to_string(), moved_unix, titles, frees_alone: frees, holds: dir_size(&p) });
+            let moved_unix = run
+                .map(|r| r.unix)
+                .filter(|u| *u > 0)
+                .or_else(|| manifest.as_ref().map(|m| m.created_unix).filter(|u| *u > 0))
+                .unwrap_or_else(|| {
+                    e.metadata().and_then(|m| m.created()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs())
+                });
+            let holds = match manifest {
+                Some(m) => m.holds,
+                None => {
+                    let (sz, has_user) = run_dir_size(&p);
+                    if !has_user {
+                        continue;
+                    }
+                    let backfill = BinManifest { version: 1, run_id: run_id.clone(), created_unix: moved_unix, holds: sz, entries: Vec::new() };
+                    if let Ok(bytes) = serde_json::to_vec_pretty(&backfill) {
+                        let _ = write_atomic(&p.join(BIN_MANIFEST), &bytes);
+                    }
+                    sz
+                }
+            };
+            out.push(BinRun { volume_root: root.clone(), run_id, path: p.display().to_string(), moved_unix, titles, frees_alone: frees, holds });
         }
     }
     out.sort_by_key(|r| r.moved_unix);
@@ -1665,6 +2252,7 @@ pub fn empty_bins(files: &DiskFiles, runs: &[BinRun], presample_secs: u32, start
     let done = empty_runs(files, runs);
     let run = run_id();
     let mut watches = Vec::new();
+    let mut vols: Option<Vec<disk_win::VolumeFacts>> = None;
     for (root, read) in before {
         let (free_before, motion) = read.unwrap_or((0, 0));
         let mine: Vec<&(BinRun, DeleteReport)> = done.iter().filter(|(r, _)| r.volume_root.eq_ignore_ascii_case(&root)).collect();
@@ -1673,7 +2261,20 @@ pub fn empty_bins(files: &DiskFiles, runs: &[BinRun], presample_secs: u32, start
             continue;
         }
         let guid = disk_win::volume_of(&root).map(|(_, g)| g).unwrap_or_default();
-        let fs = disk_win::volumes().into_iter().find(|v| v.guid.eq_ignore_ascii_case(&guid)).map(|v| v.fs).unwrap_or_default();
+        let fs = vols
+            .get_or_insert_with(disk_win::volumes)
+            .iter()
+            .find(|v| v.guid.eq_ignore_ascii_case(&guid))
+            .map(|v| v.fs.clone())
+            .unwrap_or_default();
+        let refs_before = if fs.eq_ignore_ascii_case("ReFS") {
+            disk_win::refs_volume_data(&root).map(|d| RefsSnapshot {
+                free_bytes: d.free_bytes,
+                reserved_bytes: d.reserved_bytes,
+            })
+        } else {
+            None
+        };
         let rec = WatchRecord {
             id: format!("{}-bin-{}", run, root.chars().next().unwrap_or('v')),
             run_id: run.clone(),
@@ -1690,6 +2291,7 @@ pub fn empty_bins(files: &DiskFiles, runs: &[BinRun], presample_secs: u32, start
             watcher_pid: 0,
             measured: unmeasurable_watch(&read),
             toasted: false,
+            refs_before,
         };
         let mut all = files.watches();
         all.push(rec.clone());
@@ -1822,6 +2424,16 @@ pub fn run_cli_json(args: &[&str], timeout: Duration) -> Result<Value, String> {
 // ---------------------------------------------------------------- the measured result (pure)
 
 /// What came back after acting, as read from the volume's free space.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefsSnapshot {
+    pub free_bytes: u64,
+    pub reserved_bytes: u64,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Measured {
     /// Free space now minus free space just before acting (bytes; can be negative). This is an
@@ -1840,6 +2452,14 @@ pub struct Measured {
     /// Seconds until 90% of the prediction had shown up; `None` if it never did.
     pub appeared_after_sec: Option<u64>,
     pub watched_sec: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refs_free_delta: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refs_reserved_delta: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refs_reserved_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub retrim_recommended: bool,
 }
 
 /// Reads free space after acting, until the prediction has shown up and settled, or 30 minutes.
@@ -1911,6 +2531,7 @@ impl Measure {
             other_activity: self.pre_motion as i64 > NOISE || self.low < -NOISE || self.drop_after_rise || overshoot,
             appeared_after_sec: self.appeared,
             watched_sec: self.sec,
+            ..Default::default()
         }
     }
 
@@ -1975,6 +2596,17 @@ pub fn measured_words(volume: &str, predicted: u64, m: &Measured, refs: bool) ->
     } else {
         if refs {
             body.push_str(" This drive can return deleted space much later; memguard disk shows the free space now.");
+            if m.retrim_recommended {
+                let drive = volume
+                    .chars()
+                    .next()
+                    .filter(|c| c.is_ascii_alphabetic())
+                    .map(|c| c.to_ascii_uppercase())
+                    .unwrap_or('X');
+                body.push_str(&format!(
+                    " Run Optimize-Volume -DriveLetter {drive} -ReTrim (as administrator) to nudge space return."
+                ));
+            }
         }
         (format!("Space hasn't come back yet on {}", volume), body)
     }
@@ -2003,6 +2635,8 @@ pub struct WatchRecord {
     /// The tray has shown its toast.
     #[serde(default)]
     pub toasted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refs_before: Option<RefsSnapshot>,
 }
 
 /// Watch one record until it is done (blocking, up to 30 minutes from when it started), and
@@ -2035,9 +2669,26 @@ pub fn watch(files: &DiskFiles, id: &str, say: &mut dyn FnMut(&str)) -> Option<M
         }
         std::thread::sleep(Duration::from_secs(if sec < 120 { 1 } else { 5 }));
     }
-    let res = m.result();
+    let mut res = m.result();
+    let is_refs = rec.fs.eq_ignore_ascii_case("ReFS");
+    if is_refs {
+        if let Some(after) = disk_win::refs_volume_data(&rec.volume_root) {
+            res.refs_reserved_bytes = Some(after.reserved_bytes);
+            if let Some(before) = rec.refs_before {
+                res.refs_free_delta = Some(after.free_bytes as i64 - before.free_bytes as i64);
+                res.refs_reserved_delta = Some(after.reserved_bytes as i64 - before.reserved_bytes as i64);
+            }
+            if rec.predicted >= (1u64 << 30)
+                && (res.appeared_after_sec.is_none() || res.measured_freed < (rec.predicted as i64) / 2)
+                && (after.reserved_bytes >= (256 << 20)
+                    || res.refs_free_delta.is_some_and(|d| d < (rec.predicted as i64) / 2))
+            {
+                res.retrim_recommended = true;
+            }
+        }
+    }
     let vol = rec.volume_root.trim_end_matches('\\').to_string();
-    let (t, b) = measured_words(&vol, rec.predicted, &res, rec.fs.eq_ignore_ascii_case("ReFS"));
+    let (t, b) = measured_words(&vol, rec.predicted, &res, is_refs);
     crate::log::write(&format!(
         "disk: measured after cleanup {}: {} {} (measured {:.2} GB, predicted {:.2} GB, settled {}, other_activity {}, appeared_after_sec {:?})",
         rec.run_id,
@@ -2198,12 +2849,31 @@ pub fn item_check(p: &PlannedItem, s: &crate::config::DiskSettings, files: &Disk
             c.global = true;
             if let Some(r) = files.relocate_record().filter(|r| !r.undone) {
                 c.relocated = r.entries.iter().map(|e| norm(&e.new_value)).collect();
+                if let Some((var, tail)) = i.path.strip_prefix('%').and_then(|s| s.split_once('%')) {
+                    let var = match var.to_ascii_uppercase().as_str() {
+                        "DDC" => "UE-LocalDataCachePath",
+                        "ZEN" => "UE-ZenSubprocessDataPath",
+                        _ => var,
+                    };
+                    for e in &r.entries {
+                        if e.name.eq_ignore_ascii_case(var) && i.older_than_days.is_none() {
+                            c.allowed_paths.push(norm(&format!("{}{}", e.new_value.trim_end_matches(['\\', '/']), tail)));
+                        }
+                    }
+                }
             }
-            if let Some(base) = crate::disk_scan::expand_global(&i.path) {
+            for base in crate::disk_scan::expand_global_paths(&i.path) {
                 if i.older_than_days.is_some() {
-                    c.allowed_parent = Some(norm(&base.display().to_string()));
+                    if c.allowed_parent.is_none() {
+                        c.allowed_parent = Some(norm(&base.display().to_string()));
+                    }
                 } else {
                     c.allowed_paths.push(norm(&base.display().to_string()));
+                }
+            }
+            if p.key == "cache:npm" {
+                if let Some(def) = crate::disk_scan::expand_global(r"%LOCALAPPDATA%\npm-cache\_cacache") {
+                    c.allowed_paths.push(norm(&def.display().to_string()));
                 }
             }
         }
@@ -2238,6 +2908,17 @@ pub fn clean(cfg: &crate::config::Config, files: &DiskFiles, plan: &PlanRecord, 
     let mut ready: Vec<(usize, PlannedItem, CleanAction)> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
 
+    struct CleanCandidate {
+        outcome_idx: usize,
+        item: PlannedItem,
+        action: CleanAction,
+        check: ItemCheck,
+        facts: Vec<PathFacts>,
+        pre_failed: bool,
+    }
+    let mut candidates: Vec<CleanCandidate> = Vec::new();
+
+    // Stage 1: cheap plan/catalog/agent/bin checks + base path facts.
     for (id, want) in picks {
         let refuse = |title: &str, action: CleanAction, msg: String| Outcome { id: id.clone(), title: title.into(), action, result: "refused".into(), message: msg, undo_id: None, predicted_now: 0, deleted: None };
         if seen.iter().any(|x| x.eq_ignore_ascii_case(id)) {
@@ -2296,15 +2977,91 @@ pub fn clean(cfg: &crate::config::Config, files: &DiskFiles, plan: &PlanRecord, 
             continue;
         }
         let mut check = item_check(item, &s, files, &busy);
-        let facts: Vec<PathFacts> = item.paths.iter().map(|p| path_facts(p, check.global, profile.as_deref(), &syncs, !opts.skip_git)).collect();
-        check.now_last_write = newest_write(&item.paths, Duration::from_secs(120));
-        if let Some(why) = refusal(&check, &facts) {
-            outcomes.push(refuse(&item.title, action, why));
-            continue;
-        }
+        check.action = Some(action);
+        check.allow_git_tool = action == CleanAction::Tool && item.key.starts_with("git:");
+        let marker = crate::disk_scan::catalog_info(&item.key).and_then(|ci| ci.marker);
+        let facts: Vec<PathFacts> = item
+            .paths
+            .iter()
+            .map(|p| path_facts_base_for(p, check.global, profile.as_deref(), &syncs, &check.key, marker.as_deref()))
+            .collect();
+        let no_action = if action == CleanAction::Tool {
+            no_action_reason_for(&check.key, &check.class, item.tool.as_deref())
+        } else {
+            no_action_reason(&check.key, &check.class)
+        };
+        let pre_failed = no_action.is_some()
+            || facts.is_empty()
+            || facts.iter().any(|p| pre_git_path_refusal(&check, p).is_some());
         let o = Outcome { id: item.id.clone(), title: item.title.clone(), action, result: "would_do".into(), message: String::new(), undo_id: None, predicted_now: 0, deleted: None };
         outcomes.push(o);
-        ready.push((outcomes.len() - 1, item.clone(), action));
+        candidates.push(CleanCandidate { outcome_idx: outcomes.len() - 1, item: item.clone(), action, check, facts, pre_failed });
+    }
+
+    // Stage 2: batched `git -C <repo> ls-files -z -- ...` across all eligible candidates & unique repos.
+    if !opts.skip_git {
+        let mut refs: Vec<(usize, usize)> = Vec::new();
+        for (ci, cand) in candidates.iter().enumerate() {
+            if cand.pre_failed || cand.check.allow_git_tool {
+                continue;
+            }
+            for pi in 0..cand.facts.len() {
+                refs.push((ci, pi));
+            }
+        }
+        if !refs.is_empty() {
+            let queries: Vec<(&Path, bool)> = refs
+                .iter()
+                .map(|&(ci, pi)| (Path::new(candidates[ci].facts[pi].path.as_str()), candidates[ci].check.global))
+                .collect();
+            let answers = resolve_git_checks_env(&queries, profile.as_deref(), &[]);
+            for ((ci, pi), ans) in refs.into_iter().zip(answers) {
+                candidates[ci].facts[pi].git = Some(ans);
+            }
+        }
+    }
+
+    // Stage 3: single 4-threaded `walk_clean_paths` (merged `holds_repo` + `newest_write`) + final refusal.
+    for cand in &mut candidates {
+        let first_git_fail = cand.facts.iter().position(|p| {
+            matches!(&p.git, Some(GitCheck::Tracked(_) | GitCheck::TimedOut | GitCheck::Failed(_)))
+        });
+        if !cand.pre_failed && first_git_fail != Some(0) {
+            let limit = first_git_fail.unwrap_or(cand.facts.len());
+            let walk_idx: Vec<usize> = (0..limit)
+                .filter(|&k| cand.facts[k].exists && !cand.facts[k].chain.iter().any(|(_, r)| *r))
+                .collect();
+            if walk_idx.is_empty() {
+                cand.check.now_last_write = Some(0);
+            } else {
+                let skip_git = opts.skip_git || cand.check.allow_git_tool;
+                let walk_paths: Vec<String> = walk_idx.iter().map(|&k| cand.facts[k].path.clone()).collect();
+                let stats = disk_win::walk_clean_paths(&walk_paths, 4, Instant::now() + Duration::from_secs(120), !skip_git);
+                let mut incomplete = false;
+                let mut max_lw = 0u64;
+                for (k, st) in walk_idx.into_iter().zip(stats) {
+                    if !skip_git {
+                        if st.holds_repo {
+                            cand.facts[k].holds_repo = true;
+                            cand.facts[k].repo_walk_incomplete = false;
+                        } else if st.cut_short || st.dir_failures > 0 {
+                            cand.facts[k].repo_walk_incomplete = true;
+                        }
+                    }
+                    if st.cut_short || st.dir_failures > 0 {
+                        incomplete = true;
+                    }
+                    max_lw = max_lw.max(st.last_write);
+                }
+                cand.check.now_last_write = if incomplete { None } else { Some(max_lw) };
+            }
+        }
+        if let Some(why) = refusal(&cand.check, &cand.facts) {
+            outcomes[cand.outcome_idx].result = "refused".into();
+            outcomes[cand.outcome_idx].message = why;
+            continue;
+        }
+        ready.push((cand.outcome_idx, cand.item.clone(), cand.action));
     }
 
     if opts.dry_run {
@@ -2319,20 +3076,26 @@ pub fn clean(cfg: &crate::config::Config, files: &DiskFiles, plan: &PlanRecord, 
     }
 
     // Free space just before acting, on every volume that should get space back.
-    let mut before: Vec<(String, Option<(u64, u64)>)> = Vec::new();
+    let mut before: Vec<(String, Option<(u64, u64)>, Option<RefsSnapshot>)> = Vec::new();
     for (_, item, action) in &ready {
         if *action == CleanAction::Bin {
             continue;
         }
         if let Some(root) = &item.volume_root {
-            if !before.iter().any(|(r, _)| r.eq_ignore_ascii_case(root)) {
-                before.push((root.clone(), presample(root, opts.presample_secs.max(1))));
+            if !before.iter().any(|(r, _, _)| r.eq_ignore_ascii_case(root)) {
+                let pre = presample(root, opts.presample_secs.max(1));
+                let r_snap = disk_win::refs_volume_data(root).map(|d| RefsSnapshot {
+                    free_bytes: d.free_bytes,
+                    reserved_bytes: d.reserved_bytes,
+                });
+                before.push((root.clone(), pre, r_snap));
             }
         }
     }
 
     let mut entries: Vec<UndoEntry> = Vec::new();
-    let mut tools_run: Vec<String> = Vec::new();
+    let mut tools_run: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut bin_vols: std::collections::HashMap<String, (PathBuf, Vec<BinManifestEntry>)> = std::collections::HashMap::new();
     let mut n = 0;
     for (k, item, action) in &ready {
         n += 1;
@@ -2384,12 +3147,23 @@ pub fn clean(cfg: &crate::config::Config, files: &DiskFiles, plan: &PlanRecord, 
             CleanAction::Bin => {
                 let root = item.volume_root.clone().unwrap_or_default();
                 let bin = bin_root(&root);
+                let run_dir = bin.join(&run);
+                let norm_root = norm(&root);
+                if !bin_vols.contains_key(&norm_root) && ensure_bin(&bin).is_ok() && ensure_private_dir(&run_dir).is_ok() {
+                    let _ = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(run_dir.join(BIN_IN_PROGRESS));
+                    bin_vols.insert(norm_root.clone(), (run_dir, Vec::new()));
+                }
                 let mut moves = Vec::new();
+                let mut moved_slots = Vec::new();
                 let mut err = None;
                 for (j, p) in item.paths.iter().enumerate() {
+                    let slot = format!("{}-{}", n, j);
                     // "<entry>-<path>": unique for any number of paths.
-                    match move_to_bin(Path::new(p), &bin, &run, &format!("{}-{}", n, j)) {
-                        Ok(dst) => moves.push(BinMove { from: p.clone(), to: dst.display().to_string() }),
+                    match move_to_bin(Path::new(p), &bin, &run, &slot) {
+                        Ok(dst) => {
+                            moves.push(BinMove { from: p.clone(), to: dst.display().to_string() });
+                            moved_slots.push(slot);
+                        }
                         Err(e) => {
                             err = Some(e);
                             break;
@@ -2397,6 +3171,13 @@ pub fn clean(cfg: &crate::config::Config, files: &DiskFiles, plan: &PlanRecord, 
                     }
                 }
                 if !moves.is_empty() {
+                    let moved_bytes = match (err.is_none(), item.logical_size) {
+                        (true, Some(sz)) => sz,
+                        _ => moves.iter().map(|m| dir_size(Path::new(&m.to))).sum(),
+                    };
+                    if let Some((_, list)) = bin_vols.get_mut(&norm_root) {
+                        list.push(BinManifestEntry { entry_id: entry_id.clone(), slots: moved_slots, bytes: moved_bytes });
+                    }
                     o.undo_id = Some(entry_id.clone());
                     entries.push(UndoEntry {
                         id: entry_id,
@@ -2425,16 +3206,29 @@ pub fn clean(cfg: &crate::config::Config, files: &DiskFiles, plan: &PlanRecord, 
             CleanAction::Tool => {
                 let cmd = item.tool.as_deref().and_then(tool_command);
                 match cmd {
-                    Some(c) if tools_run.contains(&c.exe.to_string()) => {
-                        o.result = "done".into();
-                        o.message = format!("Cleaned by {} (already run).", c.display());
-                    }
                     Some(c) => {
-                        tools_run.push(c.exe.to_string());
-                        let t = tool_clean(&c, opts.tool_path.as_deref(), &item.paths, item.frees_alone);
-                        o.result = t.result;
-                        o.message = t.message;
-                        o.predicted_now = t.predicted;
+                        let scope = if c.exe == "git" {
+                            item.paths
+                                .first()
+                                .and_then(|p| derive_git_repo_dir(Path::new(p)))
+                                .map(|(rd, _)| norm(&rd.display().to_string()))
+                                .unwrap_or_else(|| item.paths.first().map(|p| norm(p)).unwrap_or_default())
+                        } else {
+                            String::new()
+                        };
+                        let run_key = (scope, c.display());
+                        if tools_run.contains(&run_key) {
+                            o.result = "done".into();
+                            o.message = format!("Cleaned by {} (already run).", c.display());
+                        } else {
+                            let t = tool_clean(&c, opts.tool_path.as_deref(), &item.paths, item.frees_alone);
+                            if t.result == "done" {
+                                tools_run.insert(run_key);
+                            }
+                            o.result = t.result;
+                            o.message = t.message;
+                            o.predicted_now = t.predicted;
+                        }
                     }
                     None => {
                         o.result = "refused".into();
@@ -2447,8 +3241,31 @@ pub fn clean(cfg: &crate::config::Config, files: &DiskFiles, plan: &PlanRecord, 
         crate::log::write(&format!("disk: {} {} ({}): {} {}", action.name(), item.title, item.paths.join("; "), o.result, o.message));
     }
 
+    let now_unix = unix_now();
+    for (_, (run_dir, new_entries)) in bin_vols {
+        if new_entries.is_empty() {
+            let _ = std::fs::remove_file(run_dir.join(BIN_IN_PROGRESS));
+            let _ = std::fs::remove_dir(&run_dir);
+            continue;
+        }
+        let mut manifest = read_bin_manifest(&run_dir).unwrap_or_default();
+        manifest.version = 1;
+        manifest.run_id = run.clone();
+        if manifest.created_unix == 0 {
+            manifest.created_unix = now_unix;
+        }
+        manifest.entries.extend(new_entries);
+        manifest.holds = manifest.entries.iter().map(|e| e.bytes).sum();
+        if let Ok(bytes) = serde_json::to_vec_pretty(&manifest) {
+            if let Err(e) = write_atomic(&run_dir.join(BIN_MANIFEST), &bytes) {
+                crate::log::write(&format!("disk: could not write bin manifest: {}", e));
+            }
+        }
+        let _ = std::fs::remove_file(run_dir.join(BIN_IN_PROGRESS));
+    }
+
     let mut log = files.undo_log();
-    log.push_run(UndoRun { id: run.clone(), time: crate::win::local_time_string(), unix: unix_now(), entries });
+    log.push_run(UndoRun { id: run.clone(), time: crate::win::local_time_string(), unix: now_unix, entries });
     if let Err(e) = files.save_undo_log(&log) {
         crate::log::write(&format!("disk: could not write the undo log: {}", e));
     }
@@ -2456,7 +3273,8 @@ pub fn clean(cfg: &crate::config::Config, files: &DiskFiles, plan: &PlanRecord, 
     // The prediction per volume: the plan's set total when exactly that set went, else the
     // sum of the items' own numbers, which can only be lower (an "at least").
     let mut volumes: Vec<VolumePrediction> = Vec::new();
-    for (root, read) in &before {
+    let mut vols: Option<Vec<disk_win::VolumeFacts>> = None;
+    for (root, read, refs_before) in &before {
         let (free_before, motion) = &read.unwrap_or((0, 0));
         let done: Vec<&(usize, PlannedItem, CleanAction)> = ready
             .iter()
@@ -2496,7 +3314,10 @@ pub fn clean(cfg: &crate::config::Config, files: &DiskFiles, plan: &PlanRecord, 
             conf = "estimate".into();
         }
         let fs = plan.volumes.iter().find(|v| v.root.eq_ignore_ascii_case(root)).map(|v| v.fs.clone()).unwrap_or_else(|| {
-            done.first().and_then(|(_, it, _)| it.volume.clone()).and_then(|g| disk_win::volumes().into_iter().find(|v| v.guid.eq_ignore_ascii_case(&g)).map(|v| v.fs)).unwrap_or_default()
+            done.first()
+                .and_then(|(_, it, _)| it.volume.clone())
+                .and_then(|g| vols.get_or_insert_with(disk_win::volumes).iter().find(|v| v.guid.eq_ignore_ascii_case(&g)).map(|v| v.fs.clone()))
+                .unwrap_or_default()
         });
         let guid = done.first().and_then(|(_, it, _)| it.volume.clone()).unwrap_or_default();
         let mut vp = VolumePrediction { volume: guid.clone(), volume_root: root.clone(), fs: fs.clone(), item_ids: ids, predicted_freed: bytes, confidence: conf.clone(), free_before: *free_before, watch_id: None };
@@ -2518,6 +3339,7 @@ pub fn clean(cfg: &crate::config::Config, files: &DiskFiles, plan: &PlanRecord, 
                 watcher_pid: 0,
                 measured: unmeasurable_watch(read),
                 toasted: false,
+                refs_before: *refs_before,
             };
             let mut all = files.watches();
             all.push(rec);
@@ -3412,7 +4234,7 @@ mod tests {
 
     #[test]
     fn agent_plans_must_be_fresh_and_hold_the_ids() {
-        let item = |id: &str| PlannedItem { id: id.into(), key: "ue:intermediate".into(), class: "regenerable".into(), title: "x".into(), paths: vec![], path_ids: vec![], last_write: 0, volume: None, volume_root: None, frees_alone: Some(1), confidence: "exact".into(), tool: None, unmeasurable: None };
+        let item = |id: &str| PlannedItem { id: id.into(), key: "ue:intermediate".into(), class: "regenerable".into(), title: "x".into(), paths: vec![], path_ids: vec![], last_write: 0, volume: None, volume_root: None, frees_alone: Some(1), confidence: "exact".into(), tool: None, unmeasurable: None, logical_size: None };
         let plans = vec![PlanRecord { id: "p1".into(), unix: 1000, time: String::new(), items: vec![item("d1"), item("d2")], volumes: vec![] }];
         assert_eq!(plan_for_agent(&plans, "p1", &["d1".into()], 1000 + 599).unwrap().id, "p1");
         assert!(plan_for_agent(&plans, "p1", &["d1".into()], 1000 + 601).unwrap_err().contains("under 10 minutes"));
@@ -3459,6 +4281,7 @@ mod tests {
             confidence: "exact".into(),
             tool,
             unmeasurable: None,
+            logical_size: None,
         };
         PlanRecord { id: "ptest".into(), unix: unix_now(), time: String::new(), items: vec![item], volumes: vec![PlannedVolume { volume: guid, root, fs: String::new(), item_ids: vec!["d1".into()], frees_together: Some(frees), confidence: "exact".into() }] }
     }
@@ -3581,7 +4404,7 @@ mod tests {
         assert_eq!(parse_expect(&format!("d1={}", fp)).unwrap(), ("d1".into(), fp));
         assert!(parse_expect("d1").is_err() && parse_expect("d1=xyz").is_err() && parse_expect("D:=0123456789abcdef").is_err());
         // The fresh plan must find the folders the checkup counted.
-        let item = |id: &str, p: &str, fid: u128| PlannedItem { id: id.into(), key: "ue:intermediate".into(), class: "regenerable".into(), title: "x".into(), paths: vec![p.into()], path_ids: vec![Some(fid)], last_write: 0, volume: None, volume_root: None, frees_alone: Some(1), confidence: "exact".into(), tool: None, unmeasurable: None };
+        let item = |id: &str, p: &str, fid: u128| PlannedItem { id: id.into(), key: "ue:intermediate".into(), class: "regenerable".into(), title: "x".into(), paths: vec![p.into()], path_ids: vec![Some(fid)], last_write: 0, volume: None, volume_root: None, frees_alone: Some(1), confidence: "exact".into(), tool: None, unmeasurable: None, logical_size: None };
         let plan = |it: PlannedItem| PlanRecord { id: "p".into(), unix: 0, time: String::new(), items: vec![it], volumes: vec![] };
         assert_eq!(check_live_ids(&a, &plan(item("d1", r"D:\s2\Intermediate", 11))), Ok(()));
         assert_eq!(check_live_ids(&a, &plan(item("d1", r"D:\s2\Intermediate", 77))).unwrap_err(), CHECKUP_CHANGED, "made again since the checkup");
@@ -3745,7 +4568,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let files = DiskFiles::in_dir(&dir);
         let rec = WatchRecord { id: "w".into(), run_id: "r".into(), volume: String::new(), volume_root: "D:\\".into(), fs: "ReFS".into(), started_unix: unix_now(), time: String::new(),
-            free_before: 0, pre_motion: 0, predicted: G, predicted_confidence: "exact".into(), titles: vec![], watcher_pid: 0, measured: unmeasurable_watch(&None), toasted: false };
+            free_before: 0, pre_motion: 0, predicted: G, predicted_confidence: "exact".into(), titles: vec![], watcher_pid: 0, measured: unmeasurable_watch(&None), toasted: false, refs_before: None };
         files.save_watches(&[rec]).unwrap();
         let r = recent_cleanups(&files, 5);
         assert_eq!(r[0]["state"], "couldnt_measure");
@@ -3768,5 +4591,800 @@ mod tests {
         for c in ["unknown", "none", "", "weird"] {
             assert_eq!(gb_words(Some(30 << 20), c), "30 MB (uncertain)", "never a bare number for {:?}", c);
         }
+    }
+
+    #[test]
+    fn root_mtime_newer_than_children_clean_succeeds_and_post_plan_touch_refuses() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = std::env::temp_dir().join(format!("amg-clean-rootlw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let game = root.join("Game");
+        let inter = game.join("Intermediate");
+        let empty_logs = game.join(r"Saved\Logs");
+        std::fs::create_dir_all(&inter).unwrap();
+        std::fs::create_dir_all(&empty_logs).unwrap();
+        std::fs::write(game.join("Game.uproject"), REAL_UPROJECT).unwrap();
+        std::fs::write(inter.join("a.obj"), vec![1u8; 4096]).unwrap();
+
+        let set_mtime = |p: &Path, secs_ago: u64| {
+            let t = std::time::SystemTime::now() - Duration::from_secs(secs_ago);
+            let f = std::fs::OpenOptions::new().access_mode(0x100).custom_flags(0x0200_0000).open(p).unwrap();
+            f.set_modified(t).unwrap();
+        };
+        // Child is 5h old, root dir is 3h old (> default 2h min_age_hours).
+        set_mtime(&inter.join("a.obj"), 5 * 3600);
+        set_mtime(&inter, 3 * 3600);
+        set_mtime(&empty_logs, 3 * 3600);
+
+        let cfg = crate::config::Config::builtin();
+        let items = crate::disk_scan::discover(&cfg, Some(&root.display().to_string()));
+        let cached = crate::disk_scan::CachedCheckup {
+            id: "c-rootlw".into(),
+            scope: "*".into(),
+            unix: unix_now(),
+            time: String::new(),
+            items,
+            root_ids: vec![],
+            last_writes: vec![],
+            report: crate::disk_scan::Checkup { scan: json!({}), volumes: vec![], items: vec![], sharing_groups: vec![], totals: vec![], basis: "predicted".into(), do_not_sum: String::new() },
+        };
+        let run = |j: &crate::disk_scan::ScanJob, p: crate::disk_scan::Progress| Ok(crate::disk_scan::run_job(j, p));
+        let (_, rec) = crate::disk_scan::plan_record(&cfg, &cached, &[], None, &run, &mut |_, _| {}).unwrap();
+        assert_eq!(rec.items.len(), 2);
+        for it in &rec.items {
+            assert!(it.last_write > 0);
+            assert_eq!(it.last_write, newest_write(&it.paths, Duration::from_secs(30)).unwrap());
+        }
+
+        let files = DiskFiles::in_dir(root.join("data"));
+        let res = clean(&cfg, &files, &rec, &[("d1".into(), Some(CleanAction::Now))], &test_opts());
+        assert_eq!(res.outcomes[0].result, "done", "{:?}", res.outcomes[0]);
+        assert!(!inter.exists());
+
+        // Touching the empty root directory after plan_record MUST still refuse.
+        set_mtime(&empty_logs, 2 * 3600 + 600);
+        let res2 = clean(&cfg, &files, &rec, &[("d2".into(), Some(CleanAction::Now))], &test_opts());
+        assert_eq!(res2.outcomes[0].result, "refused", "{:?}", res2.outcomes[0]);
+        assert!(res2.outcomes[0].message.contains("after the plan"), "{}", res2.outcomes[0].message);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_atomic_concurrent_and_error_cleanup() {
+        let root = std::env::temp_dir().join(format!("amg-clean-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("state.json");
+
+        std::thread::scope(|s| {
+            for t in 0..8usize {
+                let target = &target;
+                s.spawn(move || {
+                    for iter in 0..20usize {
+                        let payload = serde_json::to_vec(&json!({ "thread": t, "iter": iter })).unwrap();
+                        write_atomic(target, &payload).unwrap();
+                    }
+                });
+            }
+        });
+
+        let txt = std::fs::read_to_string(&target).unwrap();
+        let val: Value = serde_json::from_str(&txt).unwrap();
+        assert!(val.get("thread").is_some());
+        for e in std::fs::read_dir(&root).unwrap().flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            assert!(!name.ends_with(".tmp"), "leftover tmp file: {}", name);
+        }
+
+        // Permanent rename failure (target is a directory) cleans up its temp file and returns Err.
+        let dir_target = root.join("already-a-dir");
+        std::fs::create_dir_all(&dir_target).unwrap();
+        assert!(write_atomic(&dir_target, b"{}").is_err());
+        for e in std::fs::read_dir(&root).unwrap().flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            assert!(!name.ends_with(".tmp"), "leftover tmp file after error: {}", name);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tool_dedup_does_not_skip_after_refused_or_failed_first_item() {
+        struct LocalAppDataGuard(Option<std::ffi::OsString>);
+        impl Drop for LocalAppDataGuard {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var("LOCALAPPDATA", v),
+                    None => std::env::remove_var("LOCALAPPDATA"),
+                }
+            }
+        }
+        let _guard = LocalAppDataGuard(std::env::var_os("LOCALAPPDATA"));
+
+        let root = std::env::temp_dir().join(format!("amg-clean-tooldedup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let local = root.join("local");
+        let bin = root.join("bin");
+        let npm_cache = local.join("npm-cache");
+        let cacache = npm_cache.join("_cacache");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&cacache).unwrap();
+        std::fs::write(cacache.join("pkg.bin"), vec![1u8; 4096]).unwrap();
+        age_tree(&root, 4 * 3600);
+        std::env::set_var("LOCALAPPDATA", &local);
+
+        let files = DiskFiles::in_dir(root.join("data"));
+        files
+            .save_relocate_record(&crate::disk_relocate::RelocateRecord {
+                unix: 1,
+                time: String::new(),
+                store: String::new(),
+                entries: vec![crate::disk_relocate::RecordEntry {
+                    name: "npm_config_cache".into(),
+                    previous: None,
+                    new_value: cacache.display().to_string(),
+                    old_location: String::new(),
+                }],
+                undone: false,
+            })
+            .unwrap();
+
+        let cacache_s = cacache.display().to_string();
+        let (_, guid) = disk_win::volume_of(&cacache_s).unwrap();
+        let (vol_root, _) = disk_win::volume_of(&cacache_s).unwrap();
+        let fid = disk_win::identity(&cacache_s).map(|x| x.1);
+        let lw = newest_write(std::slice::from_ref(&cacache_s), Duration::from_secs(10)).unwrap();
+
+        let mk_item = |id: &str, paths: Vec<String>| PlannedItem {
+            id: id.into(),
+            key: "cache:npm".into(),
+            class: "regenerable".into(),
+            title: "npm cache".into(),
+            path_ids: vec![fid; paths.len()],
+            last_write: lw,
+            paths,
+            volume: Some(guid.clone()),
+            volume_root: Some(vol_root.clone()),
+            frees_alone: Some(4096),
+            confidence: "exact".into(),
+            tool: Some("npm".into()),
+            unmeasurable: None,
+            logical_size: Some(4096),
+        };
+
+        let cfg = crate::config::Config::builtin();
+        let mut opts = test_opts();
+        opts.tool_path = Some(bin.display().to_string());
+
+        // Case 1: first item fails (npm exits 3) -> second item ALSO fails (never "done (already run)").
+        std::fs::write(
+            bin.join("npm.cmd"),
+            format!("@echo off\r\nif \"%1\"==\"config\" (\r\necho {}\r\nexit /b 0\r\n)\r\nexit /b 3\r\n", npm_cache.display()),
+        )
+        .unwrap();
+        let plan_fail = PlanRecord { id: "p-fail".into(), unix: unix_now(), time: String::new(), items: vec![mk_item("d1", vec![cacache_s.clone()]), mk_item("d2", vec![cacache_s.clone()])], volumes: vec![] };
+        let r_fail = clean(&cfg, &files, &plan_fail, &[("d1".into(), Some(CleanAction::Tool)), ("d2".into(), Some(CleanAction::Tool))], &opts);
+        assert_eq!(r_fail.outcomes[0].result, "failed", "{:?}", r_fail.outcomes);
+        assert_eq!(r_fail.outcomes[1].result, "failed", "{:?}", r_fail.outcomes);
+        assert!(!r_fail.outcomes[1].message.contains("already run"));
+
+        // Case 2: first item refused (2 paths != 1 in tool_clean) -> second item runs and succeeds ("done").
+        std::fs::write(
+            bin.join("npm.cmd"),
+            format!("@echo off\r\nif \"%1\"==\"config\" (\r\necho {}\r\nexit /b 0\r\n)\r\nrmdir /s /q \"{}\"\r\nexit /b 0\r\n", npm_cache.display(), cacache.display()),
+        )
+        .unwrap();
+        let plan_refuse = PlanRecord { id: "p-ref".into(), unix: unix_now(), time: String::new(), items: vec![mk_item("d1", vec![cacache_s.clone(), cacache_s.clone()]), mk_item("d2", vec![cacache_s.clone()])], volumes: vec![] };
+        let r_ref = clean(&cfg, &files, &plan_refuse, &[("d1".into(), Some(CleanAction::Tool)), ("d2".into(), Some(CleanAction::Tool))], &opts);
+        assert_eq!(r_ref.outcomes[0].result, "refused", "{:?}", r_ref.outcomes);
+        assert_eq!(r_ref.outcomes[1].result, "done", "{:?}", r_ref.outcomes);
+        assert_eq!(r_ref.outcomes[1].predicted_now, 4096);
+
+        // Case 3: first item succeeds ("done") -> second item gets "done (already run)" with predicted_now == 0.
+        std::fs::create_dir_all(&cacache).unwrap();
+        std::fs::write(cacache.join("pkg.bin"), vec![1u8; 4096]).unwrap();
+        age_tree(&cacache, 4 * 3600);
+        let lw2 = newest_write(std::slice::from_ref(&cacache_s), Duration::from_secs(10)).unwrap();
+        let fid2 = disk_win::identity(&cacache_s).map(|x| x.1);
+        let mut i1 = mk_item("d1", vec![cacache_s.clone()]);
+        i1.last_write = lw2;
+        i1.path_ids = vec![fid2];
+        let mut i2 = mk_item("d2", vec![cacache_s.clone()]);
+        i2.last_write = lw2;
+        i2.path_ids = vec![fid2];
+        let plan_ok = PlanRecord { id: "p-ok".into(), unix: unix_now(), time: String::new(), items: vec![i1, i2], volumes: vec![] };
+        let r_ok = clean(&cfg, &files, &plan_ok, &[("d1".into(), Some(CleanAction::Tool)), ("d2".into(), Some(CleanAction::Tool))], &opts);
+        assert_eq!(r_ok.outcomes[0].result, "done", "{:?}", r_ok.outcomes);
+        assert_eq!(r_ok.outcomes[1].result, "done", "{:?}", r_ok.outcomes);
+        assert!(r_ok.outcomes[1].message.contains("already run"), "{}", r_ok.outcomes[1].message);
+        assert_eq!(r_ok.outcomes[1].predicted_now, 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bin_manifest_written_on_clean_read_o1_and_updated_on_undo() {
+        let root = std::env::temp_dir().join(format!("amg-clean-manifest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let game = root.join("Game");
+        let logs = game.join(r"Saved\Logs");
+        let crashes = game.join(r"Saved\Crashes");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::create_dir_all(&crashes).unwrap();
+        std::fs::write(game.join("Game.uproject"), REAL_UPROJECT).unwrap();
+        std::fs::write(logs.join("a.log"), vec![1u8; 1000]).unwrap();
+        std::fs::write(crashes.join("c.dmp"), vec![2u8; 2500]).unwrap();
+        age_tree(&root, 4 * 3600);
+
+        let vr = root.display().to_string();
+        let make_item = |id: &str, key: &str, title: &str, p: &Path, logical: Option<u64>| {
+            let ps = vec![p.display().to_string()];
+            let (class, tool) = catalog_class(key).unwrap();
+            PlannedItem {
+                id: id.into(),
+                key: key.into(),
+                class,
+                title: title.into(),
+                path_ids: vec![disk_win::identity(&ps[0]).map(|x| x.1)],
+                last_write: newest_write(&ps, Duration::from_secs(10)).unwrap(),
+                paths: ps,
+                volume: Some(vr.clone()),
+                volume_root: Some(vr.clone()),
+                frees_alone: Some(4096),
+                confidence: "exact".into(),
+                tool,
+                unmeasurable: None,
+                logical_size: logical,
+            }
+        };
+        let plan = PlanRecord {
+            id: "pm".into(),
+            unix: unix_now(),
+            time: String::new(),
+            items: vec![make_item("d1", "ue:logs", "Logs", &logs, Some(12345)), make_item("d2", "ue:crashes", "Crashes", &crashes, None)],
+            volumes: vec![],
+        };
+        let files = DiskFiles::in_dir(root.join("data"));
+        let res = clean(&crate::config::Config::builtin(), &files, &plan, &[("d1".into(), Some(CleanAction::Bin)), ("d2".into(), Some(CleanAction::Bin))], &test_opts());
+        assert_eq!(res.outcomes[0].result, "done", "{:?}", res.outcomes);
+        assert_eq!(res.outcomes[1].result, "done", "{:?}", res.outcomes);
+
+        let run_dir = root.join(BIN_DIR).join(&res.run_id);
+        let manifest_path = run_dir.join(BIN_MANIFEST);
+        assert!(manifest_path.is_file(), "manifest.json must exist");
+        assert!(!run_dir.join(BIN_IN_PROGRESS).exists(), ".in_progress must be removed");
+
+        let runs = bin_runs(&files, std::slice::from_ref(&vr));
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].holds, 12345 + 2500);
+
+        // Overwrite manifest holds to prove bin_runs reads manifest in O(1) without walking disk.
+        let mut m: BinManifest = serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        m.holds = 999_999;
+        write_atomic(&manifest_path, &serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+        let runs_o1 = bin_runs(&files, std::slice::from_ref(&vr));
+        assert_eq!(runs_o1[0].holds, 999_999);
+
+        // Partial undo (undo d1 only): manifest remains with entry d2's bytes (2500).
+        let u1 = undo(&files, Some(&format!("{}-1", res.run_id)));
+        assert_eq!(u1[0].result, "undone", "{:?}", u1);
+        assert!(logs.join("a.log").is_file());
+        assert!(manifest_path.is_file());
+        let runs_partial = bin_runs(&files, std::slice::from_ref(&vr));
+        assert_eq!(runs_partial.len(), 1);
+        assert_eq!(runs_partial[0].holds, 2500);
+
+        // Full undo (undo d2): manifest and run_dir are completely removed.
+        let u2 = undo(&files, Some(&format!("{}-2", res.run_id)));
+        assert_eq!(u2[0].result, "undone", "{:?}", u2);
+        assert!(crashes.join("c.dmp").is_file());
+        assert!(!run_dir.exists(), "run dir must be removed on full undo");
+        assert!(bin_runs(&files, std::slice::from_ref(&vr)).is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bin_runs_backfills_legacy_and_corrupt_manifest_and_counts_nested_user_manifest() {
+        let root = std::env::temp_dir().join(format!("amg-clean-backfill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let legacy_slot = root.join(BIN_DIR).join("legacy-run").join("1-0").join("Logs");
+        let corrupt_slot = root.join(BIN_DIR).join("corrupt-run").join("1-0").join("Logs");
+        std::fs::create_dir_all(&legacy_slot).unwrap();
+        std::fs::create_dir_all(&corrupt_slot).unwrap();
+        std::fs::write(legacy_slot.join("a.log"), vec![1u8; 42]).unwrap();
+        // A user file also named manifest.json inside <slot>\<name>\ MUST be counted in holds!
+        std::fs::write(legacy_slot.join("manifest.json"), vec![2u8; 10]).unwrap();
+        std::fs::write(corrupt_slot.join("b.log"), vec![3u8; 17]).unwrap();
+        std::fs::write(root.join(BIN_DIR).join("corrupt-run").join(BIN_MANIFEST), b"{not valid json").unwrap();
+
+        let files = DiskFiles::in_dir(root.join("data"));
+        let vr = root.display().to_string();
+        let runs = bin_runs(&files, std::slice::from_ref(&vr));
+        assert_eq!(runs.len(), 2);
+        let legacy = runs.iter().find(|r| r.run_id == "legacy-run").unwrap();
+        let corrupt = runs.iter().find(|r| r.run_id == "corrupt-run").unwrap();
+        assert_eq!(legacy.holds, 52);
+        assert_eq!(corrupt.holds, 17);
+        assert!(root.join(BIN_DIR).join("legacy-run").join(BIN_MANIFEST).is_file());
+        assert!(serde_json::from_str::<BinManifest>(&std::fs::read_to_string(root.join(BIN_DIR).join("corrupt-run").join(BIN_MANIFEST)).unwrap()).is_ok());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn batched_git_ls_matches_exact_boundaries_and_chunks_over_24kb() {
+        // 1. Pure boundary matching: `dir` vs `dir2` vs `dir_file`, nested `dir/sub`, case & special chars.
+        let queries = vec![
+            (":(literal,icase)DIR".to_string(), norm("DIR")),
+            (":(literal,icase)dir/sub".to_string(), norm("dir/sub")),
+            (":(literal,icase)Saved/[ab]".to_string(), norm("Saved/[ab]")),
+        ];
+        let mut counts = vec![0usize; queries.len()];
+        let out = b"dir/a.txt\0dir/sub/x.txt\0dir2/b.txt\0dir_file\0Saved/[ab]/c.txt\0";
+        parse_git_ls_batch(out, &queries, &mut counts);
+        assert_eq!(counts, vec![2, 1, 1], "dir2 and dir_file must not match dir; dir and dir/sub must both count");
+
+        // 2. Real git repo: chunking >24,576 UTF-16 code units, duplicate queries, special chars, and safe.directory abort.
+        let root = std::env::temp_dir().join(format!("amg-clean-gitbatch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let rs = root.display().to_string();
+        if run_with_timeout(Path::new("git"), &["-C", &rs, "init", "-q"], Duration::from_secs(20)).is_err() {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+
+        let mut query_paths: Vec<PathBuf> = Vec::with_capacity(520);
+        let mut query_is_global: Vec<bool> = Vec::with_capacity(520);
+        for i in 0..520usize {
+            let folder = format!("plugin_with_a_fairly_long_directory_name_{:04}_intermediate", i);
+            let p = root.join(&folder);
+            std::fs::create_dir_all(&p).unwrap();
+            if i == 0 || i == 250 || i == 519 {
+                std::fs::write(p.join("tracked.txt"), b"x").unwrap();
+                run_with_timeout(Path::new("git"), &["-C", &rs, "add", &format!("{}/tracked.txt", folder)], Duration::from_secs(20)).unwrap();
+            }
+            query_paths.push(p);
+            query_is_global.push(false);
+        }
+        // Special pathspec chars & prefix collision in same batch.
+        for special in ["Saved/[ab]", "-dash", "!bang", "(paren)", "dir", "dir2"] {
+            let p = root.join(special);
+            std::fs::create_dir_all(&p).unwrap();
+            query_paths.push(p);
+            query_is_global.push(false);
+        }
+        std::fs::write(root.join("dir2/only_dir2.txt"), b"x").unwrap();
+        run_with_timeout(Path::new("git"), &["-C", &rs, "add", "dir2/only_dir2.txt"], Duration::from_secs(20)).unwrap();
+
+        let qs: Vec<(&Path, bool)> = query_paths.iter().zip(query_is_global.iter()).map(|(p, g)| (p.as_path(), *g)).collect();
+        let answers = resolve_git_checks_env(&qs, None, &[]);
+        assert_eq!(answers.len(), qs.len());
+        assert_eq!(answers[0], GitCheck::Tracked(1));
+        assert_eq!(answers[250], GitCheck::Tracked(1));
+        assert_eq!(answers[519], GitCheck::Tracked(1));
+        for (i, a) in answers.iter().enumerate().take(519).skip(1) {
+            if i != 250 {
+                assert_eq!(*a, GitCheck::Clean, "index {}", i);
+            }
+        }
+        assert_eq!(answers[520], GitCheck::Clean); // Saved/[ab]
+        assert_eq!(answers[521], GitCheck::Clean); // -dash
+        assert_eq!(answers[522], GitCheck::Clean); // !bang
+        assert_eq!(answers[523], GitCheck::Clean); // (paren)
+        assert_eq!(answers[524], GitCheck::Clean); // dir (must NOT match dir2!)
+        assert_eq!(answers[525], GitCheck::Tracked(1)); // dir2
+
+        // safe.directory abort across chunked repo: all paths fail cleanly.
+        let safe_answers = resolve_git_checks_env(&qs, None, &[("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")]);
+        assert!(safe_answers.iter().all(|a| matches!(a, GitCheck::Failed(m) if m.contains("safe.directory"))));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn global_cache_skips_userprofile_dot_git_but_protects_subrepo() {
+        let root = std::env::temp_dir().join(format!("amg-clean-globalgit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let fake_profile = root.join("profile");
+        let global_cache = fake_profile.join(r"AppData\Local\npm-cache\_cacache");
+        let proj_inter = fake_profile.join(r"Game\Intermediate");
+        let subrepo = fake_profile.join("subrepo");
+        let global_in_subrepo = subrepo.join("DDC");
+        std::fs::create_dir_all(&global_cache).unwrap();
+        std::fs::create_dir_all(&proj_inter).unwrap();
+        std::fs::create_dir_all(&global_in_subrepo).unwrap();
+
+        let prof_s = fake_profile.display().to_string();
+        if run_with_timeout(Path::new("git"), &["-C", &prof_s, "init", "-q"], Duration::from_secs(20)).is_err() {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        std::fs::write(global_cache.join("pkg.bin"), b"cache").unwrap();
+        std::fs::write(proj_inter.join("obj.bin"), b"obj").unwrap();
+        run_with_timeout(Path::new("git"), &["-C", &prof_s, "add", "AppData/Local/npm-cache/_cacache/pkg.bin", "Game/Intermediate/obj.bin"], Duration::from_secs(20)).unwrap();
+
+        let sub_s = subrepo.display().to_string();
+        run_with_timeout(Path::new("git"), &["-C", &sub_s, "init", "-q"], Duration::from_secs(20)).unwrap();
+        std::fs::write(global_in_subrepo.join("kept.ddc"), b"ddc").unwrap();
+        run_with_timeout(Path::new("git"), &["-C", &sub_s, "add", "DDC/kept.ddc"], Duration::from_secs(20)).unwrap();
+
+        // Even with GIT_TEST_ASSUME_DIFFERENT_OWNER=1 on profile/.git, global_cache must skip profile/.git -> NotRepo (0 git spawns).
+        let profile_str = fake_profile.display().to_string();
+        let res = resolve_git_checks_env(
+            &[
+                (&global_cache, true),
+                (&proj_inter, false),
+                (&global_in_subrepo, true),
+            ],
+            Some(&profile_str),
+            &[("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")],
+        );
+        assert_eq!(res[0], GitCheck::NotRepo, "global cache outside sub-repos must skip %USERPROFILE%\\.git");
+        assert!(matches!(&res[1], GitCheck::Failed(m) if m.contains("safe.directory")), "project item must still check %USERPROFILE%\\.git: {:?}", res[1]);
+        assert!(matches!(&res[2], GitCheck::Failed(m) if m.contains("safe.directory")), "global cache inside sub-repo must check sub-repo: {:?}", res[2]);
+
+        // Without owner mismatch, sub-repo tracked file protects global_in_subrepo, while global_cache stays NotRepo.
+        let res_ok = resolve_git_checks_env(
+            &[
+                (&global_cache, true),
+                (&proj_inter, false),
+                (&global_in_subrepo, true),
+            ],
+            Some(&profile_str),
+            &[],
+        );
+        assert_eq!(res_ok[0], GitCheck::NotRepo);
+        assert_eq!(res_ok[1], GitCheck::Tracked(1));
+        assert_eq!(res_ok[2], GitCheck::Tracked(1));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn clean_merged_walk_batched_git_and_refusal_order_multi_path() {
+        let root = std::env::temp_dir().join(format!("amg-clean-merged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let game = root.join("Game");
+        let inter_clean = game.join("Intermediate");
+        let plugin_dirty = game.join(r"Plugins\Foo\Intermediate");
+        let plugin_repo = game.join(r"Plugins\Bar\Intermediate");
+        let outer_target = root.join("OutsideRepo");
+        std::fs::create_dir_all(&inter_clean).unwrap();
+        std::fs::create_dir_all(&plugin_dirty).unwrap();
+        std::fs::create_dir_all(plugin_repo.join(r"nested\.git\objects")).unwrap();
+        std::fs::create_dir_all(outer_target.join(".git")).unwrap();
+        std::fs::write(game.join("Game.uproject"), REAL_UPROJECT).unwrap();
+        std::fs::write(inter_clean.join("a.obj"), vec![1u8; 1024]).unwrap();
+        std::fs::write(plugin_dirty.join("tracked.obj"), b"t").unwrap();
+        std::fs::write(plugin_repo.join(r"nested\.git\objects\x"), b"g").unwrap();
+
+        // A child junction inside inter_clean pointing to outer_target (which has .git) must NOT trigger holds_repo.
+        let j_ok = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(inter_clean.join("child_link"))
+            .arg(&outer_target)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        let gs = game.display().to_string();
+        if run_with_timeout(Path::new("git"), &["-C", &gs, "init", "-q"], Duration::from_secs(20)).is_err() {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        run_with_timeout(Path::new("git"), &["-C", &gs, "add", "Plugins/Foo/Intermediate/tracked.obj"], Duration::from_secs(20)).unwrap();
+
+        age_tree(&root, 4 * 3600);
+        if j_ok {
+            use std::os::windows::fs::OpenOptionsExt;
+            let when = std::time::SystemTime::now() - Duration::from_secs(4 * 3600);
+            if let Ok(f) = std::fs::OpenOptions::new().access_mode(0x100).custom_flags(0x0200_0000 | 0x0020_0000).open(inter_clean.join("child_link")) {
+                let _ = f.set_modified(when);
+            }
+        }
+
+        let mk = |id: &str, key: &str, paths: Vec<PathBuf>| -> PlannedItem {
+            let ps: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+            let (vr, guid) = disk_win::volume_of(&ps[0]).unwrap();
+            let (class, tool) = catalog_class(key).unwrap();
+            PlannedItem {
+                id: id.into(),
+                key: key.into(),
+                class,
+                title: id.into(),
+                path_ids: ps.iter().map(|p| disk_win::identity(p).map(|x| x.1)).collect(),
+                last_write: newest_write(&ps, Duration::from_secs(10)).unwrap(),
+                paths: ps,
+                volume: Some(guid),
+                volume_root: Some(vr),
+                frees_alone: Some(1024),
+                confidence: "exact".into(),
+                tool,
+                unmeasurable: None,
+                logical_size: None,
+            }
+        };
+
+        // d1: clean Intermediate (with child junction if created) -> cleaned!
+        // d2: multi-path [plugin_repo (holds .git), plugin_dirty (git tracked)] -> MUST refuse with path 0's holds_repo!
+        // d3: plugin_dirty -> refused by batched git ls-files!
+        let plan = PlanRecord {
+            id: "pmix".into(),
+            unix: unix_now(),
+            time: String::new(),
+            items: vec![
+                mk("d1", "ue:intermediate", vec![inter_clean.clone()]),
+                mk("d2", "ue:plugin_intermediate", vec![plugin_repo.clone(), plugin_dirty.clone()]),
+                mk("d3", "ue:plugin_intermediate", vec![plugin_dirty.clone()]),
+            ],
+            volumes: vec![],
+        };
+
+        let files = DiskFiles::in_dir(root.join("data"));
+        let mut opts = test_opts();
+        opts.skip_git = false;
+        let res = clean(
+            &crate::config::Config::builtin(),
+            &files,
+            &plan,
+            &[("d1".into(), Some(CleanAction::Now)), ("d2".into(), Some(CleanAction::Now)), ("d3".into(), Some(CleanAction::Now))],
+            &opts,
+        );
+        assert_eq!(res.outcomes[0].result, "done", "{:?}", res.outcomes[0]);
+        assert!(!inter_clean.exists());
+        if j_ok {
+            assert!(outer_target.join(".git").is_dir(), "child junction target must be untouched");
+        }
+        assert_eq!(res.outcomes[1].result, "refused");
+        assert!(res.outcomes[1].message.contains("git repository"), "path 0 holds_repo must win before path 1 git: {}", res.outcomes[1].message);
+        assert_eq!(res.outcomes[2].result, "refused");
+        assert!(res.outcomes[2].message.contains("Git tracks 1 file"), "{}", res.outcomes[2].message);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn offered_actions_and_agent_rules_for_git_lfs_and_zen() {
+        assert_eq!(offered_actions("git:lfs", "review", None, true), Vec::<CleanAction>::new());
+        assert_eq!(offered_actions("git:lfs", "review", Some("git-lfs"), true), vec![CleanAction::Tool]);
+        assert!(!agent_may_clean("git:lfs"));
+
+        assert_eq!(offered_actions("ue:zen", "disposable", None, true), Vec::<CleanAction>::new());
+        assert_eq!(offered_actions("ue:zen", "disposable", Some("zen"), true), vec![CleanAction::Tool]);
+        assert!(!agent_may_clean("ue:zen"));
+
+        assert_eq!(offered_actions("git:loose_objects", "disposable", Some("git-maintenance"), true), vec![CleanAction::Tool]);
+        assert_eq!(offered_actions("ue:pdb", "review", None, true), Vec::<CleanAction>::new());
+    }
+
+    #[test]
+    fn catalog_pattern_matching_covers_ipch_and_git_variants() {
+        assert!(rel_matches_catalog(r".vs\MyProj\v17\ipch", r".vs\...\ipch", false));
+        assert!(!rel_matches_catalog(r".vs\ipch", r".vs\...\ipch", false));
+        assert!(rel_matches_git_catalog(r".git\lfs\objects", r".git\lfs\objects", "git:lfs"));
+        assert!(rel_matches_git_catalog(r"lfs\objects", r".git\lfs\objects", "git:lfs"));
+        assert!(rel_matches_git_catalog(r".git\modules\sub\lfs\objects", r".git\lfs\objects", "git:lfs"));
+        assert!(rel_matches_git_catalog(r".git\objects\pack\tmp_pack_abc", r".git\objects\pack\tmp_pack_*", "git:tmp_packs"));
+        assert!(rel_matches_git_catalog(r"objects\pack\tmp_pack_abc", r".git\objects\pack\tmp_pack_*", "git:tmp_packs"));
+    }
+
+    #[test]
+    fn measured_words_retrim_advice_never_uses_freed() {
+        let meas = Measured {
+            measured_freed: 100 << 20,
+            watched_sec: WATCH_MAX_SEC,
+            appeared_after_sec: None,
+            settled: false,
+            retrim_recommended: true,
+            refs_reserved_bytes: Some(2 * G),
+            ..Default::default()
+        };
+        let (t, b) = measured_words("E:", 4 * G, &meas, true);
+        assert!(b.contains("Optimize-Volume -DriveLetter E -ReTrim"), "{}", b);
+        assert!(!t.contains("Freed") && !t.contains("freed") && !b.contains("Freed") && !b.contains("freed"), "{} / {}", t, b);
+    }
+
+    #[test]
+    fn dir_size_handles_single_file_and_long_paths() {
+        let root = std::env::temp_dir().join(format!("amg-dirsize-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let f = root.join("single.bin");
+        std::fs::write(&f, vec![7u8; 4096]).unwrap();
+        assert_eq!(dir_size(&f), 4096);
+
+        let mut deep = root.clone();
+        for i in 0..16 {
+            deep.push(format!("very_long_nested_directory_segment_{:02}_padding", i));
+        }
+        std::fs::create_dir_all(PathBuf::from(disk_win::long_path(&deep))).unwrap();
+        let deep_file = deep.join("deep_payload.bin");
+        assert!(deep_file.display().to_string().len() > 260);
+        std::fs::write(PathBuf::from(disk_win::long_path(&deep_file)), vec![3u8; 2048]).unwrap();
+        assert_eq!(dir_size(&deep), 2048);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn clean_git_tools_run_per_repo_and_validate_common_dir() {
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("amg-git-tool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let r1 = root.join("repo1");
+        let r2 = root.join("repo2");
+        std::fs::create_dir_all(&r1).unwrap();
+        std::fs::create_dir_all(&r2).unwrap();
+        for r in [&r1, &r2] {
+            assert!(std::process::Command::new("git").arg("-C").arg(r).arg("init").output().unwrap().status.success());
+        }
+        let tmp1 = r1.join(r".git\objects\pack\tmp_pack_1");
+        let tmp2 = r2.join(r".git\objects\pack\tmp_pack_2");
+        std::fs::create_dir_all(tmp1.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(tmp2.parent().unwrap()).unwrap();
+        std::fs::write(&tmp1, vec![1u8; 1024]).unwrap();
+        std::fs::write(&tmp2, vec![2u8; 1024]).unwrap();
+
+        let r1s = r1.display().to_string();
+        let (vr, guid) = disk_win::volume_of(&r1s).unwrap();
+        let (class, tool) = catalog_class("git:tmp_packs").unwrap();
+        let mk = |id: &str, p: &Path| -> PlannedItem {
+            let ps = p.display().to_string();
+            PlannedItem {
+                id: id.into(),
+                key: "git:tmp_packs".into(),
+                class: class.clone(),
+                title: id.into(),
+                path_ids: vec![disk_win::identity(&ps).map(|x| x.1)],
+                last_write: 0,
+                paths: vec![ps],
+                volume: Some(guid.clone()),
+                volume_root: Some(vr.clone()),
+                frees_alone: Some(1024),
+                confidence: "exact".into(),
+                tool: tool.clone(),
+                unmeasurable: None,
+                logical_size: None,
+            }
+        };
+        let plan = PlanRecord {
+            id: "pgit".into(),
+            unix: unix_now(),
+            time: String::new(),
+            items: vec![mk("d1", &tmp1), mk("d2", &tmp2)],
+            volumes: vec![],
+        };
+        let files = DiskFiles::in_dir(root.join("data"));
+        let mut opts = test_opts();
+        opts.skip_git = false;
+        let res = clean(
+            &crate::config::Config::builtin(),
+            &files,
+            &plan,
+            &[("d1".into(), Some(CleanAction::Tool)), ("d2".into(), Some(CleanAction::Tool))],
+            &opts,
+        );
+        assert_eq!(res.outcomes[0].result, "done", "{:?}", res.outcomes[0]);
+        assert_eq!(res.outcomes[1].result, "done", "{:?}", res.outcomes[1]);
+        // Repo 2 must actually run its own git command rather than reporting "already run" from repo 1.
+        assert!(!res.outcomes[1].message.contains("already run"), "repo2 should not share repo1 tools_run key: {}", res.outcomes[1].message);
+
+        // Tampered non-git target fails rev-parse validation.
+        let fake_git_dir = root.join(r"not_a_repo\.git\objects\pack");
+        std::fs::create_dir_all(&fake_git_dir).unwrap();
+        let cmd = tool_command("git-prune-tmp").unwrap();
+        let bad = tool_clean(&cmd, None, &[fake_git_dir.display().to_string()], Some(512));
+        assert_eq!(bad.result, "refused", "{:?}", bad);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn run_cmd_timeout_kills_nested_process_tree_without_hanging() {
+        let t0 = Instant::now();
+        let res = run_cmd(
+            Path::new("cmd.exe"),
+            &["/c", "cmd.exe /c ping -n 30 127.0.0.1"],
+            Duration::from_millis(300),
+            &[],
+        );
+        assert_eq!(res, Err(RunError::TimedOut));
+        assert!(t0.elapsed() < Duration::from_secs(5), "run_cmd took {:?} (grandchild pipe leaked?)", t0.elapsed());
+    }
+
+    #[test]
+    fn refusal_unconditionally_blocks_git_items_even_if_class_overridden() {
+        let mut item = proj_item("git:lfs", "regenerable", r"D:\repo\.git\lfs\objects");
+        item.action = None;
+        assert!(refusal(&item, &[proj_facts(r"D:\repo\.git\lfs\objects")]).is_some());
+        item.action = Some(CleanAction::Now);
+        assert!(refusal(&item, &[proj_facts(r"D:\repo\.git\lfs\objects")]).is_some());
+        item.action = Some(CleanAction::Bin);
+        assert!(refusal(&item, &[proj_facts(r"D:\repo\.git\lfs\objects")]).is_some());
+        item.action = Some(CleanAction::Tool);
+        item.allow_git_tool = false;
+        assert!(refusal(&item, &[proj_facts(r"D:\repo\.git\lfs\objects")]).is_some());
+    }
+
+    #[test]
+    fn t5_relocated_ue_ddc_and_zen_cleanable_without_process_env() {
+        // Regression test for Bug T5-2.1
+        let root = std::env::temp_dir().join(format!("amg-t5-ddc-reloc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ddc = root.join("Relocated").join("ue-ddc");
+        let zen = root.join("Relocated").join("ue-zen");
+        std::fs::create_dir_all(&ddc).unwrap();
+        std::fs::create_dir_all(&zen).unwrap();
+        std::fs::write(ddc.join("pak.bin"), vec![1u8; 4096]).unwrap();
+        std::fs::write(zen.join("zen.dat"), vec![2u8; 4096]).unwrap();
+        age_tree(&ddc, 4 * 3600);
+        age_tree(&zen, 4 * 3600);
+
+        let files = DiskFiles::in_dir(root.join("data"));
+        std::fs::create_dir_all(&files.dir).unwrap();
+        files.save_relocate_record(&crate::disk_relocate::RelocateRecord {
+            time: "t".into(),
+            unix: 1000,
+            store: r"HKCU\Software\AtherMemGuard-test\t5".into(),
+            entries: vec![
+                crate::disk_relocate::RecordEntry {
+                    name: "UE-LocalDataCachePath".into(),
+                    previous: None,
+                    new_value: ddc.display().to_string(),
+                    old_location: r"C:\Users\Old\AppData\Local\UnrealEngine\Common\DerivedDataCache".into(),
+                },
+                crate::disk_relocate::RecordEntry {
+                    name: "UE-ZenSubprocessDataPath".into(),
+                    previous: None,
+                    new_value: zen.display().to_string(),
+                    old_location: r"C:\Users\Old\AppData\Local\UnrealEngine\Common\Zen".into(),
+                },
+            ],
+            undone: false,
+        }).unwrap();
+
+        let plan_ddc = plan_one("ue:global_ddc", "Unreal shared DDC", std::slice::from_ref(&ddc), 4096);
+        let r_ddc = clean(&crate::config::Config::builtin(), &files, &plan_ddc, &[("d1".into(), Some(CleanAction::Now))], &test_opts());
+        assert_eq!(r_ddc.outcomes[0].result, "done", "{:?}", r_ddc.outcomes[0]);
+        assert!(!ddc.join("pak.bin").exists());
+
+        // For ue:zen, check item_check populates allowed_paths with the relocated Zen path even without env var.
+        let plan_zen = plan_one("ue:zen", "Unreal Zen cache", std::slice::from_ref(&zen), 4096);
+        let chk_zen = item_check(&plan_zen.items[0], &crate::config::DiskSettings::default(), &files, &(vec![], None));
+        assert!(chk_zen.allowed_paths.contains(&norm(&zen.display().to_string())), "{:?}", chk_zen.allowed_paths);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn t5_git_ls_non_ascii_utf8_and_measure_drop_after_rise() {
+        let root = std::env::temp_dir().join(format!("amg-t5-git-utf8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let inter = root.join("Intermediate");
+        std::fs::create_dir_all(&inter).unwrap();
+        let r = |args: &[&str]| run_with_timeout(Path::new("git"), args, Duration::from_secs(20));
+        let rs = root.display().to_string();
+        if r(&["-C", &rs, "init", "-q"]).is_ok() {
+            std::fs::write(inter.join("café_日本語.uasset"), b"tracked").unwrap();
+            r(&["-C", &rs, "add", "Intermediate/café_日本語.uasset"]).unwrap();
+            assert_eq!(git_check(&inter), GitCheck::Tracked(1));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Measure drop after rise flags other_activity = true
+        let before = 200 * G;
+        let mut m = Measure::new(before, 2 * G, 0);
+        m.push(1, before + 2 * G);
+        m.push(2, before + 2 * G);
+        m.push(3, before + G);
+        m.push(4, before + G);
+        m.push(5, before + G);
+        let res = m.result();
+        assert!(res.settled && res.other_activity && res.measured_freed == G as i64, "{:?}", res);
     }
 }

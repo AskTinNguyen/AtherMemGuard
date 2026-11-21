@@ -20,7 +20,9 @@ use super::setup::{paint_link, wrap_hard};
 use super::theme::*;
 use super::window::{self, Cursor, Event, Host, MouseButton, Surface, WindowSpec};
 use crate::engine::Level;
-use crate::history::{GroupRam, Sample};
+use crate::history::Sample;
+#[cfg(any(test, feature = "ui-snapshots"))]
+use crate::history::GroupRam;
 
 pub const KIND: &str = "history";
 pub const TITLE: &str = "Ather MemGuard — Memory history";
@@ -91,10 +93,12 @@ impl HistorySource for RealHistorySource {
 /// The mockup's day, repeated for seven days: an editor started at 08:30 that grows to
 /// 61 GB, two builds, memory freed twice around 12:10 and 12:25, a short critical spell,
 /// and an editor restart at 12:45. "Now" is 14:00 on 14 Nov 2026. Deterministic.
+#[cfg(any(test, feature = "ui-snapshots"))]
 pub struct FakeHistory {
     pub empty: bool,
 }
 
+#[cfg(any(test, feature = "ui-snapshots"))]
 impl FakeHistory {
     pub fn mockup() -> FakeHistory {
         FakeHistory { empty: false }
@@ -173,6 +177,7 @@ impl FakeHistory {
     }
 }
 
+#[cfg(any(test, feature = "ui-snapshots"))]
 impl HistorySource for FakeHistory {
     fn samples(&self, since: Duration) -> Vec<Sample> {
         if self.empty {
@@ -404,6 +409,7 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
 }
 
+#[cfg(any(test, feature = "ui-snapshots"))]
 fn local_time_string(unix: i64, offset: i64) -> String {
     let l = unix + offset;
     let (y, m, d) = civil_from_days(l.div_euclid(86_400));
@@ -535,6 +541,8 @@ pub struct Layout {
     pub footer: Rect,
     pub footer_text: Rect,
     pub link: Rect,
+    pub(crate) range_segs: Vec<Rect>,
+    pub(crate) tooltip_h: i32,
 }
 
 impl Layout {
@@ -554,6 +562,22 @@ impl Layout {
     }
 }
 
+struct ChartCache {
+    canvas: Canvas,
+    chart: Rect,
+    plot: Rect,
+    scale: Scale,
+    gen: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct HoverState {
+    target: Option<Act>,
+    range_seg: Option<usize>,
+    sample_t: Option<i64>,
+    tooltip_by: Option<i32>,
+}
+
 pub struct HistoryWindow {
     source: Box<dyn HistorySource>,
     pub range: Range,
@@ -565,11 +589,14 @@ pub struct HistoryWindow {
     offset: i64,
     cards: Vec<(String, String)>,
     mouse: Option<Pt>,
+    hover: HoverState,
     pressed: Option<Act>,
     focus: Option<Act>,
     scale: Scale,
     size: (i32, i32),
     layout: Layout,
+    chart_gen: u64,
+    chart_cache: Option<ChartCache>,
     /// `latest_unix` of the source when the samples were last read.
     loaded_latest: Option<i64>,
 }
@@ -587,11 +614,14 @@ impl HistoryWindow {
             offset: 0,
             cards: Vec::new(),
             mouse: None,
+            hover: HoverState::default(),
             pressed: None,
             focus: None,
             scale: Scale(1.0),
             size: (960, 600),
             layout: Layout::default(),
+            chart_gen: 0,
+            chart_cache: None,
             loaded_latest: None,
         };
         w.reload();
@@ -603,6 +633,7 @@ impl HistoryWindow {
         self.reload();
     }
 
+    #[cfg(any(test, feature = "ui-snapshots"))]
     pub fn set_mouse(&mut self, p: Option<Pt>) {
         self.mouse = p;
     }
@@ -649,6 +680,7 @@ impl HistoryWindow {
         let raw: Vec<ChartPoint> = self.samples.iter().map(ChartPoint::from_sample).collect();
         self.points = downsample(&raw, MAX_POINTS);
         self.cards = cards(&self.samples);
+        self.chart_gen = self.chart_gen.wrapping_add(1);
     }
 
     pub fn layout(&self, c: &Canvas) -> Layout {
@@ -667,6 +699,17 @@ impl HistoryWindow {
             // Very narrow: pills under the headline.
             l.ranges = Rect::new(content.x, l.headline.bottom() + c.s(8.0), rw.min(content.w), rh);
         }
+        let seg_pad = c.s(3.0);
+        let seg_inner = l.ranges.inset(seg_pad, seg_pad);
+        let seg_n = Range::ALL.len() as i32;
+        l.range_segs = (0..seg_n)
+            .map(|i| {
+                let x0 = seg_inner.x + seg_inner.w * i / seg_n;
+                let x1 = seg_inner.x + seg_inner.w * (i + 1) / seg_n;
+                Rect::new(x0, seg_inner.y, x1 - x0, seg_inner.h)
+            })
+            .collect();
+        l.tooltip_h = c.s(10.0) * 2 + (c.line_height(F_HINT) + c.s(2.0)) * 4;
         let top = l.ranges.bottom().max(l.headline.bottom()) + c.s(16.0);
 
         let fh = c.s(44.0);
@@ -734,42 +777,71 @@ impl HistoryWindow {
 
     fn paint_series(&self, c: &mut Canvas, plot: Rect, f: impl Fn(&ChartPoint) -> f64, col: Rgb, width: f32, dashed: bool) {
         let gap = self.gap_secs();
-        let dash_on = c.s(4.0) as f64;
-        let dash_period = dash_on * 2.0;
-        let mut travelled = 0.0f64;
-        let mut prev: Option<(i64, f64, f64)> = None;
+        let mut runs: Vec<Vec<(f32, f32)>> = Vec::new();
+        let mut cur: Vec<(f32, f32)> = Vec::new();
+        let mut prev_t: Option<i64> = None;
         for p in &self.points {
-            let (x, y) = (self.x_of(plot, p.t), self.y_of(plot, f(p)));
-            if let Some((pt, px, py)) = prev {
-                if p.t - pt <= gap {
-                    if dashed {
-                        // Dashes measured along the whole line, so dense points still dash.
-                        let len = ((x - px).powi(2) + (y - py).powi(2)).sqrt();
-                        let mut s = 0.0;
-                        while s < len {
-                            let phase = (travelled + s) % dash_period;
-                            let run = if phase < dash_on { dash_on - phase } else { dash_period - phase };
-                            let e = (s + run).min(len);
-                            if phase < dash_on && len > 0.0 {
-                                let a = Pt::new((px + (x - px) * s / len).round() as i32, (py + (y - py) * s / len).round() as i32);
-                                let b = Pt::new((px + (x - px) * e / len).round() as i32, (py + (y - py) * e / len).round() as i32);
-                                c.line(a, b, col, width, false);
-                            }
-                            s = e;
-                        }
-                        travelled += len;
+            let pt = (self.x_of(plot, p.t) as f32, self.y_of(plot, f(p)) as f32);
+            if let Some(last_t) = prev_t {
+                if p.t - last_t > gap {
+                    if cur.len() >= 2 {
+                        runs.push(std::mem::take(&mut cur));
                     } else {
-                        c.line(Pt::new(px.round() as i32, py.round() as i32), Pt::new(x.round() as i32, y.round() as i32), col, width, false);
+                        cur.clear();
                     }
                 }
             }
-            prev = Some((p.t, x, y));
+            cur.push(pt);
+            prev_t = Some(p.t);
+        }
+        if cur.len() >= 2 {
+            runs.push(cur);
+        }
+        let dash_px = dashed.then(|| c.s(4.0).max(1) as f32);
+        c.polylines(&runs, col, width, dash_px);
+    }
+
+    fn paint_chart(&mut self, c: &mut Canvas, l: &Layout) {
+        let chart = l.chart;
+        let plot = l.plot;
+        if chart.w > 0 && chart.h > 0 {
+            let need_rebuild = match &self.chart_cache {
+                Some(cc) => cc.scale != c.scale || cc.gen != self.chart_gen || cc.chart != chart || cc.plot != plot,
+                None => true,
+            };
+            if need_rebuild {
+                let mut cc = self.chart_cache.take().unwrap_or_else(|| ChartCache {
+                    canvas: Canvas::probe(c.scale),
+                    chart,
+                    plot,
+                    scale: c.scale,
+                    gen: self.chart_gen,
+                });
+                cc.canvas.set_scale(c.scale);
+                cc.canvas.resize(chart.w, chart.h);
+                cc.canvas.fill_rect(cc.canvas.bounds(), BG);
+                let local_chart = Rect::new(0, 0, chart.w, chart.h);
+                let local_plot = Rect::new(plot.x - chart.x, plot.y - chart.y, plot.w, plot.h);
+                self.paint_chart_static(&mut cc.canvas, local_chart, local_plot);
+                cc.chart = chart;
+                cc.plot = plot;
+                cc.scale = c.scale;
+                cc.gen = self.chart_gen;
+                self.chart_cache = Some(cc);
+            }
+            if let Some(cc) = &self.chart_cache {
+                c.blit_canvas(&cc.canvas, chart.x, chart.y);
+            }
+        } else {
+            self.paint_chart_static(c, chart, plot);
+        }
+        // Hover: crosshair and readout.
+        if let Some(m) = self.mouse.filter(|m| plot.contains(*m)) {
+            self.paint_hover(c, plot, m);
         }
     }
 
-    fn paint_chart(&self, c: &mut Canvas, l: &Layout) {
-        let chart = l.chart;
-        let plot = l.plot;
+    fn paint_chart_static(&self, c: &mut Canvas, chart: Rect, plot: Rect) {
         c.fill_round_rect_bordered(chart, c.s(RADIUS), SURFACE, BORDER);
         if self.is_empty() {
             let tw = (chart.w - c.s(80.0)).min(c.s(420.0));
@@ -859,10 +931,6 @@ impl HistoryWindow {
             if x >= plot.x && x <= plot.right() {
                 c.fill_ellipse(Rect::new(x - d / 2, plot.bottom() - d / 2, d, d), ACCENT);
             }
-        }
-        // Hover: crosshair and readout.
-        if let Some(m) = self.mouse.filter(|m| plot.contains(*m)) {
-            self.paint_hover(c, plot, m);
         }
     }
 
@@ -971,14 +1039,39 @@ impl HistoryWindow {
         }
     }
 
+    fn hover_state(&self, p: Option<Pt>) -> HoverState {
+        let Some(p) = p else {
+            return HoverState::default();
+        };
+        let target = self.hit(p);
+        let range_seg = if target == Some(Act::Range) {
+            self.layout.range_segs.iter().position(|r| r.contains(p))
+        } else {
+            None
+        };
+        let (sample_t, tooltip_by) = if !self.is_empty() && self.layout.plot.contains(p) {
+            let plot = self.layout.plot;
+            let mut res = (None, None);
+            if let Some(sample) = self.nearest(plot, p.x) {
+                let mouse_t = (self.now - self.range.secs()) + ((p.x - plot.x) as f64 / plot.w.max(1) as f64 * self.range.secs() as f64) as i64;
+                if (sample.t - mouse_t).abs() <= self.gap_secs() {
+                    let h = self.layout.tooltip_h;
+                    let by = (p.y - h / 2).clamp(plot.y, (plot.bottom() - h).max(plot.y));
+                    res = (Some(sample.t), Some(by));
+                }
+            }
+            res
+        } else {
+            (None, None)
+        };
+        HoverState { target, range_seg, sample_t, tooltip_by }
+    }
+
     fn activate(&mut self, a: Act, p: Option<Pt>, host: &mut Host) {
         match a {
             Act::Range => {
                 let idx = match p {
-                    Some(p) => {
-                        let probe = Canvas::new(1, 1, self.scale);
-                        self.ranges_widget().hit(&probe, self.layout.ranges, p)
-                    }
+                    Some(p) => self.layout.range_segs.iter().position(|r| r.contains(p)),
                     None => Some((Range::ALL.iter().position(|r| *r == self.range).unwrap_or(0) + 1) % 4),
                 };
                 if let Some(i) = idx {
@@ -997,14 +1090,25 @@ impl HistoryWindow {
 
 impl Surface for HistoryWindow {
     fn paint(&mut self, c: &mut Canvas) {
+        if self.size == (c.width(), c.height()) && self.scale == c.scale {
+            if let Some(clip) = c.clip() {
+                if !self.layout.chart.is_empty() && self.layout.chart.encloses(&clip) && self.chart_cache.is_some() {
+                    let l = self.layout.clone();
+                    self.paint_chart(c, &l);
+                    self.hover = self.hover_state(self.mouse);
+                    return;
+                }
+            }
+        }
         self.scale = c.scale;
         self.size = (c.width(), c.height());
         let l = self.layout(c);
         c.fill_rect(c.bounds(), BG);
         c.spaced_text(l.eyebrow, "ATHER MEMGUARD", F_EYEBROW, MUTED, c.s(3.0), Align::Left);
         c.text(l.headline, "MEMORY HISTORY", F_CHART_HEADLINE, TEXT, Align::Left);
-        let over = |r: Rect| self.mouse.map(|m| r.contains(m)).unwrap_or(false);
-        let st = WState { hover: over(l.ranges), focused: self.focus == Some(Act::Range), mouse: self.mouse.filter(|m| l.ranges.contains(*m)), ..Default::default() };
+        let mouse = self.mouse;
+        let over = |r: Rect| mouse.map(|m| r.contains(m)).unwrap_or(false);
+        let st = WState { hover: over(l.ranges), focused: self.focus == Some(Act::Range), mouse: mouse.filter(|m| l.ranges.contains(*m)), ..Default::default() };
         self.ranges_widget().paint(c, l.ranges, &st);
         self.paint_chart(c, &l);
         self.paint_legend(c, &l);
@@ -1018,6 +1122,7 @@ impl Surface for HistoryWindow {
             focus_ring(c, l.link, c.s(3.0));
         }
         self.layout = l;
+        self.hover = self.hover_state(self.mouse);
     }
 
     fn event(&mut self, ev: Event, host: &mut Host) -> bool {
@@ -1035,11 +1140,29 @@ impl Surface for HistoryWindow {
             Event::MouseMove(p) => {
                 self.mouse = Some(p);
                 host.set_cursor(if self.hit(p).is_some() { Cursor::Hand } else { Cursor::Arrow });
-                host.invalidate();
+                let next = self.hover_state(Some(p));
+                if next != self.hover {
+                    let old = self.hover;
+                    self.hover = next;
+                    if (old.target, old.range_seg) != (next.target, next.range_seg) || self.layout.chart.is_empty() {
+                        host.invalidate();
+                    } else {
+                        host.invalidate_rect(self.layout.chart);
+                    }
+                }
             }
             Event::MouseLeave => {
                 self.mouse = None;
-                host.invalidate();
+                let old = std::mem::take(&mut self.hover);
+                if old.target.is_some() || old.range_seg.is_some() {
+                    host.invalidate();
+                } else if old.sample_t.is_some() {
+                    if !self.layout.chart.is_empty() {
+                        host.invalidate_rect(self.layout.chart);
+                    } else {
+                        host.invalidate();
+                    }
+                }
             }
             Event::MouseDown(p, MouseButton::Left) => {
                 self.pressed = self.hit(p);
@@ -1112,6 +1235,7 @@ pub fn open_history(source: Box<dyn HistorySource>) -> HWND {
 }
 
 /// Paint the window at `w` x `h` (96-DPI px), for snapshots.
+#[cfg(any(test, feature = "ui-snapshots"))]
 pub fn render(win: &mut HistoryWindow, scale: Scale, w: i32, h: i32) -> Canvas {
     let mut c = Canvas::new(scale.s(w as f32), scale.s(h as f32), scale);
     win.paint(&mut c);
@@ -1344,5 +1468,50 @@ mod tests {
         w.event(Event::MouseUp(p, MouseButton::Left), &mut host);
         assert_eq!(w.range, Range::H1);
         assert_eq!(w.samples.len(), 361);
+    }
+
+    #[test]
+    fn dirty_hover_chart_cache_and_polylines() {
+        let mut w = HistoryWindow::new(Box::new(FakeHistory::mockup()));
+        let mut c = Canvas::new(960, 600, Scale(1.0));
+        w.paint(&mut c);
+        assert!(w.chart_cache.is_some());
+        let gen0 = w.chart_gen;
+
+        // Moving inside whitespace outside targets/plot produces 0 invalidations.
+        let mut h0 = Host::detached((960, 600), Scale(1.0));
+        w.event(Event::MouseMove(Pt::new(2, 2)), &mut h0);
+        assert_eq!(h0.invalidations(), (0, 0));
+
+        // Moving inside plot over a sample produces a chart-only partial invalidation.
+        let plot = w.layout.plot;
+        let p = Pt::new(plot.cx(), plot.cy());
+        let mut h1 = Host::detached((960, 600), Scale(1.0));
+        w.event(Event::MouseMove(p), &mut h1);
+        assert_eq!(h1.invalidations(), (0, 1));
+
+        // Repeating the exact same point produces 0 invalidations.
+        let mut h2 = Host::detached((960, 600), Scale(1.0));
+        w.event(Event::MouseMove(p), &mut h2);
+        assert_eq!(h2.invalidations(), (0, 0));
+
+        // Moving onto ranges pill invalidates whole window.
+        let mut h3 = Host::detached((960, 600), Scale(1.0));
+        w.event(Event::MouseMove(Pt::new(w.layout.ranges.x + 10, w.layout.ranges.cy())), &mut h3);
+        assert_eq!(h3.invalidations(), (1, 0));
+
+        // Leaving from ranges invalidates whole window; leaving a second time is a no-op.
+        let mut h4 = Host::detached((960, 600), Scale(1.0));
+        w.event(Event::MouseLeave, &mut h4);
+        assert_eq!(h4.invalidations(), (1, 0));
+        let mut h5 = Host::detached((960, 600), Scale(1.0));
+        w.event(Event::MouseLeave, &mut h5);
+        assert_eq!(h5.invalidations(), (0, 0));
+
+        // Range switch bumps chart_gen and rebuilds ChartCache on next paint.
+        w.set_range(Range::H1);
+        assert!(w.chart_gen > gen0);
+        w.paint(&mut c);
+        assert_eq!(w.chart_cache.as_ref().unwrap().gen, w.chart_gen);
     }
 }

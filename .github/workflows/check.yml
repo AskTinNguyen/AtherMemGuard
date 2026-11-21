@@ -33,21 +33,30 @@ jobs:
             target
           key: windows-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: windows-cargo-
-      - name: Build
+      - name: Build (default gui)
         shell: pwsh
         run: |
           $env:RUSTFLAGS = '-D warnings'
           cargo build --locked
-      - name: Test
+      - name: Feature matrix (--no-default-features & ui-snapshots)
+        shell: pwsh
+        run: |
+          $env:RUSTFLAGS = '-D warnings'
+          cargo build --locked --no-default-features --bin memguard
+          cargo test --locked --no-default-features --lib --tests
+          cargo build --locked --features ui-snapshots --all-targets --examples
+      - name: Test (default gui)
         shell: pwsh
         run: |
           $env:RUSTFLAGS = '-D warnings'
           cargo test --locked
-      - name: Release build with the embedded CLI
+      - name: Release build (portable + embedded CLI)
         shell: pwsh
         run: |
-          cargo build --release --locked --bin memguard
+          $env:RUSTFLAGS = '-D warnings'
+          cargo build --release --locked --no-default-features --bin memguard
+          cargo build --release --locked --bin AtherMemGuard
           New-Item -ItemType Directory -Force target\embed | Out-Null
           Copy-Item target\release\memguard.exe target\embed\memguard.exe
           $env:MEMGUARD_CLI = "$PWD\target\embed\memguard.exe"
-          cargo build --release --locked --features embed-cli --bin AtherMemGuard
+          cargo build --release --locked --features gui,embed-cli --bin AtherMemGuard

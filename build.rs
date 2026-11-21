@@ -41,6 +41,102 @@ fn mark_build_folder_portable() {
     }
 }
 
+#[cfg(windows)]
+mod lznt1 {
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn RtlGetCompressionWorkSpaceSize(
+            compression_format_and_engine: u16,
+            compress_buffer_work_space_size: *mut u32,
+            compress_fragment_work_space_size: *mut u32,
+        ) -> i32;
+        fn RtlCompressBuffer(
+            compression_format_and_engine: u16,
+            uncompressed_buffer: *const u8,
+            uncompressed_buffer_size: u32,
+            compressed_buffer: *mut u8,
+            compressed_buffer_size: u32,
+            uncompressed_chunk_size: u32,
+            final_compressed_size: *mut u32,
+            work_space: *mut u8,
+        ) -> i32;
+    }
+
+    pub fn compress(data: &[u8]) -> Result<Vec<u8>, String> {
+        const LZNT1_FORMAT_ENGINE: u16 = 0x0102;
+        const CHUNK_SIZE: u32 = 4096;
+        let mut ws_size = 0u32;
+        let mut frag_size = 0u32;
+        let st = unsafe { RtlGetCompressionWorkSpaceSize(LZNT1_FORMAT_ENGINE, &mut ws_size, &mut frag_size) };
+        if st < 0 {
+            return Err(format!("RtlGetCompressionWorkSpaceSize failed: 0x{:08x}", st as u32));
+        }
+        let mut workspace = vec![0u8; ws_size as usize];
+        let cap = data.len() + (data.len() / 4096 + 1) * 4 + 64;
+        let mut compressed = vec![0u8; cap];
+        let mut final_size = 0u32;
+        let st = unsafe {
+            RtlCompressBuffer(
+                LZNT1_FORMAT_ENGINE,
+                data.as_ptr(),
+                data.len() as u32,
+                compressed.as_mut_ptr(),
+                compressed.len() as u32,
+                CHUNK_SIZE,
+                &mut final_size,
+                workspace.as_mut_ptr(),
+            )
+        };
+        if st < 0 {
+            return Err(format!("RtlCompressBuffer failed: 0x{:08x}", st as u32));
+        }
+        compressed.truncate(final_size as usize);
+        Ok(compressed)
+    }
+}
+
+#[cfg(windows)]
+fn embed_compressed_cli() {
+    if std::env::var_os("CARGO_FEATURE_EMBED_CLI").is_none() {
+        return;
+    }
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let cli_path = std::env::var_os("MEMGUARD_CLI")
+        .map(std::path::PathBuf::from)
+        .expect("MEMGUARD_CLI must be set when feature `embed-cli` is enabled");
+    println!("cargo:rerun-if-changed={}", cli_path.display());
+    let raw = std::fs::read(&cli_path)
+        .unwrap_or_else(|e| panic!("failed to read MEMGUARD_CLI {}: {e}", cli_path.display()));
+    const MAX_EMBEDDED_CLI_BYTES: usize = 64 * 1024 * 1024;
+    assert!(
+        !raw.is_empty() && raw.len() <= MAX_EMBEDDED_CLI_BYTES,
+        "MEMGUARD_CLI size {} out of range",
+        raw.len()
+    );
+    let amgz = if raw.starts_with(b"AMGZ") {
+        raw
+    } else {
+        assert!(
+            raw.starts_with(b"MZ"),
+            "MEMGUARD_CLI {} is not a Windows PE executable",
+            cli_path.display()
+        );
+        let compressed = lznt1::compress(&raw).expect("failed to LZNT1-compress MEMGUARD_CLI");
+        let mut out = Vec::with_capacity(8 + compressed.len());
+        out.extend_from_slice(b"AMGZ");
+        out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        out.extend_from_slice(&compressed);
+        out
+    };
+    let out_dir = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR missing"));
+    let amgz_path = out_dir.join("memguard.amgz");
+    std::fs::write(&amgz_path, &amgz)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", amgz_path.display()));
+    println!("cargo:rustc-env=MEMGUARD_CLI_EMBED={}", amgz_path.display());
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=res/app.ico");
     println!("cargo:rerun-if-changed=build.rs");
@@ -49,6 +145,8 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
+    #[cfg(windows)]
+    embed_compressed_cli();
     let mut res = winresource::WindowsResource::new();
     if std::path::Path::new("res/app.ico").exists() {
         res.set_icon("res/app.ico");

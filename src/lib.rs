@@ -35,8 +35,11 @@ mod doctor_win;
 pub mod engine;
 pub mod history;
 pub mod install;
+pub mod ipc;
+#[cfg(feature = "gui")]
 pub mod logo;
 pub mod mcp;
+#[cfg(feature = "gui")]
 pub mod net;
 pub mod ops;
 pub mod paths;
@@ -44,14 +47,65 @@ pub mod ramcheck; // Part G: RAM and BIOS check
 pub mod report_page;
 pub mod smbios; // Part G: firmware tables for the RAM check
 pub mod startup;
+#[cfg(feature = "gui")]
 pub mod tray;
+#[cfg(feature = "gui")]
 pub mod ui;
+#[cfg(feature = "gui")]
 pub mod updater;
 pub mod win;
 
 pub mod log {
     use std::fs;
-    use std::io::Write;
+    use std::io::{ErrorKind, Write};
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    static LOG_LOCK: Mutex<()> = Mutex::new(());
+
+    struct LockFile(Option<PathBuf>);
+
+    impl Drop for LockFile {
+        fn drop(&mut self) {
+            if let Some(p) = self.0.take() {
+                let _ = fs::remove_file(p);
+            }
+        }
+    }
+
+    fn acquire_lockfile(lock_path: &Path) -> LockFile {
+        let pid = std::process::id();
+        for attempt in 0..80u32 {
+            match fs::OpenOptions::new().write(true).create_new(true).open(lock_path) {
+                Ok(f) => {
+                    drop(f);
+                    return LockFile(Some(lock_path.to_path_buf()));
+                }
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    if let Ok(meta) = fs::metadata(lock_path) {
+                        if meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.elapsed().ok())
+                            .is_some_and(|age| age > Duration::from_secs(5))
+                        {
+                            let _ = fs::remove_file(lock_path);
+                            continue;
+                        }
+                    }
+                    let wait_ms = 2 + ((pid.wrapping_add(attempt)) % 5) as u64;
+                    std::thread::sleep(Duration::from_millis(wait_ms));
+                }
+                Err(_) => return LockFile(None),
+            }
+        }
+        LockFile(None)
+    }
+
+    fn is_sharing_err(e: &std::io::Error) -> bool {
+        e.kind() == ErrorKind::PermissionDenied || matches!(e.raw_os_error(), Some(5 | 32 | 33))
+    }
 
     /// Append one timestamped line to the log. Never fails loudly.
     pub fn write(msg: &str) {
@@ -59,15 +113,36 @@ pub mod log {
         if cfg!(test) {
             return;
         }
+        let line = format!("{}  {}\n", crate::win::local_time_string(), msg);
+        let _guard = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = crate::paths::log_file();
         let _ = fs::create_dir_all(crate::paths::data_dir());
+        let _file_lock = acquire_lockfile(&path.with_extension("log.lock"));
         if let Ok(meta) = fs::metadata(&path) {
             if meta.len() > 2 * 1024 * 1024 {
-                let _ = fs::rename(&path, path.with_extension("log.old"));
+                let old = path.with_extension("log.old");
+                for attempt in 0..8 {
+                    match fs::rename(&path, &old) {
+                        Ok(()) => break,
+                        Err(e) if is_sharing_err(&e) && attempt < 7 => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
             }
         }
-        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = writeln!(f, "{}  {}", crate::win::local_time_string(), msg);
+        for attempt in 0..8 {
+            match fs::OpenOptions::new().create(true).append(true).open(&path) {
+                Ok(mut f) => {
+                    let _ = f.write_all(line.as_bytes());
+                    break;
+                }
+                Err(e) if is_sharing_err(&e) && attempt < 7 => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
         }
     }
 }

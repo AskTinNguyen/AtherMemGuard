@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use athermemguard::config::{Config, Cpu, MemPriority, Target};
 use athermemguard::engine::{analyze, snapshot, Status};
-use athermemguard::{install, ops, paths, tray, win};
+use athermemguard::{install, ipc, ops, paths, win};
 
 #[derive(Parser)]
 #[command(name = "memguard", version, about = "Keeps this PC primed for agentic Unreal Engine work")]
@@ -753,6 +753,16 @@ enum Cmd {
     },
     /// Run the background engine in this console, without the tray icon
     Daemon,
+    /// Pause the running background app; other apps return to normal until resumed
+    Pause {
+        /// Automatically resume after this many minutes
+        #[arg(long, value_name = "N")]
+        minutes: Option<u64>,
+    },
+    /// Resume the running background app after a pause
+    Resume,
+    /// Reload settings.toml and team.toml in the running background app
+    Reload,
     /// Install for this user, start at sign-in and start now
     Install {
         /// Also put `memguard` on your PATH so agents and scripts can call it
@@ -770,6 +780,7 @@ enum Cmd {
     /// Stop the running background app; apps go back to normal
     Stop,
     /// Write the app icon to a file (used by the build)
+    #[cfg(feature = "gui")]
     #[command(hide = true)]
     WriteIcon { path: std::path::PathBuf },
     /// Show where the settings file is, check it, or change it
@@ -869,14 +880,9 @@ fn current_status(cfg: &Config) -> Status {
     let mut st = analyze(cfg, &snapshot());
     st.daemon = win::instance_running(paths::mutex());
     st.disk = athermemguard::disk::status_brief(cfg);
-    // Paused / suspended state only the background app knows: take it from its last report.
+    // Paused / suspended state only the background app knows: take it from its live channel.
     if st.daemon {
-        if let Ok(text) = std::fs::read_to_string(paths::status_file()) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                st.paused = v["paused"].as_bool().unwrap_or(false);
-                st.ue.workers_paused = v["ue"]["workers_paused"].as_u64().unwrap_or(0) as usize;
-            }
-        }
+        ipc::apply_live_status(&mut st);
     }
     st
 }
@@ -893,7 +899,7 @@ fn print_status(st: &Status) {
             "running"
         }
     );
-    print!("{}", tray::status_text(st));
+    print!("{}", ops::status_text(st));
     println!("\nPolicy now");
     for g in &st.groups {
         let p = &g.policy;
@@ -1105,6 +1111,7 @@ fn main() -> ExitCode {
             ExitCode::from(if r.ok { 0 } else if r.declined { 3 } else { 1 })
         }
 
+        #[cfg(feature = "gui")]
         Cmd::WriteIcon { path } => match athermemguard::logo::write_ico(&path) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -1114,9 +1121,45 @@ fn main() -> ExitCode {
         },
 
         Cmd::Daemon => {
-            tray::run_headless();
+            ops::run_headless();
             ExitCode::SUCCESS
         }
+
+        Cmd::Pause { minutes } => match ipc::send_command(ipc::ControlCmd::Pause { minutes }) {
+            Ok(()) => {
+                match minutes {
+                    Some(m) => println!("Ather MemGuard paused for {} min.", m),
+                    None => println!("Ather MemGuard paused."),
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                ExitCode::from(1)
+            }
+        },
+
+        Cmd::Resume => match ipc::send_command(ipc::ControlCmd::Resume) {
+            Ok(()) => {
+                println!("Ather MemGuard resumed.");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                ExitCode::from(1)
+            }
+        },
+
+        Cmd::Reload => match ipc::send_command(ipc::ControlCmd::Reload) {
+            Ok(()) => {
+                println!("Reloaded settings.");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                ExitCode::from(1)
+            }
+        },
 
         Cmd::Install { add_to_path, no_start, no_startup } => match install::install(install::InstallOptions {
             add_to_path,
@@ -1498,5 +1541,15 @@ mod tests {
         assert_eq!(flags(&["memguard", "install"]), (false, false, false));
         assert_eq!(flags(&["memguard", "install", "--no-startup"]), (false, false, true));
         assert_eq!(flags(&["memguard", "install", "--add-to-path", "--no-start", "--no-startup"]), (true, true, true));
+    }
+
+    #[test]
+    fn ipc_subcommands_parse() {
+        assert!(matches!(Cli::try_parse_from(["memguard", "pause"]).unwrap().command, Cmd::Pause { minutes: None }));
+        assert!(matches!(Cli::try_parse_from(["memguard", "pause", "--minutes", "5"]).unwrap().command, Cmd::Pause { minutes: Some(5) }));
+        assert!(matches!(Cli::try_parse_from(["memguard", "resume"]).unwrap().command, Cmd::Resume));
+        assert!(matches!(Cli::try_parse_from(["memguard", "reload"]).unwrap().command, Cmd::Reload));
+        assert!(Cli::try_parse_from(["memguard", "pause", "--minutes", "-5"]).is_err());
+        assert!(Cli::try_parse_from(["memguard", "pause", "--minutes", "abc"]).is_err());
     }
 }

@@ -211,6 +211,11 @@ impl Stack {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Milliseconds until the next unhovered non-leaving toast expires, if any.
+    pub fn next_timeout_ms(&self) -> Option<u64> {
+        self.entries.iter().filter(|e| !e.leaving() && !e.hovered).map(|e| e.remaining_ms).min()
+    }
 }
 
 /// Top edges for toasts of `heights` (oldest first) stacked upwards from the bottom of `work`.
@@ -280,6 +285,11 @@ pub fn hit_button(c: &Canvas, t: &Toast, p: Pt) -> Option<usize> {
 /// Paint a toast filling the canvas (sized `S(360)` x `height`).
 pub fn paint(c: &mut Canvas, t: &Toast, mouse: Option<Pt>) {
     let l = layout(c, t);
+    let hover_btn = mouse.and_then(|m| l.buttons.iter().position(|r| r.contains(m)));
+    paint_with_layout(c, t, hover_btn, &l);
+}
+
+fn paint_with_layout(c: &mut Canvas, t: &Toast, hover_btn: Option<usize>, l: &ToastLayout) {
     let full = c.bounds();
     c.fill_rect(full, SURFACE);
     c.fill_rect(Rect::new(0, 0, c.s(3.0).max(2), full.h), t.edge());
@@ -300,18 +310,18 @@ pub fn paint(c: &mut Canvas, t: &Toast, mouse: Option<Pt>) {
         }
     }
     for (i, r) in l.buttons.iter().enumerate() {
-        let hover = mouse.map(|m| r.contains(m)).unwrap_or(false);
+        let hover = hover_btn == Some(i);
         button(t, i, &t.actions[i].0).paint(c, *r, &WState { hover, ..Default::default() });
     }
 }
 
 /// A canvas with the toast painted on it (snapshots).
+#[cfg(any(test, feature = "ui-snapshots"))]
 pub fn render(t: &Toast, scale: Scale) -> Canvas {
-    let probe = Canvas::new(1, 1, scale);
-    let h = height(&probe, t);
-    drop(probe);
-    let mut c = Canvas::new(scale.s(WIDTH), h, scale);
-    paint(&mut c, t, None);
+    let mut c = Canvas::probe(scale);
+    let l = layout(&c, t);
+    c.resize(scale.s(WIDTH), l.height);
+    paint_with_layout(&mut c, t, None, &l);
     c
 }
 
@@ -328,6 +338,10 @@ struct ToastWin {
     y: f32,
     mouse: Option<Pt>,
     tracking: bool,
+    buttons: Vec<Rect>,
+    hover_btn: Option<usize>,
+    dirty: bool,
+    last_geom: Option<(i32, i32, i32, i32, u8)>,
 }
 
 struct Ui {
@@ -372,7 +386,11 @@ pub fn show(toast: Toast) -> ToastId {
 pub fn show_always(toast: Toast) -> ToastId {
     let id = with_ui(|ui| {
         let now = now_ms(ui);
-        ui.stack.show(toast, now)
+        let id = ui.stack.show(toast, now);
+        if let Some(w) = ui.wins.get_mut(&id) {
+            w.dirty = true;
+        }
+        id
     });
     sync();
     id
@@ -380,8 +398,20 @@ pub fn show_always(toast: Toast) -> ToastId {
 
 /// Update the body of a toast that is still showing (download progress).
 pub fn update_body(id: ToastId, body: &str) {
-    let changed = with_ui(|ui| ui.stack.update_body(id, body));
-    if changed {
+    let need_sync = with_ui(|ui| {
+        let now = now_ms(ui);
+        let had_removed = !ui.stack.tick(now).is_empty();
+        let updated = if ui.stack.update_body(id, body) {
+            if let Some(w) = ui.wins.get_mut(&id) {
+                w.dirty = true;
+            }
+            true
+        } else {
+            false
+        };
+        updated || had_removed
+    });
+    if need_sync {
         sync();
     }
 }
@@ -448,26 +478,56 @@ fn find_id(hwnd: HWND) -> Option<ToastId> {
     with_ui(|ui| ui.wins.iter().find(|(_, w)| w.hwnd == hwnd).map(|(id, _)| *id))
 }
 
+fn next_frame_timer_ms(stack: &Stack, now: u64, animating: bool) -> Option<u32> {
+    if stack.is_empty() {
+        None
+    } else if animating || stack.entries.iter().any(|e| e.leaving() || e.presence(now) < 1.0) {
+        Some(15)
+    } else {
+        stack.next_timeout_ms().map(|ms| ms.clamp(10, u32::MAX as u64) as u32)
+    }
+}
+
+fn collect_removed_and_orphans<V>(stack: &Stack, wins: &mut HashMap<ToastId, V>, removed: &[ToastId]) -> Vec<V> {
+    let mut out = Vec::new();
+    for id in removed {
+        if let Some(w) = wins.remove(id) {
+            out.push(w);
+        }
+    }
+    let orphans: Vec<ToastId> = wins
+        .keys()
+        .copied()
+        .filter(|id| !stack.entries.iter().any(|e| e.id == *id))
+        .collect();
+    for id in orphans {
+        if let Some(w) = wins.remove(&id) {
+            out.push(w);
+        }
+    }
+    out
+}
+
 /// Bring the windows in line with the model: create, move, fade, destroy.
 fn sync() {
     register();
     let previous = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     let (work, scale) = primary_work();
     let mut destroy: Vec<HWND> = Vec::new();
-    let mut moves: Vec<(HWND, i32, i32, i32, i32, u8, bool)> = Vec::new();
+    let mut moves: Vec<(HWND, i32, i32, i32, i32, u8, bool, bool)> = Vec::new();
     let animating = with_ui(|ui| unsafe {
         if ui.host.is_null() {
             let n = wide(HOST_CLASS);
             ui.host = CreateWindowExW(0, n.as_ptr(), null(), 0, 0, 0, 0, 0, HWND_MESSAGE, null_mut(), GetModuleHandleW(null()), null());
         }
         let now = now_ms(ui);
-        for id in ui.stack.tick(now) {
-            if let Some(w) = ui.wins.remove(&id) {
-                destroy.push(w.hwnd);
-            }
+        let removed = ui.stack.tick(now);
+        for w in collect_removed_and_orphans(&ui.stack, &mut ui.wins, &removed) {
+            destroy.push(w.hwnd);
         }
-        // Heights at the current scale; create missing windows.
-        let mut heights = Vec::new();
+        // Heights at the current scale; create missing windows and repaint only dirty/rescaled ones.
+        let mut heights = Vec::with_capacity(ui.stack.entries.len());
+        let mut repainted = Vec::with_capacity(ui.stack.entries.len());
         for e in &ui.stack.entries {
             let w = ui.wins.entry(e.id).or_insert_with(|| {
                 let n = wide(CLASS);
@@ -489,14 +549,37 @@ fn sync() {
                 DwmSetWindowAttribute(hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &pref as *const i32 as *const _, 4);
                 let off: i32 = 1;
                 DwmSetWindowAttribute(hwnd, 3 /* DWMWA_TRANSITIONS_FORCEDISABLED */, &off as *const i32 as *const _, 4);
-                ToastWin { hwnd, canvas: Canvas::new(1, 1, scale), y: f32::NAN, mouse: None, tracking: false }
+                ToastWin {
+                    hwnd,
+                    canvas: Canvas::probe(scale),
+                    y: f32::NAN,
+                    mouse: None,
+                    tracking: false,
+                    buttons: Vec::new(),
+                    hover_btn: None,
+                    dirty: true,
+                    last_geom: None,
+                }
             });
-            w.canvas.set_scale(scale);
-            let h = height(&w.canvas, &e.toast);
-            if w.canvas.height() != h || w.canvas.width() != scale.s(WIDTH) {
-                w.canvas.resize(scale.s(WIDTH), h);
+            let scale_changed = w.canvas.scale != scale;
+            if scale_changed {
+                w.canvas.set_scale(scale);
+                w.dirty = true;
             }
-            heights.push(h);
+            let target_w = scale.s(WIDTH);
+            if w.dirty || w.canvas.width() != target_w || w.canvas.height() <= 0 {
+                let l = layout(&w.canvas, &e.toast);
+                w.buttons = l.buttons.clone();
+                w.hover_btn = w.mouse.and_then(|m| w.buttons.iter().position(|r| r.contains(m)));
+                w.canvas.resize(target_w, l.height);
+                paint_with_layout(&mut w.canvas, &e.toast, w.hover_btn, &l);
+                w.dirty = false;
+                heights.push(l.height);
+                repainted.push(true);
+            } else {
+                heights.push(w.canvas.height());
+                repainted.push(false);
+            }
         }
         let tops = stack_positions(&heights, work.bottom(), scale.s(MARGIN), scale.s(GAP));
         let x0 = work.right() - scale.s(MARGIN) - scale.s(WIDTH);
@@ -513,19 +596,24 @@ fn sync() {
                 w.y = target;
             }
             let p = e.presence(now);
-            if p < 1.0 {
+            if p < 1.0 || e.leaving() {
                 animating = true;
             }
             let slide = ((1.0 - p) * scale.s(24.0) as f32).round() as i32;
-            let alpha = (OPAQUE as f32 * p).round() as u8;
-            paint(&mut w.canvas, &e.toast, w.mouse);
-            moves.push((w.hwnd, x0 + slide, w.y.round() as i32, scale.s(WIDTH), heights[i], alpha, true));
+            let alpha = ((OPAQUE as f32 * p).round() as u8).max(1);
+            let geom = (x0 + slide, w.y.round() as i32, scale.s(WIDTH), heights[i], alpha);
+            let geom_changed = w.last_geom != Some(geom);
+            if geom_changed {
+                w.last_geom = Some(geom);
+            }
+            if geom_changed || repainted[i] {
+                moves.push((w.hwnd, geom.0, geom.1, geom.2, geom.3, geom.4, geom_changed, repainted[i]));
+            }
         }
-        if ui.stack.is_empty() {
-            KillTimer(ui.host, FRAME_TIMER);
+        if let Some(ms) = next_frame_timer_ms(&ui.stack, now, animating) {
+            SetTimer(ui.host, FRAME_TIMER, ms, None);
         } else {
-            // Fast frames while something moves; otherwise a slower tick for the countdowns.
-            SetTimer(ui.host, FRAME_TIMER, if animating { 15 } else { 100 }, None);
+            KillTimer(ui.host, FRAME_TIMER);
         }
         animating
     });
@@ -534,10 +622,14 @@ fn sync() {
         for h in destroy {
             DestroyWindow(h);
         }
-        for (h, x, y, w, hh, alpha, _) in moves {
-            SetLayeredWindowAttributes(h, 0, alpha.max(1), LWA_ALPHA);
-            SetWindowPos(h, HWND_TOPMOST, x, y, w, hh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-            InvalidateRect(h, null(), 0);
+        for (h, x, y, w, hh, alpha, geom_changed, needs_paint) in moves {
+            if geom_changed {
+                SetLayeredWindowAttributes(h, 0, alpha, LWA_ALPHA);
+                SetWindowPos(h, HWND_TOPMOST, x, y, w, hh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            }
+            if needs_paint {
+                InvalidateRect(h, null(), 0);
+            }
         }
         SetThreadDpiAwarenessContext(previous);
     }
@@ -572,40 +664,90 @@ unsafe extern "system" fn toast_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
         WM_PAINT => {
             let mut ps: PAINTSTRUCT = zeroed();
             let hdc = BeginPaint(hwnd, &mut ps);
+            let p = ps.rcPaint;
+            let dirty = Rect::ltrb(p.left, p.top, p.right, p.bottom);
             with_ui(|ui| {
                 if let Some(win) = ui.wins.values().find(|x| x.hwnd == hwnd) {
-                    win.canvas.blit(hdc, 0, 0);
+                    if dirty.is_empty() {
+                        win.canvas.blit(hdc, 0, 0);
+                    } else {
+                        win.canvas.blit_rect(hdc, dirty);
+                    }
                 }
             });
             EndPaint(hwnd, &ps);
             return 0;
         }
         WM_MOUSEMOVE => {
-            if let Some(id) = find_id(hwnd) {
-                with_ui(|ui| {
+            let p = pt();
+            let (hover_changed, repaint_hwnd) = with_ui(|ui| {
+                let Some(id) = ui.wins.iter().find(|(_, w)| w.hwnd == hwnd).map(|(id, _)| *id) else {
+                    return (false, false);
+                };
+                let was_hovered = ui.stack.entries.iter().find(|e| e.id == id).is_some_and(|e| e.hovered);
+                if !was_hovered {
+                    let now = now_ms(ui);
+                    ui.stack.tick(now);
                     ui.stack.set_hover(id, true);
-                    if let Some(win) = ui.wins.get_mut(&id) {
-                        win.mouse = Some(pt());
-                        if !win.tracking {
-                            let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
-                            TrackMouseEvent(&mut tme);
-                            win.tracking = true;
+                }
+                let mut repaint = false;
+                if let Some(win) = ui.wins.get_mut(&id) {
+                    win.mouse = Some(p);
+                    if !win.tracking {
+                        let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
+                        TrackMouseEvent(&mut tme);
+                        win.tracking = true;
+                    }
+                    let new_btn = win.buttons.iter().position(|r| r.contains(p));
+                    if new_btn != win.hover_btn {
+                        win.hover_btn = new_btn;
+                        if let Some(e) = ui.stack.entries.iter().find(|e| e.id == id) {
+                            let l = layout(&win.canvas, &e.toast);
+                            win.buttons = l.buttons.clone();
+                            paint_with_layout(&mut win.canvas, &e.toast, win.hover_btn, &l);
+                            win.dirty = false;
+                            repaint = true;
                         }
                     }
-                });
+                }
+                (!was_hovered, repaint)
+            });
+            if repaint_hwnd {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            if hover_changed {
                 sync();
             }
             return 0;
         }
         WM_MOUSELEAVE => {
-            if let Some(id) = find_id(hwnd) {
-                with_ui(|ui| {
-                    ui.stack.set_hover(id, false);
-                    if let Some(win) = ui.wins.get_mut(&id) {
-                        win.mouse = None;
-                        win.tracking = false;
+            let (found, repaint_hwnd) = with_ui(|ui| {
+                let Some(id) = ui.wins.iter().find(|(_, w)| w.hwnd == hwnd).map(|(id, _)| *id) else {
+                    return (false, false);
+                };
+                let now = now_ms(ui);
+                ui.stack.tick(now);
+                ui.stack.set_hover(id, false);
+                let mut repaint = false;
+                if let Some(win) = ui.wins.get_mut(&id) {
+                    win.mouse = None;
+                    win.tracking = false;
+                    if win.hover_btn.take().is_some() {
+                        if let Some(e) = ui.stack.entries.iter().find(|e| e.id == id) {
+                            let l = layout(&win.canvas, &e.toast);
+                            win.buttons = l.buttons.clone();
+                            paint_with_layout(&mut win.canvas, &e.toast, None, &l);
+                            win.dirty = false;
+                            repaint = true;
+                        }
                     }
-                });
+                }
+                (true, repaint)
+            });
+            if repaint_hwnd {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            if found {
                 sync();
             }
             return 0;
@@ -614,6 +756,7 @@ unsafe extern "system" fn toast_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
             if let Some(id) = find_id(hwnd) {
                 let cmd = with_ui(|ui| {
                     let now = now_ms(ui);
+                    ui.stack.tick(now);
                     let entry = ui.stack.entries.iter().find(|e| e.id == id).cloned();
                     ui.stack.dismiss(id, now);
                     let entry = entry?;
@@ -621,7 +764,7 @@ unsafe extern "system" fn toast_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
                         return None;
                     }
                     let win = ui.wins.get(&id)?;
-                    match hit_button(&win.canvas, &entry.toast, pt()) {
+                    match win.buttons.iter().position(|r| r.contains(pt())) {
                         Some(i) => Some(entry.toast.actions[i].1),
                         None => entry.toast.on_click,
                     }
@@ -632,6 +775,18 @@ unsafe extern "system" fn toast_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
                 }
             }
             return 0;
+        }
+        WM_NCDESTROY => {
+            let _ = UI.try_with(|cell| {
+                if let Ok(mut slot) = cell.try_borrow_mut() {
+                    if let Some(ui) = slot.as_mut() {
+                        let id = ui.wins.iter().find(|(_, w)| w.hwnd == hwnd).map(|(id, _)| *id);
+                        if let Some(id) = id {
+                            ui.wins.remove(&id);
+                        }
+                    }
+                }
+            });
         }
         _ => {}
     }
@@ -1054,6 +1209,7 @@ pub mod catalog {
     }
 
     /// One sample of every toast with the mockup's numbers: (snapshot name, toast).
+    #[cfg(any(test, feature = "ui-snapshots"))]
     pub fn samples() -> Vec<(&'static str, Toast)> {
         vec![
             ("first-run", first_run("Ctrl+Alt+M")),
@@ -1275,5 +1431,187 @@ mod disk_toast_tests {
         let c = disk_level("C: is low on space", "body", true, "C:");
         assert_ne!(d.key, c.key, "two drives in one poll must not replace each other");
         assert_eq!(d.actions, vec![("Free up disk space".to_string(), crate::ui::Command::OpenDoctorDisk)], "opens the Disk space tab");
+    }
+}
+
+#[cfg(test)]
+mod timer_tests {
+    use super::*;
+
+    fn info(title: &str) -> Toast {
+        Toast { kind: ToastKind::Info, title: title.into(), body: String::new(), actions: Vec::new(), on_click: None, key: None }
+    }
+
+    #[test]
+    fn next_timeout_ms_and_tick_before_hover_preserve_countdown() {
+        let mut s = Stack::new();
+        assert_eq!(s.next_timeout_ms(), None);
+        let a = s.show(info("a"), 0);
+        s.tick(1000);
+        assert_eq!(s.next_timeout_ms(), Some(DEFAULT_MS - 1000));
+
+        // Mouse enters at 1500ms: tick(1500) before set_hover(a, true) deducts the 500ms unhovered time.
+        s.tick(1500);
+        s.set_hover(a, true);
+        assert_eq!(s.next_timeout_ms(), None, "all static toasts hovered -> no timer needed");
+
+        // Mouse leaves at 10_000ms: tick(10_000) before set_hover(a, false) deducts 0ms while hovered.
+        s.tick(10_000);
+        s.set_hover(a, false);
+        assert_eq!(s.next_timeout_ms(), Some(DEFAULT_MS - 1500));
+
+        // Adding another unhovered toast uses the minimum remaining timeout.
+        let _b = s.show(info("b"), 10_000);
+        assert_eq!(s.next_timeout_ms(), Some(DEFAULT_MS - 1500));
+    }
+
+    #[test]
+    fn leaving_at_onset_selects_15ms_frame_timer() {
+        // 1. Natural expiry via tick(): now == since -> presence == 1.0, must still pick 15ms.
+        let mut s = Stack::new();
+        let a = s.show(info("expire"), 0);
+        let removed = s.tick(DEFAULT_MS);
+        assert!(removed.is_empty());
+        assert!(s.entries.iter().find(|e| e.id == a).unwrap().leaving());
+        assert_eq!(s.entries.iter().find(|e| e.id == a).unwrap().presence(DEFAULT_MS), 1.0);
+        assert_eq!(next_frame_timer_ms(&s, DEFAULT_MS, false), Some(15));
+
+        // 2. Click-dismiss via dismiss(id, now) while another unhovered toast has seconds left.
+        let mut s = Stack::new();
+        let b = s.show(info("clicked"), 10_000);
+        let _other = s.show(info("sibling"), 10_000);
+        s.tick(10_000 + ENTER_MS);
+        assert_eq!(next_frame_timer_ms(&s, 10_000 + ENTER_MS, false), Some((DEFAULT_MS - ENTER_MS) as u32));
+        s.dismiss(b, 10_500);
+        assert_eq!(s.entries.iter().find(|e| e.id == b).unwrap().presence(10_500), 1.0);
+        assert_eq!(next_frame_timer_ms(&s, 10_500, false), Some(15));
+
+        // 3. dismiss_all(now): all entries leaving at now == since -> must pick 15ms, never None.
+        s.dismiss_all(10_500);
+        assert_eq!(next_frame_timer_ms(&s, 10_500, false), Some(15));
+    }
+
+    #[test]
+    fn tick_outside_sync_drains_are_reconciled_from_wins() {
+        let mut s = Stack::new();
+        let a = s.show(info("a"), 0);
+        let b = s.show(info("b"), 0);
+        let mut wins: HashMap<ToastId, &'static str> = HashMap::from([(a, "hwnd_a"), (b, "hwnd_b")]);
+
+        // Simulate dismiss at t=100, then an out-of-sync tick (e.g., show/update_body/WM_MOUSEMOVE)
+        // draining `a` and discarding its returned Vec<ToastId>.
+        s.dismiss(a, 100);
+        let _discarded = s.tick(100 + LEAVE_MS);
+        assert!(s.entries.iter().all(|e| e.id != a));
+
+        // Subsequent sync() calls tick() and gets empty `removed`, yet reconciliation still
+        // catches and removes orphan `a` while preserving active `b`.
+        let removed_in_sync = s.tick(100 + LEAVE_MS);
+        assert!(removed_in_sync.is_empty());
+        let to_destroy = collect_removed_and_orphans(&s, &mut wins, &removed_in_sync);
+        assert_eq!(to_destroy, vec!["hwnd_a"]);
+        assert_eq!(wins.keys().copied().collect::<Vec<_>>(), vec![b]);
+    }
+
+    #[test]
+    fn live_toast_windows_close_on_click_dismiss_all_and_expiry() {
+        fn pump_until(max_ms: u64, mut done: impl FnMut() -> bool) -> bool {
+            let start = Instant::now();
+            loop {
+                unsafe {
+                    let mut msg: MSG = zeroed();
+                    while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+                if done() {
+                    return true;
+                }
+                if start.elapsed().as_millis() as u64 >= max_ms {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        // 1. Click-to-dismiss (WM_LBUTTONUP)
+        let id1 = show_always(info("click-close"));
+        let hwnd1 = with_ui(|ui| ui.wins.get(&id1).map(|w| w.hwnd)).unwrap();
+        assert_ne!(unsafe { IsWindow(hwnd1) }, 0);
+        unsafe { SendMessageW(hwnd1, WM_LBUTTONUP, 0, 0) };
+        let closed1 = pump_until(LEAVE_MS + 600, || unsafe { IsWindow(hwnd1) == 0 });
+        assert!(closed1, "clicked toast HWND must close and be destroyed");
+        assert!(with_ui(|ui| ui.wins.is_empty() && ui.stack.is_empty()));
+
+        // 2. dismiss_all()
+        let id2 = show_always(info("dismiss-all-close"));
+        let hwnd2 = with_ui(|ui| ui.wins.get(&id2).map(|w| w.hwnd)).unwrap();
+        assert_ne!(unsafe { IsWindow(hwnd2) }, 0);
+        dismiss_all();
+        let closed2 = pump_until(LEAVE_MS + 600, || unsafe { IsWindow(hwnd2) == 0 });
+        assert!(closed2, "dismiss_all() toast HWND must close and be destroyed");
+        assert!(with_ui(|ui| ui.wins.is_empty() && ui.stack.is_empty()));
+
+        // 3. Natural expiry via FRAME_TIMER
+        let id3 = show_always(info("expire-close"));
+        let hwnd3 = with_ui(|ui| ui.wins.get(&id3).map(|w| w.hwnd)).unwrap();
+        pump_until(ENTER_MS + 80, || with_ui(|ui| ui.stack.entries.iter().any(|e| e.id == id3 && matches!(e.phase, Phase::Shown))));
+        with_ui(|ui| {
+            if let Some(e) = ui.stack.entries.iter_mut().find(|e| e.id == id3) {
+                e.remaining_ms = 40;
+            }
+        });
+        sync();
+        let closed3 = pump_until(LEAVE_MS + 700, || unsafe { IsWindow(hwnd3) == 0 });
+        assert!(closed3, "expired toast HWND must close and be destroyed");
+        assert!(with_ui(|ui| ui.wins.is_empty() && ui.stack.is_empty()));
+
+        // Clean up host message window on test thread.
+        with_ui(|ui| unsafe {
+            if !ui.host.is_null() {
+                DestroyWindow(ui.host);
+                ui.host = null_mut();
+            }
+        });
+    }
+
+    #[test]
+    fn t5_toast_stack_eviction_hover_pause_and_key_replacement() {
+        let mk = |title: &str, key: Option<&'static str>, with_btn: bool| Toast {
+            kind: ToastKind::Info,
+            title: title.into(),
+            body: "body".into(),
+            actions: if with_btn { vec![("OK".into(), Command::Quit)] } else { vec![] },
+            on_click: None,
+            key,
+        };
+        let t0 = mk("A", Some("k1"), false);
+        assert_eq!(t0.duration_ms(), DEFAULT_MS);
+        let t1 = mk("B", None, true);
+        assert_eq!(t1.duration_ms(), WITH_BUTTONS_MS);
+
+        let mut stack = Stack::new();
+        let id1 = stack.show(t0, 0);
+        // Same-key replacement updates in place, keeps id, and restarts timer.
+        let id1_rep = stack.show(mk("A2", Some("k1"), true), 1000);
+        assert_eq!(id1, id1_rep);
+        assert_eq!(stack.entries.len(), 1);
+        assert_eq!(stack.entries[0].toast.title, "A2");
+        assert_eq!(stack.entries[0].remaining_ms, WITH_BUTTONS_MS);
+
+        // Hover freezes remaining_ms across tick().
+        stack.set_hover(id1, true);
+        stack.tick(5000);
+        assert_eq!(stack.entries[0].remaining_ms, WITH_BUTTONS_MS);
+        stack.set_hover(id1, false);
+
+        // Push up to MAX_VISIBLE + 1 = 4 distinct toasts -> oldest starts leaving early.
+        let _id2 = stack.show(mk("T2", Some("k2"), false), 5000);
+        let _id3 = stack.show(mk("T3", Some("k3"), false), 5000);
+        let _id4 = stack.show(mk("T4", Some("k4"), false), 5000);
+        let active_count = stack.entries.iter().filter(|e| !e.leaving()).count();
+        assert_eq!(active_count, MAX_VISIBLE);
+        assert!(stack.entries.iter().find(|e| e.id == id1).unwrap().leaving());
     }
 }

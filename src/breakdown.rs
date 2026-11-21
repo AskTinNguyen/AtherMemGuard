@@ -6,6 +6,7 @@
 //! `RamBreakdown::parts` is the one list of parts every view (flyout, `memguard status`)
 //! shows.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use serde::Serialize;
@@ -105,21 +106,23 @@ impl RamBreakdown {
 /// How many other apps the breakdown names.
 pub const TOP_APPS: usize = 5;
 
-/// Processes that are part of Windows (lowercase, without `.exe`). They can't be closed, so
-/// they count as "Windows and drivers", not "Other apps".
+/// Processes that are part of Windows (lowercase, without `.exe`). Sorted in ASCII ordinal
+/// order for `binary_search`. They can't be closed, so they count as "Windows and drivers",
+/// not "Other apps".
 const WINDOWS_PROCESSES: &[&str] = &[
-    "system", "registry", "secure system", "smss", "csrss", "wininit", "winlogon", "services", "lsass", "lsaiso", "svchost",
-    "fontdrvhost", "dwm", "msmpeng", "mpdefendercoreservice", "nissrv", "securityhealthservice", "spoolsv", "searchindexer",
-    "searchhost", "searchprotocolhost", "searchfilterhost", "wmiprvse", "audiodg", "conhost", "sihost", "taskhostw",
-    "runtimebroker", "ctfmon", "explorer", "startmenuexperiencehost", "shellexperiencehost", "textinputhost", "dllhost",
-    "smartscreen", "wudfhost", "dashost", "unsecapp", "wlanext", "sgrmbroker", "msdtc", "vmcompute", "vmms",
-    "applicationframehost", "lockapp", "systemsettings", "widgets", "widgetservice", "phoneexperiencehost", "crossdeviceservice",
-    "useroobebroker", "backgroundtaskhost", "compattelrunner", "musnotification", "tiworker", "trustedinstaller",
+    "applicationframehost", "audiodg", "backgroundtaskhost", "compattelrunner", "conhost", "crossdeviceservice",
+    "csrss", "ctfmon", "dashost", "dllhost", "dwm", "explorer", "fontdrvhost", "lockapp", "lsaiso", "lsass",
+    "mpdefendercoreservice", "msdtc", "msmpeng", "musnotification", "nissrv", "phoneexperiencehost", "registry",
+    "runtimebroker", "searchfilterhost", "searchhost", "searchindexer", "searchprotocolhost", "secure system",
+    "securityhealthservice", "services", "sgrmbroker", "shellexperiencehost", "sihost", "smartscreen", "smss",
+    "spoolsv", "startmenuexperiencehost", "svchost", "system", "systemsettings", "taskhostw", "textinputhost",
+    "tiworker", "trustedinstaller", "unsecapp", "useroobebroker", "vmcompute", "vmms", "widgets", "widgetservice",
+    "wininit", "winlogon", "wlanext", "wmiprvse", "wudfhost",
 ];
 
 /// Is this (lowercase, no `.exe`) process name part of Windows?
 pub fn is_windows_process(lower: &str) -> bool {
-    WINDOWS_PROCESSES.contains(&lower)
+    WINDOWS_PROCESSES.binary_search(&lower).is_ok()
 }
 
 /// Who a process's RAM counts for, as the engine decided it.
@@ -135,31 +138,41 @@ pub enum Owner {
     Nobody,
 }
 
-/// The breakdown of `sys`'s RAM in use, with `owners[i]` the owner of `procs[i]` and
-/// `group_names` the groups `Owner::Group` points into.
-pub fn breakdown(sys: &SysInfo, procs: &[Proc], owners: &[Owner], group_names: &[String]) -> RamBreakdown {
+fn breakdown_inner(
+    sys: &SysInfo,
+    procs: &[Proc],
+    lowers: Option<&[String]>,
+    owners: &[Owner],
+    group_names: &[String],
+) -> RamBreakdown {
     let in_use = sys.ram_total.saturating_sub(sys.ram_avail);
     let (mut editor, mut workers, mut ue_other) = (0u64, 0u64, 0u64);
     let mut group_ram = vec![0u64; group_names.len()];
     let (mut windows, mut compressed) = (0u64, 0u64);
     // By lowercase name: (display name, processes, bytes).
-    let mut apps: HashMap<String, (&str, usize, u64)> = HashMap::new();
-    for (p, owner) in procs.iter().zip(owners) {
+    let mut apps: HashMap<Cow<'_, str>, (&str, usize, u64)> = HashMap::new();
+    for (i, (p, owner)) in procs.iter().zip(owners).enumerate() {
         match owner {
             Owner::UnrealEditor => editor += p.private,
             Owner::UnrealWorker => workers += p.private,
             Owner::Unreal => ue_other += p.private,
             Owner::Group(g) => group_ram[*g] += p.private,
             Owner::Nobody => {
-                let lower = p.name.to_ascii_lowercase();
+                let lower: Cow<'_, str> = match lowers.and_then(|l| l.get(i)) {
+                    Some(s) => Cow::Borrowed(s.as_str()),
+                    None => Cow::Owned(p.name.to_ascii_lowercase()),
+                };
                 if lower == "memory compression" {
                     compressed += p.private;
-                } else if p.pid == 4 || is_windows_process(&lower) {
+                } else if p.pid == 4 || is_windows_process(lower.as_ref()) {
                     windows += p.private;
                 } else if p.pid != 0 {
-                    let a = apps.entry(lower).or_insert((p.name.as_str(), 0, 0));
-                    a.1 += 1;
-                    a.2 += p.private;
+                    if let Some(a) = apps.get_mut(lower.as_ref()) {
+                        a.1 += 1;
+                        a.2 += p.private;
+                    } else {
+                        apps.insert(lower, (p.name.as_str(), 1, p.private));
+                    }
                 }
             }
         }
@@ -190,13 +203,45 @@ pub fn breakdown(sys: &SysInfo, procs: &[Proc], owners: &[Owner], group_names: &
     }
 }
 
+/// The breakdown of `sys`'s RAM in use, with `owners[i]` the owner of `procs[i]` and
+/// `group_names` the groups `Owner::Group` points into.
+pub fn breakdown(sys: &SysInfo, procs: &[Proc], owners: &[Owner], group_names: &[String]) -> RamBreakdown {
+    breakdown_inner(sys, procs, None, owners, group_names)
+}
+
+/// Same as `breakdown`, reusing pre-lowercased process names (`lowers[i]` = `procs[i].name.to_ascii_lowercase()`).
+pub fn breakdown_with_lowers(
+    sys: &SysInfo,
+    procs: &[Proc],
+    lowers: &[String],
+    owners: &[Owner],
+    group_names: &[String],
+) -> RamBreakdown {
+    breakdown_inner(sys, procs, Some(lowers), owners, group_names)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn parts_cover_everything_but_unreal_in_a_fixed_order() {
-        let br = crate::ui::status_source::sample_breakdown();
+        let app = |name: &str, processes: usize, ram_gb: f64| AppRam { name: name.into(), processes, ram_gb };
+        let group = |name: &str, ram_gb: f64| GroupRam { name: name.into(), ram_gb };
+        let br = RamBreakdown {
+            in_use_gb: 82.6,
+            unreal_gb: 34.0,
+            unreal_editor_gb: 30.1,
+            unreal_workers_gb: 2.4,
+            groups: vec![group("Browsers", 3.6), group("Chat", 0.9), group("Agents", 5.8), group("Background", 0.6)],
+            other_apps_gb: 6.2,
+            other_apps_count: 61,
+            top_apps: vec![app("rider64", 1, 2.8), app("vmmem", 1, 1.9), app("devenv", 2, 0.7), app("Discord", 6, 0.3), app("Spotify", 5, 0.2)],
+            file_cache_gb: 22.4,
+            windows_gb: 5.3,
+            compressed_gb: 1.6,
+            unattributed_gb: 2.2,
+        };
         let parts = br.parts();
         let labels: Vec<String> = parts.iter().map(|(p, _)| br.label(*p)).collect();
         assert_eq!(
@@ -206,5 +251,72 @@ mod tests {
         let sum: f64 = parts.iter().map(|(_, g)| g).sum::<f64>() + br.unreal_gb;
         assert!((sum - br.in_use_gb).abs() < 0.05, "{}", sum);
         assert_eq!(br.label(RamPart::Group(99)), "");
+    }
+
+    #[test]
+    fn windows_processes_is_sorted_and_unique() {
+        assert_eq!(WINDOWS_PROCESSES.len(), 56);
+        assert!(WINDOWS_PROCESSES.windows(2).all(|w| w[0] < w[1]));
+        for &name in WINDOWS_PROCESSES {
+            assert_eq!(name, name.to_ascii_lowercase());
+            assert!(is_windows_process(name), "missing {}", name);
+        }
+        assert!(!is_windows_process("chrome"));
+        assert!(!is_windows_process(""));
+    }
+
+    #[test]
+    fn breakdown_with_lowers_matches_breakdown() {
+        let gb = 1024 * 1024 * 1024u64;
+        let sys = SysInfo {
+            ram_total: 64 * gb,
+            ram_avail: 32 * gb,
+            nonpaged_pool: gb / 4,
+            resident_paged_pool: gb / 4,
+            resident_system_code: gb / 8,
+            resident_drivers: gb / 8,
+            resident_system_cache: gb,
+            ..SysInfo::default()
+        };
+        let proc_item = |pid: u32, name: &str, private: u64| Proc {
+            pid,
+            ppid: 1,
+            name: name.into(),
+            ram: private,
+            private,
+            committed: private,
+            created: 1,
+            queryable: pid != 0,
+        };
+        let procs = vec![
+            proc_item(0, "[System Process]", gb),
+            proc_item(4, "System", gb / 2),
+            proc_item(10, "Memory Compression", 2 * gb),
+            proc_item(20, "Svchost", gb / 2),
+            proc_item(30, "UnrealEditor", 8 * gb),
+            proc_item(40, "ShaderCompileWorker", 4 * gb),
+            proc_item(50, "chrome", 2 * gb),
+            proc_item(60, "Blender", 3 * gb),
+            proc_item(70, "blender", gb),
+        ];
+        let owners = vec![
+            Owner::Nobody,
+            Owner::Nobody,
+            Owner::Nobody,
+            Owner::Nobody,
+            Owner::UnrealEditor,
+            Owner::UnrealWorker,
+            Owner::Group(0),
+            Owner::Nobody,
+            Owner::Nobody,
+        ];
+        let group_names = vec!["Browsers".to_string()];
+        let lowers: Vec<String> = procs.iter().map(|p| p.name.to_ascii_lowercase()).collect();
+        let a = breakdown(&sys, &procs, &owners, &group_names);
+        let b = breakdown_with_lowers(&sys, &procs, &lowers, &owners, &group_names);
+        assert_eq!(a, b);
+        assert_eq!(b.other_apps_count, 1);
+        assert_eq!(b.top_apps[0].name, "Blender");
+        assert_eq!(b.top_apps[0].processes, 2);
     }
 }

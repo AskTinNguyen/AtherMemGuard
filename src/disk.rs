@@ -89,7 +89,7 @@ pub struct Volume {
     pub reserved_gb: Option<f64>,
     pub free_pct: f64,
     pub level: Level,
-    /// Needs the disk history (a later version): always null for now.
+    /// Burn-rate trend in GB/day (negative = losing free space, positive = gaining free space).
     pub trend_gb_per_day: Option<f64>,
     /// "dev_drive", "system", "pagefile", "projects", "ddc", "zen", "temp", "watched".
     pub roles: Vec<String>,
@@ -103,6 +103,21 @@ pub struct Volume {
     /// Rotating disk (seek penalty): never suggested as a cache destination.
     #[serde(skip)]
     pub fixed_local: bool,
+    /// Volume cluster size in bytes (0 if unknown).
+    #[serde(skip)]
+    pub cluster: u64,
+    /// VHD/VHDX backing file size on host (when known).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vhd_file_bytes: Option<u64>,
+    /// Free bytes on the VHD/VHDX host volume (when known).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vhd_host_free: Option<u64>,
+    /// Maximum virtual size of the VHD/VHDX (when known).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vhd_max_bytes: Option<u64>,
+    /// Attached filesystem minifilters on this Dev Drive (when accessible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attached_filters: Option<Vec<String>>,
 }
 
 impl Volume {
@@ -185,7 +200,7 @@ pub fn volume_from(f: &VolumeFacts, ctx: &RoleContext, s: &DiskSettings, prev: O
         trusted: if dev { f.trusted } else { None },
         block_cloning: f.fs_flags & disk_win::FS_BLOCK_REFCOUNTING != 0,
         backing: backing.into(),
-        backed_by: None,
+        backed_by: f.vhd_backed_by.clone(),
         total_gb: gb2(f.total),
         free_gb: gb2(f.avail),
         free_basis: "available_to_caller".into(),
@@ -198,6 +213,11 @@ pub fn volume_from(f: &VolumeFacts, ctx: &RoleContext, s: &DiskSettings, prev: O
         avail: f.avail,
         total: f.total,
         fixed_local: f.drive_type == 3 && f.total > 0 && f.seek_penalty != Some(true),
+        cluster: f.cluster,
+        vhd_file_bytes: f.vhd_file_bytes,
+        vhd_host_free: f.vhd_host_free,
+        vhd_max_bytes: f.vhd_max_bytes,
+        attached_filters: f.attached_filters.clone(),
     }
 }
 
@@ -297,14 +317,35 @@ impl DiskWatch {
 
 // ---------------------------------------------------------------- reading this PC
 
-/// Where the Unreal caches are: the legacy file-system DDC (or `UE-LocalDataCachePath`) and Zen.
+/// Where the Unreal caches are: the legacy file-system DDC (`UE-LocalDataCachePath`) and Zen (`UE-ZenSubprocessDataPath`).
 pub fn ue_cache_dirs() -> (Option<PathBuf>, Option<PathBuf>) {
     let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
-    let ddc = std::env::var_os("UE-LocalDataCachePath")
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty() && !p.to_string_lossy().eq_ignore_ascii_case("None"))
-        .or_else(|| local.as_ref().map(|l| l.join(r"UnrealEngine\Common\DerivedDataCache")));
-    let zen = local.map(|l| l.join(r"UnrealEngine\Common\Zen"));
+    let env_dir = |var: &str| {
+        std::env::var_os(var)
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty() && !p.to_string_lossy().trim().eq_ignore_ascii_case("None"))
+    };
+    let mut ddc = env_dir("UE-LocalDataCachePath");
+    let mut zen = env_dir("UE-ZenSubprocessDataPath");
+    if ddc.is_none() || zen.is_none() {
+        if let Some(rec) = crate::disk_clean::DiskFiles::default().relocate_record().filter(|r| !r.undone) {
+            let reloc_dir = |var: &str| {
+                rec.entries
+                    .iter()
+                    .find(|e| e.name.eq_ignore_ascii_case(var))
+                    .map(|e| PathBuf::from(crate::disk_relocate::expand_vars(&e.new_value).trim()))
+                    .filter(|p| !p.as_os_str().is_empty() && !p.to_string_lossy().trim().eq_ignore_ascii_case("None"))
+            };
+            if ddc.is_none() {
+                ddc = reloc_dir("UE-LocalDataCachePath");
+            }
+            if zen.is_none() {
+                zen = reloc_dir("UE-ZenSubprocessDataPath");
+            }
+        }
+    }
+    let ddc = ddc.or_else(|| local.as_ref().map(|l| l.join(r"UnrealEngine\Common\DerivedDataCache")));
+    let zen = zen.or_else(|| local.map(|l| l.join(r"UnrealEngine\Common\Zen")));
     (ddc, zen)
 }
 
@@ -348,11 +389,182 @@ pub fn read_volumes(cfg: &Config, prev: &DiskWatch) -> Vec<Volume> {
             ctx.watched.push(g);
         }
     }
-    facts
+    let mut vols: Vec<Volume> = facts
         .iter()
         .filter(|f| f.total > 0 && !f.paths.is_empty())
         .map(|f| volume_from(f, &ctx, &s, prev.previous(&f.guid)))
-        .collect()
+        .collect();
+    apply_and_record_trends(&mut vols, &s);
+    vols
+}
+
+const TREND_MIN_SPAN_SEC: u64 = 300;
+const TREND_SAMPLE_INTERVAL_SEC: u64 = 900;
+const TREND_DELTA_BYTES: u64 = 2 << 30;
+const TREND_RETENTION_SEC: u64 = 7 * 86_400;
+const TREND_MAX_SAMPLES: usize = 512;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrendSample {
+    pub unix: u64,
+    pub avail: u64,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct TrendHistory {
+    #[serde(default)]
+    volumes: std::collections::HashMap<String, Vec<TrendSample>>,
+}
+
+fn trend_file() -> PathBuf {
+    crate::paths::data_dir().join("disk-trend.json")
+}
+
+/// Compute burn/gain rate in GB/day via OLS slope over recent samples (negative = losing free
+/// space, positive = gaining free space). Returns `None` when fewer than 2 samples span at least
+/// 5 minutes, preventing noisy slopes on cold 1-second runs.
+pub fn compute_trend_gb_per_day(samples: &[TrendSample], now_unix: u64, cur_avail: u64, cur_total: u64) -> Option<f64> {
+    if cur_total == 0 {
+        return None;
+    }
+    let mut valid: Vec<(u64, u64)> = samples
+        .iter()
+        .filter(|s| s.unix <= now_unix && s.total == cur_total)
+        .map(|s| (s.unix, s.avail))
+        .collect();
+    valid.sort_by_key(|&(t, _)| t);
+
+    let day_cutoff = now_unix.saturating_sub(86_400);
+    let week_cutoff = now_unix.saturating_sub(TREND_RETENTION_SEC);
+    let mut pts: Vec<(u64, u64)> = valid.iter().copied().filter(|(t, _)| *t >= day_cutoff).collect();
+    if pts.last().is_none_or(|(t, _)| now_unix > *t) {
+        pts.push((now_unix, cur_avail));
+    }
+    let day_ok = pts.len() >= 2 && pts.last().unwrap().0.saturating_sub(pts[0].0) >= TREND_MIN_SPAN_SEC;
+    if !day_ok {
+        pts = valid.into_iter().filter(|(t, _)| *t >= week_cutoff).collect();
+        if pts.last().is_none_or(|(t, _)| now_unix > *t) {
+            pts.push((now_unix, cur_avail));
+        }
+    }
+    if pts.len() < 2 {
+        return None;
+    }
+    let t0 = pts[0].0;
+    let t_last = pts[pts.len() - 1].0;
+    if t_last.saturating_sub(t0) < TREND_MIN_SPAN_SEC {
+        return None;
+    }
+    let a0 = pts[0].1 as f64;
+    let n = pts.len() as f64;
+    let mut sum_x = 0.0f64;
+    let mut sum_y = 0.0f64;
+    let mut sum_xx = 0.0f64;
+    let mut sum_xy = 0.0f64;
+    for (t, a) in &pts {
+        let x = t.saturating_sub(t0) as f64;
+        let y = *a as f64 - a0;
+        sum_x += x;
+        sum_y += y;
+        sum_xx += x * x;
+        sum_xy += x * y;
+    }
+    let denom = n * sum_xx - sum_x * sum_x;
+    if denom.abs() < 1e-9 {
+        return None;
+    }
+    let slope_bps = (n * sum_xy - sum_x * sum_y) / denom;
+    let gb_per_day = slope_bps * 86_400.0 / GIB;
+    if !gb_per_day.is_finite() {
+        return None;
+    }
+    let rounded = (gb_per_day * 100.0).round() / 100.0;
+    Some(if rounded.abs() < 0.01 { 0.0 } else { rounded })
+}
+
+fn apply_and_record_trends(vols: &mut [Volume], s: &DiskSettings) {
+    let path = trend_file();
+    let mut hist: TrendHistory = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let now = unix_now();
+    let cutoff = now.saturating_sub(TREND_RETENTION_SEC);
+    let mut dirty = false;
+
+    for v in vols.iter_mut() {
+        let key = v.volume_id.to_ascii_lowercase();
+        let samples = hist.volumes.entry(key).or_default();
+        samples.retain(|e| e.unix >= cutoff && e.unix <= now && e.total == v.total);
+        v.trend_gb_per_day = compute_trend_gb_per_day(samples, now, v.avail, v.total);
+
+        if crate::disk_scan::cache_writes_allowed() && (is_watched(v, s) || v.fixed_local) {
+            let need_sample = match samples.last() {
+                None => true,
+                Some(last) => {
+                    now.saturating_sub(last.unix) >= TREND_SAMPLE_INTERVAL_SEC
+                        || v.avail.abs_diff(last.avail) >= TREND_DELTA_BYTES
+                }
+            };
+            if need_sample {
+                samples.push(TrendSample { unix: now, avail: v.avail, total: v.total });
+                if samples.len() > TREND_MAX_SAMPLES {
+                    let drop_n = samples.len() - TREND_MAX_SAMPLES;
+                    samples.drain(..drop_n);
+                }
+                dirty = true;
+            }
+        }
+    }
+
+    if dirty && crate::disk_scan::cache_writes_allowed() {
+        if let Ok(bytes) = serde_json::to_vec(&hist) {
+            let _ = crate::disk_clean::write_atomic(&path, &bytes);
+        }
+    }
+}
+
+/// Predict near-term headroom exhaustion (cook headroom / critical threshold) from volume burn rates.
+pub fn headroom_eta_advice(vols: &[Volume], cfg: &Config) -> Vec<String> {
+    let s = cfg.disk();
+    let mut out = Vec::new();
+    for v in vols.iter().filter(|v| is_watched(v, &s) || v.dev_drive) {
+        let Some(t) = v.trend_gb_per_day else { continue };
+        let burn = -t;
+        if !burn.is_finite() || burn < 0.5 {
+            continue;
+        }
+        let name = v.name();
+        if let Some(cook_gb) = cfg.prime.cook.disk_gb.filter(|&c| c > 0.0) {
+            if (v.roles.iter().any(|r| r == "projects" || r == "dev_drive")) && v.free_gb > cook_gb {
+                let hours = ((v.free_gb - cook_gb) / burn) * 24.0;
+                if hours.is_finite() && hours <= 72.0 {
+                    out.push(format!(
+                        "{} is losing ~{:.1} GB/day and will drop below {:.0} GB cook headroom in ~{:.0} hours.",
+                        name,
+                        burn,
+                        cook_gb,
+                        hours.ceil().max(1.0)
+                    ));
+                }
+            }
+        }
+        let crit_gb = threshold(s.critical_free_gb, s.critical_free_pct, v.total) as f64 / GIB;
+        if v.free_gb > crit_gb {
+            let hours = ((v.free_gb - crit_gb) / burn) * 24.0;
+            if hours.is_finite() && hours <= 48.0 {
+                out.push(format!(
+                    "{} is losing ~{:.1} GB/day and will hit critical free space ({:.0} GB) in ~{:.0} hours.",
+                    name,
+                    burn,
+                    crit_gb,
+                    hours.ceil().max(1.0)
+                ));
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------- Dev Drive health
@@ -450,6 +662,35 @@ pub struct CachesOnSystem {
     pub gb: f64,
     /// When they were sized.
     pub measured: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refs_64k_slack_gb: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cow_saved_gb: Option<f64>,
+}
+
+/// Extra host disk space consumed by a dynamically-expanding VHD/VHDX beyond guest used bytes.
+pub fn vhd_host_slack(file_bytes: u64, used_bytes: u64) -> u64 {
+    file_bytes.saturating_sub(used_bytes)
+}
+
+fn is_core_dev_drive_filter(name: &str) -> bool {
+    const CORE: &[&str] = &[
+        "WdFilter",
+        "FileInfo",
+        "bindFlt",
+        "wcifs",
+        "PrjFlt",
+        "luafv",
+        "storqosflt",
+        "npsvctrig",
+        "Wof",
+        "FileCrypt",
+        "FsDepends",
+        "CsvNSFlt",
+        "FLTMGR",
+    ];
+    let n = name.trim();
+    CORE.iter().any(|c| c.eq_ignore_ascii_case(n)) || n.to_ascii_uppercase().starts_with("PROCMON")
 }
 
 /// The Dev Drive findings (proposal 4 B). Pure.
@@ -523,17 +764,100 @@ pub fn dev_findings(vols: &[Volume], dev: &DevDriveState, caches: Option<&Caches
         }
     }
     for v in devs.iter().filter(|v| v.backing == "vhd") {
-        out.push(finding(
-            "dev:vhd_host_low",
-            "info",
-            format!("{} lives in a virtual disk file", v.name()),
-            format!(
-                "{} is a Dev Drive inside a VHD file. Ather MemGuard can't see how much room that file may still grow into on its host drive; check the host has at least as much free as {} may still grow.",
-                v.name(),
-                v.name()
-            ),
-            None,
-        ));
+        if let (Some(file_bytes), Some(host_free), Some(backed_by)) = (v.vhd_file_bytes, v.vhd_host_free, v.backed_by.as_deref()) {
+            let max_bytes = v.vhd_max_bytes.unwrap_or(v.total);
+            if vhd_host_low(file_bytes, max_bytes, host_free) {
+                let sev = if host_free < 20 * (1 << 30) { "problem" } else { "caution" };
+                out.push(finding(
+                    "dev:vhd_host_low",
+                    sev,
+                    format!("{} host drive is tight for virtual disk growth", v.name()),
+                    format!(
+                        "{} lives in {} ({:.1} GB on disk, max {:.1} GB), and its host drive only has {:.1} GB free.",
+                        v.name(),
+                        backed_by,
+                        gb2(file_bytes),
+                        gb2(max_bytes),
+                        gb2(host_free)
+                    ),
+                    None,
+                ));
+            }
+            let guest_used = v.total.saturating_sub(v.avail);
+            let slack = vhd_host_slack(file_bytes, guest_used);
+            if slack >= 10 * (1 << 30) || (slack >= 2 * (1 << 30) && slack >= file_bytes / 4) {
+                let sev = if vhd_host_low(file_bytes, max_bytes, host_free) { "caution" } else { "info" };
+                out.push(finding(
+                    "dev:vhd_compact",
+                    sev,
+                    format!("{} virtual disk holds {:.1} GB of reclaimable slack", v.name(), gb2(slack)),
+                    format!(
+                        "{} uses {:.1} GB on the host ({}) for {:.1} GB of guest data (~{:.1} GB slack). Compacting after dismounting returns that space to the host.",
+                        v.name(),
+                        gb2(file_bytes),
+                        backed_by,
+                        gb2(guest_used),
+                        gb2(slack)
+                    ),
+                    Some(Fix {
+                        needs_admin: true,
+                        command: format!("Optimize-VHD -Path \"{}\" -Mode Full (or diskpart: select vdisk file=\"{}\" -> attach vdisk readonly -> compact vdisk -> detach vdisk)", backed_by, backed_by),
+                        check: format!("{} file size on host drops closer to {:.1} GB", backed_by, gb2(guest_used)),
+                    }),
+                ));
+            }
+        } else {
+            out.push(finding(
+                "dev:vhd_host_low",
+                "info",
+                format!("{} lives in a virtual disk file", v.name()),
+                format!(
+                    "{} is a Dev Drive inside a VHD file. Ather MemGuard can't see how much room that file may still grow into on its host drive; check the host has at least as much free as {} may still grow.",
+                    v.name(),
+                    v.name()
+                ),
+                None,
+            ));
+        }
+    }
+    for v in &devs {
+        if v.cluster >= 65_536 {
+            let measured_slack = caches.and_then(|c| c.refs_64k_slack_gb).filter(|&g| g >= 0.5);
+            let sev = if measured_slack.is_some_and(|g| g >= 5.0) { "caution" } else { "info" };
+            let extra = measured_slack
+                .map(|g| format!(" The last checkup measured ~{:.1} GB of cluster slack.", g))
+                .unwrap_or_default();
+            out.push(finding(
+                "dev:refs_64k_clusters",
+                sev,
+                format!("{} uses 64 KB ReFS clusters", v.name()),
+                format!(
+                    "{} is formatted with 64 KB clusters, so every tiny file (Git objects, Rust crates, Unreal Intermediate files) reserves at least 64 KB instead of 4 KB.{extra}",
+                    v.name()
+                ),
+                None,
+            ));
+        }
+        if let Some(filters) = &v.attached_filters {
+            let extra: Vec<&str> = filters.iter().map(String::as_str).filter(|f| !is_core_dev_drive_filter(f)).collect();
+            if !extra.is_empty() {
+                out.push(finding(
+                    "dev:extra_filters",
+                    "info",
+                    format!("Extra minifilters attached to {}", v.name()),
+                    format!(
+                        "{} has non-core filesystem filters attached ({}), which can add I/O overhead on builds.",
+                        v.name(),
+                        extra.join(", ")
+                    ),
+                    Some(Fix {
+                        needs_admin: true,
+                        command: format!("fltmc instances -v {}", v.name()),
+                        check: format!("Review attached filters on {}", v.name()),
+                    }),
+                ));
+            }
+        }
     }
     if !devs.is_empty() && dev.third_party_av.is_some_and(|n| n > 0) {
         out.push(finding(
@@ -586,6 +910,7 @@ fn unix_now() -> u64 {
 /// The Dev Drive policy and Defender facts, from the day's cache unless `refresh`.
 pub fn dev_drive_state(refresh: bool) -> DevDriveState {
     let path = defender_cache_file();
+    let reg = disk_win::read_dev_drive_policy();
     let cached: Option<DefenderCache> = if refresh || cfg!(test) {
         None
     } else {
@@ -594,21 +919,31 @@ pub fn dev_drive_state(refresh: bool) -> DevDriveState {
     let c = match cached.filter(|c| unix_now().saturating_sub(c.unix) < DEFENDER_CACHE.as_secs()) {
         Some(c) => c,
         None => {
-            let c = DefenderCache { unix: unix_now(), time: crate::win::local_time_string(), facts: disk_win::probe_defender(), fsutil: disk_win::fsutil_devdrv_query() };
+            let fsutil = if reg.enabled.is_none() || reg.av_filters == "unknown" {
+                disk_win::fsutil_devdrv_query()
+            } else {
+                None
+            };
+            let c = DefenderCache { unix: unix_now(), time: crate::win::local_time_string(), facts: disk_win::probe_defender(), fsutil };
             if crate::disk_scan::cache_writes_allowed() {
-                let _ = std::fs::create_dir_all(crate::paths::data_dir());
-                let _ = std::fs::write(&path, serde_json::to_string_pretty(&c).unwrap_or_default());
+                if let Ok(bytes) = serde_json::to_vec_pretty(&c) {
+                    let _ = crate::disk_clean::write_atomic(&path, &bytes);
+                }
             }
             c
         }
     };
-    let (enabled, av) = parse_fsutil_devdrv(c.fsutil.as_deref().unwrap_or(""));
-    let defender_active = c.facts.defender_active != Some(false);
+    let (fsutil_enabled, fsutil_av) = parse_fsutil_devdrv(c.fsutil.as_deref().unwrap_or(""));
+    let enabled = reg.enabled.or(fsutil_enabled);
+    let av = if reg.av_filters != "unknown" { reg.av_filters } else { fsutil_av };
+    let pm = reg.perf_mode.or(c.facts.performance_mode_status);
+    let rt = c.facts.realtime_enabled.or_else(|| reg.realtime_disabled.map(|d| !d));
+    let defender_active = if reg.passive_mode == Some(true) { false } else { c.facts.defender_active != Some(false) };
     DevDriveState {
         enabled,
         av_filters: av.into(),
-        defender_performance_mode: if defender_active { performance_mode_words(c.facts.performance_mode_status) } else { "unknown" }.into(),
-        realtime_protection: c.facts.realtime_enabled,
+        defender_performance_mode: if defender_active { performance_mode_words(pm) } else { "unknown" }.into(),
+        realtime_protection: rt,
         third_party_av: c.facts.third_party_av,
         defender_checked: c.time,
     }
@@ -629,6 +964,7 @@ pub fn report(cfg: &Config, refresh: bool) -> DiskReport {
             None => format!("{} is low on space.", v.name()),
         });
     }
+    advice.extend(headroom_eta_advice(&vols, cfg));
     if caches.is_none() && s.check_dev_drive && vols.iter().any(|v| v.dev_drive) {
         advice.push("Run `memguard disk checkup` once to size the caches on the system drive.".into());
     }
@@ -660,14 +996,19 @@ pub fn render_text(r: &DiskReport) -> String {
             Level::Elevated => "   getting full",
             Level::Critical => "   ALMOST FULL",
         };
+        let trend = match v.trend_gb_per_day {
+            Some(t) if t.abs() >= 0.1 => format!("  {:+.1} GB/day", t),
+            _ => String::new(),
+        };
         s.push_str(&format!(
-            "{:<4} {:<5} {:>9.1} GB free of {:>8.1} GB ({:>4.1}%)  {}{}\n",
+            "{:<4} {:<5} {:>9.1} GB free of {:>8.1} GB ({:>4.1}%)  {}{}{}\n",
             v.name(),
             v.fs,
             v.free_gb,
             v.total_gb,
             v.free_pct,
             if kind.is_empty() { String::new() } else { kind.join(", ") },
+            trend,
             level
         ));
         if v.fs.eq_ignore_ascii_case("ReFS") {
@@ -911,6 +1252,7 @@ mod tests {
             fs_version: None,
             bus_type: Some(17),
             seek_penalty: Some(false),
+            ..Default::default()
         }
     }
 
@@ -1054,7 +1396,7 @@ mod tests {
         hdd.seek_penalty = Some(true);
         let g = volume_from(&hdd, &ctx, &st, None);
         let vols = vec![c, d.clone(), e, g];
-        let caches = CachesOnSystem { gb: 200.0, measured: String::new() };
+        let caches = CachesOnSystem { gb: 200.0, measured: String::new(), ..Default::default() };
         let f = dev_findings(&vols, &dev_state("off", "antivirus_allowed"), Some(&caches), &st);
         let ids: Vec<&str> = f.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(ids, ["dev:perf_mode_off", "dev:caches_on_c"]);
@@ -1093,7 +1435,7 @@ mod tests {
         let ctx = ctx_for("C", &["D"]);
         let c = volume_from(&facts("C", "NTFS", 1903, 298, false), &ctx, &st, None);
         let d = volume_from(&facts("D", "ReFS", 1907, 20, true), &ctx, &st, None);
-        let caches = CachesOnSystem { gb: 200.0, measured: String::new() };
+        let caches = CachesOnSystem { gb: 200.0, measured: String::new(), ..Default::default() };
         let f = crate::doctor::disk_findings(&[c, d], Some(&dev_state("off", "antivirus_allowed")), Some(&caches), &crate::config::Config::builtin());
         let ids: Vec<&str> = f.iter().map(|f| f.id.as_str()).collect();
         assert!(ids.iter().any(|i| i.starts_with("disk:low:")) && ids.contains(&"dev:perf_mode_off"), "{:?}", ids);
@@ -1120,6 +1462,136 @@ mod tests {
         assert!(!checks[0].ok);
         assert_eq!(checks[0].roles, vec!["project", "temp"]);
         assert!(gate_checks(None, 100.0, &[], 20.0).is_empty());
+    }
+
+    #[test]
+    fn vhd_findings_64k_clusters_and_extra_filters() {
+        let st = s();
+        let ctx = ctx_for("C", &["D"]);
+        let mut f = facts("D", "ReFS", 500, 400, true);
+        f.bus_type = Some(disk_win::BUS_FILE_BACKED_VIRTUAL);
+        f.vhd_backed_by = Some(r"C:\Dev\devdrive.vhdx".into());
+        f.vhd_file_bytes = Some(250 * G); // guest used = 100 GB -> 150 GB slack!
+        f.vhd_host_free = Some(50 * G); // max 500 - 250 = 250 > 50 -> host low!
+        f.vhd_max_bytes = Some(500 * G);
+        f.cluster = 65_536;
+        f.attached_filters = Some(vec!["WdFilter".into(), "FileInfo".into(), "ThirdPartyScanner".into()]);
+
+        let d = volume_from(&f, &ctx, &st, None);
+        assert_eq!(d.backed_by.as_deref(), Some(r"C:\Dev\devdrive.vhdx"));
+        assert_eq!(vhd_host_slack(250 * G, 100 * G), 150 * G);
+
+        let caches = CachesOnSystem { gb: 5.0, measured: String::new(), refs_64k_slack_gb: Some(12.5), cow_saved_gb: None };
+        let found = dev_findings(&[d], &dev_state("on", "antivirus_allowed"), Some(&caches), &st);
+        let ids: Vec<&str> = found.iter().map(|x| x.id.as_str()).collect();
+        assert!(ids.contains(&"dev:vhd_host_low"), "{:?}", ids);
+        assert!(ids.contains(&"dev:vhd_compact"), "{:?}", ids);
+        assert!(ids.contains(&"dev:refs_64k_clusters"), "{:?}", ids);
+        assert!(ids.contains(&"dev:extra_filters"), "{:?}", ids);
+        let compact = found.iter().find(|x| x.id == "dev:vhd_compact").unwrap();
+        assert!(compact.fix.as_ref().unwrap().command.contains("Optimize-VHD"));
+        assert!(compact.fix.as_ref().unwrap().command.contains("compact vdisk"));
+    }
+
+    #[test]
+    fn trend_computation_and_headroom_eta() {
+        let now = 1_700_100_000u64;
+        // Cold 1-second run: < 300s span -> None.
+        let cold = vec![TrendSample { unix: now - 1, avail: 200 * G, total: 500 * G }];
+        assert_eq!(compute_trend_gb_per_day(&cold, now, 200 * G, 500 * G), None);
+
+        // Losing 24 GB over 24h -> -24.0 GB/day.
+        let burn = vec![
+            TrendSample { unix: now - 86_400, avail: 224 * G, total: 500 * G },
+            TrendSample { unix: now - 43_200, avail: 212 * G, total: 500 * G },
+        ];
+        let t = compute_trend_gb_per_day(&burn, now, 200 * G, 500 * G).unwrap();
+        assert!((t - (-24.0)).abs() < 0.05, "got {}", t);
+
+        // Forward clock jump sample in future + partition resize sample ignored.
+        let dirty = vec![
+            TrendSample { unix: now - 86_400, avail: 100 * G, total: 300 * G }, // old partition size
+            TrendSample { unix: now + 99999, avail: 999 * G, total: 500 * G },  // clock jump
+            TrendSample { unix: now - 3600, avail: 201 * G, total: 500 * G },
+        ];
+        let t2 = compute_trend_gb_per_day(&dirty, now, 200 * G, 500 * G).unwrap();
+        assert!((t2 - (-24.0)).abs() < 0.1, "got {}", t2);
+
+        // Headroom ETA advice triggers when cook headroom <= 72h.
+        let mut cfg = Config::builtin();
+        cfg.prime.cook.disk_gb = Some(100.0);
+        let ctx = ctx_for("C", &["D"]);
+        let mut d = volume_from(&facts("D", "ReFS", 500, 120, true), &ctx, &s(), None);
+        d.trend_gb_per_day = Some(-20.0); // 20 GB above cook (100 GB) at 20 GB/day -> 24 hours
+        let adv = headroom_eta_advice(&[d], &cfg);
+        assert!(adv.iter().any(|a| a.contains("cook headroom") && a.contains("24 hours")), "{:?}", adv);
+
+        // Out-of-order / backward-clock-jump samples must not panic and still compute exact slope.
+        let unsorted = vec![
+            TrendSample { unix: now - 500, avail: 200 * G, total: 500 * G },
+            TrendSample { unix: now - 1000, avail: 202 * G, total: 500 * G },
+        ];
+        let t_unsorted = compute_trend_gb_per_day(&unsorted, now, 198 * G, 500 * G).unwrap();
+        assert!(t_unsorted < 0.0 && t_unsorted.is_finite(), "got {}", t_unsorted);
+
+        // >= 2 samples in last 24h spanning < 300s must fall back to valid 7-day history.
+        let short_recent_with_week = vec![
+            TrendSample { unix: now - 2 * 86_400, avail: 248 * G, total: 500 * G },
+            TrendSample { unix: now - 86_400 - 3600, avail: 225 * G, total: 500 * G },
+            TrendSample { unix: now - 60, avail: 200 * G, total: 500 * G },
+            TrendSample { unix: now - 30, avail: 200 * G, total: 500 * G },
+        ];
+        let t_week = compute_trend_gb_per_day(&short_recent_with_week, now, 200 * G, 500 * G).unwrap();
+        assert!((t_week - (-24.0)).abs() < 0.5, "expected ~-24 GB/day from 7d fallback, got {}", t_week);
+    }
+
+    #[test]
+    fn ue_cache_dirs_respects_zen_env_var() {
+        let prev = std::env::var_os("UE-ZenSubprocessDataPath");
+        std::env::set_var("UE-ZenSubprocessDataPath", r"E:\CustomZen");
+        let (_, zen) = ue_cache_dirs();
+        assert_eq!(zen, Some(PathBuf::from(r"E:\CustomZen")));
+        std::env::set_var("UE-ZenSubprocessDataPath", "None");
+        let (_, zen_none) = ue_cache_dirs();
+        assert_ne!(zen_none, Some(PathBuf::from("None")));
+        match prev {
+            Some(v) => std::env::set_var("UE-ZenSubprocessDataPath", v),
+            None => std::env::remove_var("UE-ZenSubprocessDataPath"),
+        }
+    }
+
+    #[test]
+    fn t5_headroom_eta_advice_and_dev_findings_boundaries() {
+        let cfg = Config::builtin();
+        let mut v_nan = volume_from(&facts("C", "NTFS", 500, 10, false), &ctx_for("C", &["C"]), &s(), None);
+        v_nan.trend_gb_per_day = Some(f64::NAN);
+        assert!(headroom_eta_advice(&[v_nan], &cfg).is_empty());
+
+        let mut v_gain = volume_from(&facts("C", "NTFS", 500, 10, false), &ctx_for("C", &["C"]), &s(), None);
+        v_gain.trend_gb_per_day = Some(3.0);
+        assert!(headroom_eta_advice(&[v_gain], &cfg).is_empty());
+
+        let mut v_burn = volume_from(&facts("C", "NTFS", 500, 35, false), &ctx_for("C", &["C"]), &s(), None);
+        v_burn.trend_gb_per_day = Some(-15.0);
+        let eta = headroom_eta_advice(&[v_burn], &cfg);
+        assert!(eta.iter().any(|l| l.contains("critical free space")), "{:?}", eta);
+
+        // Dev Drive VHD compact (>=2 GiB & >=25% vs >=10 GiB), 64K ReFS slack >= 5.0 GB caution, PROCMON24 ignored
+        let mut vf = facts("D", "ReFS", 200, 100, true);
+        vf.cluster = 65_536;
+        vf.bus_type = Some(disk_win::BUS_FILE_BACKED_VIRTUAL);
+        vf.vhd_backed_by = Some(r"C:\DevDrive.vhdx".into());
+        vf.vhd_file_bytes = Some(120 * G); // guest_used = 100 GB -> slack = 20 GB (>= 10 GB)
+        vf.vhd_host_free = Some(50 * G);
+        vf.vhd_max_bytes = Some(200 * G);
+        vf.attached_filters = Some(vec!["PROCMON24".into(), "WdFilter".into(), "bindflt".into()]);
+        let dv = volume_from(&vf, &RoleContext::default(), &s(), None);
+        let dev = dev_state("on", "antivirus_allowed");
+        let caches = CachesOnSystem { gb: 0.0, measured: "t".into(), refs_64k_slack_gb: Some(5.0), cow_saved_gb: None };
+        let df = dev_findings(&[dv], &dev, Some(&caches), &s());
+        assert!(df.iter().any(|f| f.id == "dev:vhd_compact"), "{:?}", df);
+        assert_eq!(df.iter().find(|f| f.id == "dev:refs_64k_clusters").unwrap().severity, "caution");
+        assert!(!df.iter().any(|f| f.id == "dev:extra_filters"), "PROCMON24 is a core filter: {:?}", df);
     }
 }
 

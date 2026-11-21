@@ -20,6 +20,7 @@ enum Command {
     /// Silent install for scripts.
     Install(install::InstallOptions),
     /// Paint every UI surface with sample data into PNG files (docs/UI.md, for review).
+    #[cfg(feature = "ui-snapshots")]
     UiSnapshots(String),
     /// Started elevated by the tray's "Free Windows file cache": empty it, exit 0 when done.
     FlushCache,
@@ -38,6 +39,7 @@ fn parse_args(args: &[String]) -> Command {
         "--uninstall" if rest.is_empty() => Command::Uninstall,
         "--settings" if rest.is_empty() => Command::Settings,
         "--flush-cache" if rest.is_empty() => Command::FlushCache,
+        #[cfg(feature = "ui-snapshots")]
         "--ui-snapshots" => match rest {
             [dir] => Command::UiSnapshots(dir.clone()),
             _ => Command::Unknown(args.join(" ")),
@@ -110,6 +112,7 @@ fn main() {
                 1
             }
         },
+        #[cfg(feature = "ui-snapshots")]
         Command::UiSnapshots(dir) => {
             let dir = std::path::Path::new(&dir);
             match athermemguard::ui::snapshots::write_all(dir) {
@@ -153,6 +156,7 @@ mod tests {
         assert_eq!(p(&["--install", "--no-start"]), opts(true, true, false));
         assert_eq!(p(&["--install", "--no-startup"]), opts(true, false, true));
         assert_eq!(p(&["--install", "--no-start", "--no-path", "--NO-STARTUP"]), opts(false, false, false));
+        #[cfg(feature = "ui-snapshots")]
         assert_eq!(p(&["--ui-snapshots", r"C:\shots"]), Command::UiSnapshots(r"C:\shots".into()));
     }
 

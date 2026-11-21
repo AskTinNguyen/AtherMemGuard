@@ -6,6 +6,7 @@
 //! out into a flat list of `Item`s (rect + what to draw + what a click does), which hit tests,
 //! keyboard focus and the layout tests use.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use windows_sys::Win32::Foundation::HWND;
@@ -16,7 +17,7 @@ use super::commands::Command;
 use super::geom::{Pt, Rect};
 use super::kit::*;
 use super::settings_model::*;
-use super::settings_store::{group_path, Layer, SettingsStore, Tier, Value};
+use super::settings_store::{group_path, strip_exe, Layer, RunningApp, SettingsStore, Tier, Value};
 use super::status_source::StatusSource;
 use super::theme::*;
 use super::toast;
@@ -63,14 +64,14 @@ pub fn open_settings(host: SettingsHost) -> HWND {
 
 // ---------------------------------------------------------------- items
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ChipOwner {
-    Protect,
+    List(String),
     Group(String),
 }
 
 /// What a click or Enter on an item does.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Act {
     Toggle(String),
     Startup,
@@ -86,7 +87,7 @@ pub enum Act {
 }
 
 /// What right-click on a row offers.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowKey {
     /// A row in `model[block]`, or row `inner` of the group card at `model[block]`.
     Row { block: usize, inner: Option<usize> },
@@ -151,16 +152,24 @@ enum Pending {
     Reset(RowKey),
     Priority(String),
     Speed(String, Tier),
-    AddApp(String),
+    AddApp { group: String, create: bool, apps: Vec<RunningApp> },
     GroupMenu(String),
 }
 
 enum EditTarget {
     Number(String),
-    AddProtect,
-    AddApp(String),
+    AddChip(String),
+    AddApp { group: String, create: bool },
     AddGroup,
     Rename(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct SettingsHover {
+    act: Option<Act>,
+    sub: Option<usize>,
+    row: Option<RowKey>,
+    dialog: Option<bool>,
 }
 
 enum Confirm {
@@ -194,10 +203,12 @@ pub struct SettingsWindow {
     revision: u64,
     pub query: String,
     open_group: Option<String>,
-    protect_expanded: bool,
+    expanded_chips: HashSet<ChipOwner>,
     items: Vec<Item>,
     scroll: Scroll,
     mouse: Option<Pt>,
+    hover: SettingsHover,
+    dialog_rects: Option<(Rect, Rect)>,
     pressed: Option<Act>,
     focus: Option<Act>,
     drag: Option<Drag>,
@@ -207,6 +218,8 @@ pub struct SettingsWindow {
     pending: Option<Pending>,
     confirm: Option<Confirm>,
     caret_on: bool,
+    focused: bool,
+    minimized: bool,
     tier_speed_click: bool,
     scale: Scale,
     size: (i32, i32),
@@ -222,10 +235,12 @@ impl SettingsWindow {
             revision: 0,
             query: String::new(),
             open_group: None,
-            protect_expanded: false,
+            expanded_chips: HashSet::new(),
             items: Vec::new(),
             scroll: Scroll::default(),
             mouse: None,
+            hover: SettingsHover::default(),
+            dialog_rects: None,
             pressed: None,
             focus: None,
             drag: None,
@@ -235,6 +250,8 @@ impl SettingsWindow {
             pending: None,
             confirm: None,
             caret_on: true,
+            focused: true,
+            minimized: false,
             tier_speed_click: false,
             scale: Scale(1.0),
             size: (0, 0),
@@ -257,31 +274,38 @@ impl SettingsWindow {
         }
     }
 
+    #[cfg(any(test, feature = "ui-snapshots"))]
     pub fn set_query(&mut self, q: &str) {
         self.query = q.to_string();
         self.scroll.y = 0;
     }
 
+    #[cfg(any(test, feature = "ui-snapshots"))]
     pub fn set_open_group(&mut self, name: Option<&str>) {
         self.open_group = name.map(str::to_string);
     }
 
     /// Show the hard-cap confirmation (snapshots).
+    #[cfg(any(test, feature = "ui-snapshots"))]
     pub fn confirm_hard_cap(&mut self, group: &str, mb: f64) {
         self.confirm = Some(Confirm::HardCap { path: group_path(group, Tier::Always, "hard_cap_mb"), mb });
+        self.dialog_rects = None;
     }
 
     /// Put the mouse somewhere (snapshots of hover states).
+    #[cfg(any(test, feature = "ui-snapshots"))]
     pub fn set_mouse(&mut self, p: Option<Pt>) {
         self.mouse = p;
     }
 
     /// The items of the last layout (tests).
+    #[cfg(any(test, feature = "ui-snapshots"))]
     pub fn items(&self) -> &[Item] {
         &self.items
     }
 
     /// Whole page height (search bar + content + footer) at `width`, for full-page snapshots.
+    #[cfg(any(test, feature = "ui-snapshots"))]
     pub fn page_height(&mut self, c: &Canvas) -> i32 {
         let saved = self.scroll.y;
         self.scroll.y = 0;
@@ -322,7 +346,9 @@ impl SettingsWindow {
                 Ctl::Number { path: p, .. } | Ctl::Toggle { path: p, .. } | Ctl::Segmented { path: p, .. } | Ctl::Hotkey { path: p, .. } if p == path => {
                     return Some((r, &r.ctl))
                 }
-                Ctl::Headroom { ram_path, commit_path, .. } if ram_path == path || commit_path == path => return Some((r, &r.ctl)),
+                Ctl::Headroom { ram_path, commit_path, disk_path, .. } if ram_path == path || commit_path == path || disk_path == path => {
+                    return Some((r, &r.ctl))
+                }
                 _ => {}
             }
         }
@@ -539,14 +565,19 @@ impl SettingsWindow {
         h
     }
 
-    fn chips_for(&self, r: &Row) -> Option<(Chips, ChipOwner)> {
+    fn chips_for(&self, c: &Canvas, r: &Row, max_w: i32) -> Option<(Chips, ChipOwner)> {
         match &r.ctl {
-            Ctl::Chips { items, add_label, .. } => Some((
-                Chips { items: items.clone(), add_label: add_label.to_string(), max_lines: 1, expanded: self.protect_expanded || !self.query.is_empty() },
-                ChipOwner::Protect,
-            )),
+            Ctl::Chips { path, items, add_label } => {
+                let owner = ChipOwner::List(path.clone());
+                let expanded = self.expanded_chips.contains(&owner) || !self.query.is_empty();
+                let compact = items.iter().map(|s| compact_chip_label(c, s, max_w)).collect();
+                Some((Chips { items: compact, add_label: add_label.to_string(), max_lines: 1, expanded }, owner))
+            }
             Ctl::GroupApps { group, items } => {
-                Some((Chips { items: items.clone(), add_label: "+ Add app…".into(), max_lines: 3, expanded: false }, ChipOwner::Group(group.clone())))
+                let owner = ChipOwner::Group(group.clone());
+                let expanded = self.expanded_chips.contains(&owner) || !self.query.is_empty();
+                let compact = items.iter().map(|s| compact_chip_label(c, s, max_w)).collect();
+                Some((Chips { items: compact, add_label: "+ Add app…".into(), max_lines: 3, expanded }, owner))
             }
             _ => None,
         }
@@ -556,7 +587,7 @@ impl SettingsWindow {
         match &r.ctl {
             Ctl::Toggle { .. } | Ctl::Startup { .. } => c.s(24.0),
             Ctl::Segmented { .. } => c.s(38.0),
-            Ctl::Chips { .. } | Ctl::GroupApps { .. } => self.chips_for(r).map(|(ch, _)| ch.height(c, w)).unwrap_or(0),
+            Ctl::Chips { .. } | Ctl::GroupApps { .. } => self.chips_for(c, r, w).map(|(ch, _)| ch.height(c, w)).unwrap_or(0),
             Ctl::None => 0,
             _ => c.s(CTRL_H),
         }
@@ -598,16 +629,22 @@ impl SettingsWindow {
                 items.push(Item::new(num_r, Paint::Num(NumberField { text, muted: off, editing })).act(Act::Number(path.clone())));
                 items.push(Item::new(unit_r, Paint::Text { s: unit.clone(), font: F_HINT, color: MUTED, align: Align::Left }));
             }
-            Ctl::Headroom { ram_path, ram, commit_path, commit } => {
-                let num_w = c.s(64.0);
+            Ctl::Headroom { ram_path, ram, commit_path, commit, disk_path, disk } => {
+                let num_w = c.s(56.0);
                 let gb_w = c.measure("GB", F_HINT).0;
                 let mut x = ctl.right() - gb_w;
                 items.push(Item::new(Rect::new(x, ctl.y, gb_w, ctl.h), Paint::Text { s: "GB".into(), font: F_HINT, color: MUTED, align: Align::Left }));
-                for (path, v, cap) in [(commit_path, commit, "Commit"), (ram_path, ram, "RAM")] {
+                for (path, v, cap, off_zero) in [
+                    (disk_path, disk, "Disk", true),
+                    (commit_path, commit, "Commit", false),
+                    (ram_path, ram, "RAM", false),
+                ] {
                     x -= c.s(8.0) + num_w;
+                    let off = off_zero && *v <= 0.0;
+                    let text = if off { "Off".to_string() } else { format_number(*v) };
                     let editing = editing_path.as_deref() == Some(path.as_str());
                     items.push(
-                        Item::new(Rect::new(x, ctl.y, num_w, ctl.h), Paint::Num(NumberField { text: format_number(*v), muted: false, editing }))
+                        Item::new(Rect::new(x, ctl.y, num_w, ctl.h), Paint::Num(NumberField { text, muted: off, editing }))
                             .act(Act::Number(path.clone())),
                     );
                     let cw = c.measure(cap, F_HINT).0;
@@ -617,7 +654,7 @@ impl SettingsWindow {
                 }
             }
             Ctl::Chips { .. } | Ctl::GroupApps { .. } => {
-                if let Some((chips, owner)) = self.chips_for(r) {
+                if let Some((chips, owner)) = self.chips_for(c, r, ctl.w) {
                     items.push(Item::new(ctl, Paint::Chips(chips)).act(Act::Chips(owner)));
                 }
             }
@@ -906,7 +943,7 @@ impl SettingsWindow {
         let x = c.s(24.0);
         c.icon(Rect::new(x, 0, c.s(18.0), th), glyph::SEARCH, Font::new(Face::Icon, 15.0, REGULAR), MUTED);
         let tx = x + c.s(18.0) + c.s(12.0);
-        let caret_on = self.caret_on && self.editing.is_none() && self.recording.is_none() && self.confirm.is_none();
+        let caret_on = self.caret_on && self.caret_visible();
         let caret_h = c.s(20.0);
         let cw = c.px1(2.0);
         if self.query.is_empty() {
@@ -993,7 +1030,7 @@ impl SettingsWindow {
                 let idx = match (p, self.item_with(&act)) {
                     (Some(p), Some(it)) => match &it.paint {
                         Paint::Seg(seg) => {
-                            let probe = Canvas::new(1, 1, self.scale);
+                            let probe = Canvas::probe(self.scale);
                             seg.hit(&probe, it.rect, p).unwrap_or(*selected)
                         }
                         _ => *selected,
@@ -1022,10 +1059,24 @@ impl SettingsWindow {
                             format_number(*value)
                         }
                     }
-                    Some((_, Ctl::Headroom { ram_path, ram, commit, .. })) => format_number(if *ram_path == path { *ram } else { *commit }),
+                    Some((_, Ctl::Headroom { ram_path, ram, commit_path, commit, disk_path, disk })) => {
+                        if *disk_path == path {
+                            if *disk <= 0.0 {
+                                String::new()
+                            } else {
+                                format_number(*disk)
+                            }
+                        } else if *ram_path == path {
+                            format_number(*ram)
+                        } else if *commit_path == path {
+                            format_number(*commit)
+                        } else {
+                            String::new()
+                        }
+                    }
                     _ => String::new(),
                 };
-                let probe = Canvas::new(1, 1, self.scale);
+                let probe = Canvas::probe(self.scale);
                 self.editing = Some(EditTarget::Number(path));
                 host.edit(0, NumberField::edit_rect(&probe, rect), &text, true);
             }
@@ -1035,30 +1086,35 @@ impl SettingsWindow {
                     Paint::Chips(ch) => (it.rect, ch.clone()),
                     _ => return,
                 };
-                let probe = Canvas::new(1, 1, self.scale);
+                let probe = Canvas::probe(self.scale);
                 let hit = match p {
                     Some(p) => chips.hit(&probe, rect, p),
                     None => Some(ChipHit::Add),
                 };
                 let add_rect = chips.layout(&probe, rect.w).into_iter().find(|(_, k)| *k == ChipKind::Add).map(|(r, _)| r.offset(rect.x, rect.y)).unwrap_or(rect);
                 match (hit, owner) {
-                    (Some(ChipHit::Remove(i)), ChipOwner::Protect) => {
-                        let mut items = chips.items.clone();
-                        items.remove(i);
-                        self.write(|s| s.set("ue.protect", Value::List(items)));
+                    (Some(ChipHit::Remove(i)), ChipOwner::List(path)) => {
+                        let mut items = self.host.store.get(&path).and_then(|s| s.value.as_list().map(|l| l.to_vec())).unwrap_or_default();
+                        if i < items.len() {
+                            items.remove(i);
+                            self.write(|s| s.set(&path, Value::List(items)));
+                        }
                     }
                     (Some(ChipHit::Remove(i)), ChipOwner::Group(g)) => {
-                        let name = chips.items[i].clone();
-                        self.write(|s| s.remove_process(&g, &name));
+                        if let Some(name) = self.group(&g).and_then(|gm| gm.info.processes.get(i)).cloned() {
+                            self.write(|s| s.remove_process(&g, &name));
+                        }
                     }
-                    (Some(ChipHit::More), _) => self.protect_expanded = true,
-                    (Some(ChipHit::Add), ChipOwner::Protect) => {
-                        self.editing = Some(EditTarget::AddProtect);
+                    (Some(ChipHit::More), owner) => {
+                        self.expanded_chips.insert(owner);
+                    }
+                    (Some(ChipHit::Add), ChipOwner::List(path)) => {
+                        self.editing = Some(EditTarget::AddChip(path));
                         let w = c_max(add_rect.w, probe.s(180.0));
                         let r = Rect::new(add_rect.right() - w, add_rect.y, w, add_rect.h);
                         host.edit(0, r.inset(probe.s(6.0), probe.s(2.0)), "", false);
                     }
-                    (Some(ChipHit::Add), ChipOwner::Group(g)) => self.add_app_menu(g, Pt::new(add_rect.x, add_rect.bottom()), host),
+                    (Some(ChipHit::Add), ChipOwner::Group(g)) => self.add_app_menu(g, false, Pt::new(add_rect.x, add_rect.bottom()), host),
                     _ => {}
                 }
             }
@@ -1087,19 +1143,19 @@ impl SettingsWindow {
         host.invalidate();
     }
 
-    fn add_app_menu(&mut self, group: String, at: Pt, host: &mut Host) {
-        let apps = self.host.store.running_apps();
+    fn add_app_menu(&mut self, group: String, create: bool, at: Pt, host: &mut Host) {
+        let mut apps = self.host.store.running_apps();
+        apps.truncate(30);
         let mut items: Vec<MenuItem> = apps
             .iter()
             .enumerate()
-            .take(30)
             .map(|(i, a)| MenuItem::new(i as u32 + 1, &format!("{} · {} processes · {}", a.name, a.processes, format_gb(a.ram_gb))))
             .collect();
         if !items.is_empty() {
             items.push(MenuItem::separator());
         }
         items.push(MenuItem::new(MENU_ID_TYPE, "Type a name…"));
-        self.pending = Some(Pending::AddApp(group));
+        self.pending = Some(Pending::AddApp { group, create, apps });
         host.menu(MENU_PICK, items, at);
     }
 
@@ -1108,7 +1164,7 @@ impl SettingsWindow {
         match b {
             ButtonAct::AddGroup => {
                 if let Some(it) = self.item_with(&Act::Button(ButtonAct::AddGroup)) {
-                    let probe = Canvas::new(1, 1, self.scale);
+                    let probe = Canvas::probe(self.scale);
                     let r = Rect::new(it.rect.right() - probe.s(240.0), it.rect.y, probe.s(240.0), it.rect.h);
                     self.editing = Some(EditTarget::AddGroup);
                     host.edit(0, NumberField::edit_rect(&probe, r), "New group", false);
@@ -1129,7 +1185,10 @@ impl SettingsWindow {
                 let f = self.host.store.settings_file();
                 host.shell_open(&f.to_string_lossy());
             }
-            ButtonAct::ResetAll => self.confirm = Some(Confirm::ResetAll),
+            ButtonAct::ResetAll => {
+                self.confirm = Some(Confirm::ResetAll);
+                self.dialog_rects = None;
+            }
         }
         host.invalidate();
     }
@@ -1232,13 +1291,16 @@ impl SettingsWindow {
                 MENU_ID_RENAME => {
                     let rect = self.items.iter().find(|i| matches!(&i.paint, Paint::GroupName { name, .. } if *name == g)).map(|i| i.rect);
                     if let Some(r) = rect {
-                        let probe = Canvas::new(1, 1, self.scale);
+                        let probe = Canvas::probe(self.scale);
                         self.editing = Some(EditTarget::Rename(g.clone()));
                         let er = Rect::new(r.x - probe.s(4.0), r.y, probe.s(200.0), probe.line_height(F_GROUP) + probe.s(4.0));
                         host.edit(0, er, &g, false);
                     }
                 }
-                MENU_ID_REMOVE => self.confirm = Some(Confirm::RemoveGroup(g)),
+                MENU_ID_REMOVE => {
+                    self.confirm = Some(Confirm::RemoveGroup(g));
+                    self.dialog_rects = None;
+                }
                 _ => {}
             },
             Pending::Priority(g) => {
@@ -1253,17 +1315,33 @@ impl SettingsWindow {
                     self.write(|s| s.set(&path, Value::Text(v.to_string())));
                 }
             }
-            Pending::AddApp(g) => {
+            Pending::AddApp { group, create, apps } => {
                 if id == MENU_ID_TYPE {
-                    let rect = self.items.iter().find(|i| i.act == Some(Act::Chips(ChipOwner::Group(g.clone())))).map(|i| i.rect);
+                    let rect = if create {
+                        self.item_with(&Act::Button(ButtonAct::AddGroup)).map(|i| i.rect)
+                    } else {
+                        self.items.iter().find(|i| i.act == Some(Act::Chips(ChipOwner::Group(group.clone())))).map(|i| i.rect)
+                    };
                     if let Some(r) = rect {
-                        let probe = Canvas::new(1, 1, self.scale);
+                        let probe = Canvas::probe(self.scale);
                         let w = probe.s(200.0).min(r.w);
-                        self.editing = Some(EditTarget::AddApp(g));
-                        host.edit(0, Rect::new(r.right() - w, r.bottom() - Chips::chip_h(&probe), w, Chips::chip_h(&probe)).inset(probe.s(4.0), probe.s(2.0)), "", false);
+                        let ch = Chips::chip_h(&probe);
+                        let er = if create {
+                            Rect::new(r.right() - w, r.y, w, r.h).inset(probe.s(4.0), probe.s(2.0))
+                        } else {
+                            Rect::new(r.right() - w, r.bottom() - ch, w, ch).inset(probe.s(4.0), probe.s(2.0))
+                        };
+                        self.editing = Some(EditTarget::AddApp { group, create });
+                        host.edit(0, er, "", false);
                     }
-                } else if let Some(app) = self.host.store.running_apps().get(id as usize - 1).cloned() {
-                    self.write(|s| s.add_process(&g, &app.name));
+                } else if let Some(app) = id.checked_sub(1).and_then(|i| apps.get(i as usize)).cloned() {
+                    if create {
+                        if self.write(|s| s.add_group(&group, std::slice::from_ref(&app.name))) {
+                            self.open_group = Some(group);
+                        }
+                    } else {
+                        self.write(|s| s.add_process(&group, &app.name));
+                    }
                 }
             }
         }
@@ -1282,7 +1360,17 @@ impl SettingsWindow {
                 let label = row.label.clone();
                 let (min, max, integer, off_at_zero, old) = match ctl {
                     Ctl::Number { min, max, integer, off_at_zero, value, .. } => (*min, *max, *integer, *off_at_zero, *value),
-                    Ctl::Headroom { ram_path, ram, commit, .. } => (0.0, 1024.0, false, false, if *ram_path == path { *ram } else { *commit }),
+                    Ctl::Headroom { ram_path, ram, commit_path, commit, disk_path, disk } => {
+                        if *disk_path == path {
+                            (0.0, 100_000.0, false, true, *disk)
+                        } else if *ram_path == path {
+                            (0.0, 1024.0, false, false, *ram)
+                        } else if *commit_path == path {
+                            (0.0, 1024.0, false, false, *commit)
+                        } else {
+                            return;
+                        }
+                    }
                     _ => return,
                 };
                 let t = text.trim().replace(',', ".");
@@ -1302,44 +1390,69 @@ impl SettingsWindow {
                     return;
                 }
                 let value = if integer { Value::Int(v as i64) } else { Value::Float(v) };
-                if off_at_zero && old <= 0.0 && v > 0.0 {
+                if path.ends_with(".hard_cap_mb") && off_at_zero && old <= 0.0 && v > 0.0 {
                     self.confirm = Some(Confirm::HardCap { path, mb: v });
+                    self.dialog_rects = None;
                     return;
                 }
                 self.write(|s| s.set(&path, value));
             }
-            EditTarget::AddProtect => {
-                if text.is_empty() {
+            EditTarget::AddChip(path) => {
+                let name = if chip_strip_exe(&path) {
+                    strip_exe(&text)
+                } else {
+                    text.trim().trim_matches('"').trim().to_string()
+                };
+                if name.is_empty() {
                     return;
                 }
-                let mut items = self.host.store.get("ue.protect").and_then(|s| s.value.as_list().map(|l| l.to_vec())).unwrap_or_default();
-                let name = text.trim_end_matches(".exe").to_string();
+                let mut items = self.host.store.get(&path).and_then(|s| s.value.as_list().map(|l| l.to_vec())).unwrap_or_default();
                 if !items.iter().any(|x| x.eq_ignore_ascii_case(&name)) {
                     items.push(name);
                 }
-                self.write(|s| s.set("ue.protect", Value::List(items)));
+                self.write(|s| s.set(&path, Value::List(items)));
             }
-            EditTarget::AddApp(g) => {
-                if !text.is_empty() {
-                    self.write(|s| s.add_process(&g, &text));
+            EditTarget::AddApp { group, create } => {
+                let proc_name = strip_exe(&text);
+                if proc_name.is_empty() {
+                    return;
+                }
+                if create {
+                    if self.write(|s| s.add_group(&group, std::slice::from_ref(&proc_name))) {
+                        self.open_group = Some(group);
+                    }
+                } else {
+                    self.write(|s| s.add_process(&group, &proc_name));
                 }
             }
             EditTarget::AddGroup => {
-                if text.is_empty() {
+                let name = text.trim().to_string();
+                if name.is_empty() {
                     return;
                 }
-                if self.write(|s| s.add_group(&text, &[])) {
-                    self.open_group = Some(text.clone());
-                    // Offer what's running right away.
-                    if let Some(it) = self.item_with(&Act::Button(ButtonAct::AddGroup)) {
-                        let at = Pt::new(it.rect.x, it.rect.bottom());
-                        self.add_app_menu(text, at, host);
-                    }
+                if name.contains('.') {
+                    toast::show_always(toast::catalog::save_failed("A group needs a name without dots."));
+                    return;
                 }
+                if self.host.store.groups().iter().any(|g| g.name.eq_ignore_ascii_case(&name)) {
+                    toast::show_always(toast::catalog::save_failed(&format!("There is already a group called {}.", name)));
+                    return;
+                }
+                let at = self
+                    .item_with(&Act::Button(ButtonAct::AddGroup))
+                    .map(|it| Pt::new(it.rect.x, it.rect.bottom()))
+                    .unwrap_or_default();
+                self.add_app_menu(name, true, at, host);
             }
             EditTarget::Rename(old) => {
-                if !text.is_empty() && text != old && self.write(|s| s.rename_group(&old, &text)) && self.open_group.as_deref() == Some(old.as_str()) {
-                    self.open_group = Some(text);
+                let new_name = text.trim().to_string();
+                if !new_name.is_empty() && new_name != old && self.write(|s| s.rename_group(&old, &new_name)) {
+                    if self.open_group.as_deref() == Some(old.as_str()) {
+                        self.open_group = Some(new_name.clone());
+                    }
+                    if self.expanded_chips.remove(&ChipOwner::Group(old)) {
+                        self.expanded_chips.insert(ChipOwner::Group(new_name));
+                    }
                 }
             }
         }
@@ -1362,6 +1475,7 @@ impl SettingsWindow {
     }
 
     fn confirm_ok(&mut self) {
+        self.dialog_rects = None;
         match self.confirm.take() {
             Some(Confirm::HardCap { path, mb }) => {
                 self.write(|s| s.set(&path, Value::Int(mb as i64)));
@@ -1458,6 +1572,54 @@ fn c_max(a: i32, b: i32) -> i32 {
     a.max(b)
 }
 
+fn compact_chip_label(c: &Canvas, s: &str, max_w: i32) -> String {
+    let avail = (max_w - c.s(20.0) - 2 * c.px1(1.0)).max(c.s(40.0));
+    if c.measure(s, F_CHIP).0 <= avail {
+        return s.to_string();
+    }
+    if let Some(last_sep) = s.rfind(['\\', '/']) {
+        let tail = &s[last_sep..];
+        let prefix = s.get(..3).filter(|p| p.ends_with(['\\', '/'])).unwrap_or("");
+        let candidate = format!("{}…{}", prefix, tail);
+        if c.measure(&candidate, F_CHIP).0 <= avail {
+            return candidate;
+        }
+    }
+    c.ellipsize(s, F_CHIP, avail)
+}
+
+fn scroll_thumb(scroll: &Scroll, scale: Scale) -> Option<Rect> {
+    if scroll.content <= scroll.view.h || scroll.view.h <= 0 {
+        return None;
+    }
+    let w = scale.s(4.0).max(3);
+    let track = scroll.view.inset(0, scale.s(4.0));
+    let h = ((track.h as i64 * scroll.view.h as i64 / scroll.content as i64) as i32).max(scale.s(32.0));
+    let y = track.y + ((track.h - h) as i64 * scroll.y as i64 / scroll.max().max(1) as i64) as i32;
+    Some(Rect::new(scroll.view.right() - w - scale.s(3.0), y, w, h))
+}
+
+fn scroll_y_for_thumb(scroll: &Scroll, scale: Scale, thumb_top: i32) -> i32 {
+    let Some(t) = scroll_thumb(scroll, scale) else { return 0 };
+    let track = scroll.view.inset(0, scale.s(4.0));
+    let span = (track.h - t.h).max(1);
+    ((thumb_top - track.y).clamp(0, span) as i64 * scroll.max() as i64 / span as i64) as i32
+}
+
+fn slider_frac_at(scale: Scale, r: Rect, x: i32) -> f32 {
+    let k = scale.s(8.0);
+    let (x0, x1) = (r.x + k, r.right() - k);
+    if x1 <= x0 {
+        0.0
+    } else {
+        ((x - x0) as f32 / (x1 - x0) as f32).clamp(0.0, 1.0)
+    }
+}
+
+fn clip_rect(a: Rect, b: Rect) -> Rect {
+    Rect::ltrb(a.x.max(b.x), a.y.max(b.y), a.right().min(b.right()), a.bottom().min(b.bottom()))
+}
+
 fn is_modifier(vk: u16) -> bool {
     matches!(vk, VK_CONTROL | VK_MENU | VK_SHIFT | VK_LWIN | VK_RWIN | VK_LCONTROL | VK_RCONTROL | VK_LMENU | VK_RMENU | VK_LSHIFT | VK_RSHIFT)
 }
@@ -1530,9 +1692,128 @@ impl SettingsWindow {
         Rect::new(0, 0, self.size.0, self.scale.s(60.0) + self.scale.px1(1.0))
     }
 
+    fn caret_active(&self) -> bool {
+        self.focused && !self.minimized
+    }
+
+    fn sync_caret_timer(&mut self, host: &mut Host) {
+        if self.caret_active() {
+            host.set_timer(TIMER_CARET, 530);
+        } else {
+            host.kill_timer(TIMER_CARET);
+        }
+    }
+
     /// Can the search caret be on screen now?
     fn caret_visible(&self) -> bool {
-        self.editing.is_none() && self.recording.is_none() && self.confirm.is_none()
+        self.caret_active() && self.editing.is_none() && self.recording.is_none() && self.confirm.is_none()
+    }
+
+    fn dialog_buttons(&mut self) -> Option<(Rect, Rect)> {
+        if self.confirm.is_none() {
+            self.dialog_rects = None;
+            return None;
+        }
+        if let Some(rects) = self.dialog_rects {
+            return Some(rects);
+        }
+        let d = self.dialog()?;
+        let probe = Canvas::probe(self.scale);
+        let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
+        let (_, ok, cancel) = d.layout(&probe, area);
+        self.dialog_rects = Some((ok, cancel));
+        Some((ok, cancel))
+    }
+
+    fn compute_hover(&mut self, p: Option<Pt>) -> SettingsHover {
+        let Some(p) = p else {
+            return SettingsHover::default();
+        };
+        if self.confirm.is_some() {
+            let dialog = self.dialog_buttons().and_then(|(ok, cancel)| {
+                if ok.contains(p) {
+                    Some(true)
+                } else if cancel.contains(p) {
+                    Some(false)
+                } else {
+                    None
+                }
+            });
+            return SettingsHover { act: None, sub: None, row: None, dialog };
+        }
+        let row = self.row_at(p);
+        let Some(it) = self.hit(p) else {
+            return SettingsHover { act: None, sub: None, row, dialog: None };
+        };
+        let act = it.act.clone();
+        let sub = match (&it.paint, it.rect) {
+            (Paint::Seg(seg), r) => {
+                let probe = Canvas::probe(self.scale);
+                seg.hit(&probe, r, p)
+            }
+            (Paint::Chips(ch), r) => {
+                let probe = Canvas::probe(self.scale);
+                match ch.hit(&probe, r, p) {
+                    Some(ChipHit::Item(i) | ChipHit::Remove(i)) => Some(i),
+                    Some(ChipHit::More) => Some(usize::MAX - 1),
+                    Some(ChipHit::Add) => Some(usize::MAX),
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+        SettingsHover { act, sub, row, dialog: None }
+    }
+
+    fn invalidate_hover(&mut self, old: &SettingsHover, next: &SettingsHover, host: &mut Host) {
+        if old.dialog != next.dialog {
+            let pad = self.scale.s(4.0);
+            if let Some((ok, cancel)) = self.dialog_buttons() {
+                if old.dialog == Some(true) || next.dialog == Some(true) {
+                    host.invalidate_rect(ok.inset(-pad, -pad));
+                }
+                if old.dialog == Some(false) || next.dialog == Some(false) {
+                    host.invalidate_rect(cancel.inset(-pad, -pad));
+                }
+            } else {
+                host.invalidate();
+            }
+            return;
+        }
+        let view = self.scroll.view;
+        let row_pad_x = self.scale.s(12.0);
+        let row_pad_y = self.scale.s(4.0);
+        let act_pad = self.scale.s(4.0);
+        let mut inval = |r: Rect| {
+            let c = clip_rect(r, view);
+            if !c.is_empty() {
+                host.invalidate_rect(c);
+            }
+        };
+        if old.row != next.row {
+            for r in [&old.row, &next.row].into_iter().flatten() {
+                if let Some(bg) = self.items.iter().find(|i| matches!(i.paint, Paint::RowBg) && i.row.as_ref() == Some(r)) {
+                    inval(bg.rect.inset(-row_pad_x, -row_pad_y));
+                }
+            }
+            for a in [&old.act, &next.act].into_iter().flatten() {
+                if let Some(it) = self.item_with(a) {
+                    inval(it.rect.inset(-act_pad, -act_pad));
+                }
+            }
+        } else if old.act != next.act {
+            for a in [&old.act, &next.act].into_iter().flatten() {
+                if let Some(it) = self.item_with(a) {
+                    inval(it.rect.inset(-act_pad, -act_pad));
+                }
+            }
+        } else if old.sub != next.sub {
+            if let Some(a) = &next.act {
+                if let Some(it) = self.item_with(a) {
+                    inval(it.rect.inset(-act_pad, -act_pad));
+                }
+            }
+        }
     }
 }
 
@@ -1572,17 +1853,42 @@ impl Surface for SettingsWindow {
         self.paint_search(c);
         self.paint_footer(c);
         if let Some(d) = self.dialog() {
-            d.paint(c, self.dialog_area(c), self.mouse, false);
+            let area = self.dialog_area(c);
+            let (_, ok, cancel) = d.layout(c, area);
+            self.dialog_rects = Some((ok, cancel));
+            d.paint(c, area, self.mouse, false);
+        } else {
+            self.dialog_rects = None;
         }
+        self.hover = self.compute_hover(self.mouse);
     }
 
     fn event(&mut self, ev: Event, host: &mut Host) -> bool {
         self.scale = host.scale;
         match ev {
             Event::Resized => {
+                self.dialog_rects = None;
                 host.set_timer(TIMER_REFRESH, 1000);
-                host.set_timer(TIMER_CARET, 530);
+                self.sync_caret_timer(host);
                 host.invalidate();
+            }
+            Event::Focus(on) => {
+                if self.focused != on {
+                    self.focused = on;
+                    self.caret_on = self.caret_active();
+                    self.sync_caret_timer(host);
+                    host.invalidate_rect(self.search_bar());
+                }
+            }
+            Event::Minimized(min) => {
+                if self.minimized != min {
+                    self.minimized = min;
+                    self.caret_on = self.caret_active();
+                    self.sync_caret_timer(host);
+                    if !min {
+                        host.invalidate();
+                    }
+                }
             }
             Event::Timer(TIMER_REFRESH) => {
                 // Status-derived values (group usage, GB units) change with each engine tick,
@@ -1598,32 +1904,58 @@ impl Surface for SettingsWindow {
                 }
             }
             Event::Timer(TIMER_CARET) => {
-                self.caret_on = !self.caret_on;
-                if self.caret_visible() {
-                    host.invalidate_rect(self.search_bar());
+                if self.caret_active() {
+                    self.caret_on = !self.caret_on;
+                    if self.caret_visible() {
+                        host.invalidate_rect(self.search_bar());
+                    }
                 }
             }
             Event::MouseMove(p) => {
                 self.mouse = Some(p);
+                let mut dragged = false;
+                let mut drag_changed = false;
                 match &mut self.drag {
                     Some(Drag::Slider { rect, pct, .. }) => {
-                        let probe = Canvas::new(1, 1, self.scale);
-                        *pct = pct_from_frac(Slider::frac_at(&probe, *rect, p.x));
+                        dragged = true;
+                        let next = pct_from_frac(slider_frac_at(self.scale, *rect, p.x));
+                        if (next - *pct).abs() > 1e-9 {
+                            *pct = next;
+                            drag_changed = true;
+                        }
                     }
                     Some(Drag::Thumb { grab }) => {
-                        let probe = Canvas::new(1, 1, self.scale);
+                        dragged = true;
                         let top = p.y - *grab;
-                        self.scroll.y = self.scroll.y_for_thumb(&probe, top);
+                        let next_y = scroll_y_for_thumb(&self.scroll, self.scale, top);
+                        if next_y != self.scroll.y {
+                            self.scroll.y = next_y;
+                            drag_changed = true;
+                        }
                     }
                     None => {}
                 }
-                let hand = self.confirm.is_none() && self.hit(p).is_some();
+                if dragged {
+                    host.set_cursor(if self.confirm.is_none() { Cursor::Hand } else { Cursor::Arrow });
+                    if drag_changed {
+                        host.invalidate();
+                    }
+                    return true;
+                }
+                let next = self.compute_hover(Some(p));
+                let hand = self.confirm.is_none() && next.act.is_some();
                 host.set_cursor(if hand { Cursor::Hand } else { Cursor::Arrow });
-                host.invalidate();
+                if next != self.hover {
+                    let old = std::mem::replace(&mut self.hover, next.clone());
+                    self.invalidate_hover(&old, &next, host);
+                }
             }
             Event::MouseLeave => {
                 self.mouse = None;
-                host.invalidate();
+                let old = std::mem::take(&mut self.hover);
+                if old != SettingsHover::default() {
+                    self.invalidate_hover(&old, &SettingsHover::default(), host);
+                }
             }
             Event::MouseDown(p, MouseButton::Left) => {
                 if self.confirm.is_some() {
@@ -1632,9 +1964,8 @@ impl Surface for SettingsWindow {
                 if self.recording.is_some() {
                     self.recording = None;
                 }
-                let probe = Canvas::new(1, 1, self.scale);
-                if let Some(t) = self.scroll.thumb(&probe) {
-                    if t.inset(-probe.s(4.0), 0).contains(p) {
+                if let Some(t) = scroll_thumb(&self.scroll, self.scale) {
+                    if t.inset(-self.scale.s(4.0), 0).contains(p) {
                         self.drag = Some(Drag::Thumb { grab: p.y - t.y });
                         host.capture(true);
                         host.invalidate();
@@ -1645,7 +1976,7 @@ impl Surface for SettingsWindow {
                 if let Some((act, rect)) = hit {
                     self.focus = Some(act.clone());
                     if let Act::Slider(group, tier) = act {
-                        let pct = pct_from_frac(Slider::frac_at(&probe, rect, p.x));
+                        let pct = pct_from_frac(slider_frac_at(self.scale, rect, p.x));
                         self.drag = Some(Drag::Slider { group, tier, rect, pct });
                         host.capture(true);
                     } else {
@@ -1658,13 +1989,12 @@ impl Surface for SettingsWindow {
             }
             Event::MouseUp(p, MouseButton::Left) => {
                 if self.confirm.is_some() {
-                    if let Some(d) = self.dialog() {
-                        let probe = Canvas::new(self.size.0.max(1), self.size.1.max(1), self.scale);
-                        let (_, ok, cancel) = d.layout(&probe, probe.bounds());
+                    if let Some((ok, cancel)) = self.dialog_buttons() {
                         if ok.contains(p) {
                             self.confirm_ok();
                         } else if cancel.contains(p) {
                             self.confirm = None;
+                            self.dialog_rects = None;
                         }
                     }
                     host.invalidate();
@@ -1719,8 +2049,10 @@ impl Surface for SettingsWindow {
                 }
                 if self.confirm.is_some() {
                     match vk {
-                        VK_ESCAPE => self.confirm = None,
-                        VK_RETURN => self.confirm = None, // every confirmation guards something risky: Enter is the safe choice
+                        VK_ESCAPE | VK_RETURN => {
+                            self.confirm = None;
+                            self.dialog_rects = None;
+                        }
                         _ => {}
                     }
                     host.invalidate();
@@ -2054,5 +2386,274 @@ mod interaction_tests {
         w.event(Event::EditDone { tag: 0, commit: true, text: "4096".into() }, &mut host);
         w.confirm_ok();
         assert_eq!(value(&w, "group.Browsers.hard_cap_mb"), Some(Value::Int(4096)));
+    }
+
+    #[test]
+    fn f62a_controls_edit_headroom_disk_doctor_and_interval() {
+        let mut w = sample_settings();
+        painted(&mut w);
+        let mut host = Host::detached((900, 3200), Scale(1.0));
+
+        // interval_sec (integer)
+        w.editing = Some(EditTarget::Number("interval_sec".into()));
+        w.event(Event::EditDone { tag: 0, commit: true, text: "15".into() }, &mut host);
+        assert_eq!(value(&w, "interval_sec"), Some(Value::Int(15)));
+
+        // prime.build.disk_gb: setting 0 ("Off") and back to 64.5 does NOT trigger HardCap confirmation.
+        w.editing = Some(EditTarget::Number("prime.build.disk_gb".into()));
+        w.event(Event::EditDone { tag: 0, commit: true, text: "off".into() }, &mut host);
+        assert_eq!(value(&w, "prime.build.disk_gb"), Some(Value::Float(0.0)));
+        assert!(w.confirm.is_none());
+        w.editing = Some(EditTarget::Number("prime.build.disk_gb".into()));
+        w.event(Event::EditDone { tag: 0, commit: true, text: "64.5".into() }, &mut host);
+        assert_eq!(value(&w, "prime.build.disk_gb"), Some(Value::Float(64.5)));
+        assert!(w.confirm.is_none());
+
+        // [disk] float and int edits + toggle
+        w.editing = Some(EditTarget::Number("disk.min_age_hours".into()));
+        w.event(Event::EditDone { tag: 0, commit: true, text: "0.75".into() }, &mut host);
+        assert_eq!(value(&w, "disk.min_age_hours"), Some(Value::Float(0.75)));
+        w.editing = Some(EditTarget::Number("disk.scan_depth".into()));
+        w.event(Event::EditDone { tag: 0, commit: true, text: "5".into() }, &mut host);
+        assert_eq!(value(&w, "disk.scan_depth"), Some(Value::Int(5)));
+
+        // Long path in disk.project_dirs compacts cleanly and removes by exact stored index.
+        let long_path = r"D:\VeryLongWorkspaceRoot\StudioProjects\Unreal5\MySuperLongProjectName\Saved\DerivedDataCache";
+        w.editing = Some(EditTarget::AddChip("disk.project_dirs".into()));
+        w.event(Event::EditDone { tag: 0, commit: true, text: format!("\"{}\"", long_path) }, &mut host);
+        assert_eq!(value(&w, "disk.project_dirs"), Some(Value::List(vec![long_path.into()])));
+
+        w.set_query("disk space");
+        let mut c = Canvas::new(720, 2400, Scale(1.5));
+        w.paint(&mut c);
+        let chips_it = w.item_with(&Act::Chips(ChipOwner::List("disk.project_dirs".into()))).unwrap();
+        if let Paint::Chips(ch) = &chips_it.paint {
+            for (cr, _) in ch.layout(&c, chips_it.rect.w) {
+                assert!(cr.x >= 0 && cr.right() <= chips_it.rect.w, "chip overflowed ctl width: {:?}", cr);
+            }
+        } else {
+            panic!("expected Chips");
+        }
+    }
+
+    #[test]
+    fn f61_dirty_hover_gating_and_no_dialog_dib_alloc() {
+        let mut w = sample_settings();
+        painted(&mut w);
+        let mut host = Host::detached((900, 2400), Scale(1.0));
+
+        // Moving over unchanged blank margin produces zero invalidations.
+        w.event(Event::MouseMove(Pt::new(2, 120)), &mut host);
+        assert_eq!(host.invalidations(), (0, 0));
+        w.event(Event::MouseLeave, &mut host);
+        assert_eq!(host.invalidations(), (0, 0));
+
+        // Moving onto a toggle invalidates once via invalidate_rect; moving 1px inside does not.
+        let toggle = w.item_with(&Act::Toggle("general.notifications".into())).unwrap().rect;
+        w.event(Event::MouseMove(Pt::new(toggle.cx(), toggle.cy())), &mut host);
+        let first_inv = host.invalidations();
+        assert_eq!(first_inv.0, 0);
+        assert!(first_inv.1 >= 1);
+        w.event(Event::MouseMove(Pt::new(toggle.cx() + 1, toggle.cy())), &mut host);
+        assert_eq!(host.invalidations(), first_inv);
+
+        // Moving across Segmented options invalidates when segment changes, not within same segment.
+        let seg = w.item_with(&Act::Seg("general.preset".into())).unwrap().rect;
+        w.event(Event::MouseMove(Pt::new(seg.x + 10, seg.cy())), &mut host);
+        let seg1 = host.invalidations();
+        w.event(Event::MouseMove(Pt::new(seg.x + 12, seg.cy())), &mut host);
+        assert_eq!(host.invalidations(), seg1);
+        w.event(Event::MouseMove(Pt::new(seg.right() - 10, seg.cy())), &mut host);
+        assert!(host.invalidations().1 > seg1.1);
+
+        // MouseLeave after hover invalidates once, then a second MouseLeave does nothing.
+        let before_leave = host.invalidations();
+        w.event(Event::MouseLeave, &mut host);
+        assert!(host.invalidations().1 > before_leave.1);
+        let after_leave = host.invalidations();
+        w.event(Event::MouseLeave, &mut host);
+        assert_eq!(host.invalidations(), after_leave);
+
+        // Dialog paint caches dialog_rects; lazy fallback via Canvas::probe populates dialog_rects and MouseUp consumes it.
+        w.confirm = Some(Confirm::ResetAll);
+        painted(&mut w);
+        let cached = w.dialog_rects.expect("paint() must cache dialog_rects");
+        w.dialog_rects = None;
+        let fallback = w.dialog_buttons().expect("dialog_buttons() lazy fallback");
+        assert_eq!(fallback, cached);
+        assert_eq!(w.dialog_rects, Some(cached));
+        let (_ok, cancel) = cached;
+        w.event(Event::MouseUp(Pt::new(cancel.cx(), cancel.cy()), MouseButton::Left), &mut host);
+        assert!(w.confirm.is_none());
+        assert!(w.dialog_rects.is_none());
+    }
+
+    #[test]
+    fn f61_focus_and_minimize_pause_caret_timer() {
+        let mut w = sample_settings();
+        painted(&mut w);
+        let mut host = Host::detached((900, 2400), Scale(1.0));
+        assert!(w.caret_visible());
+
+        // Losing focus stops caret blinking even if a stale timer or Resized arrives.
+        w.event(Event::Focus(false), &mut host);
+        assert!(!w.caret_visible());
+        let inv = host.invalidations();
+        let caret_before = w.caret_on;
+        w.event(Event::Timer(TIMER_CARET), &mut host);
+        assert_eq!(host.invalidations(), inv);
+        assert_eq!(w.caret_on, caret_before);
+        w.event(Event::Resized, &mut host);
+        assert!(!w.caret_visible());
+
+        // Regaining focus restores caret visibility and blinking.
+        w.event(Event::Focus(true), &mut host);
+        assert!(w.caret_visible());
+        let inv = host.invalidations();
+        w.event(Event::Timer(TIMER_CARET), &mut host);
+        assert_eq!(host.invalidations().1, inv.1 + 1);
+
+        // Minimizing also pauses caret blinking.
+        w.event(Event::Minimized(true), &mut host);
+        assert!(!w.caret_visible());
+        let inv = host.invalidations();
+        w.event(Event::Timer(TIMER_CARET), &mut host);
+        assert_eq!(host.invalidations(), inv);
+        w.event(Event::Minimized(false), &mut host);
+        assert!(w.caret_visible());
+    }
+
+    #[test]
+    fn bug3_defers_add_group_until_first_process_picked_or_typed() {
+        let mut w = sample_settings();
+        painted(&mut w);
+        let mut host = Host::detached((900, 2400), Scale(1.0));
+        let initial_groups = w.host.store.groups().len();
+
+        // Submitting group name opens add_app_menu WITHOUT creating an empty group yet.
+        w.editing = Some(EditTarget::AddGroup);
+        w.event(Event::EditDone { tag: 0, commit: true, text: "Renderers".into() }, &mut host);
+        assert_eq!(w.host.store.groups().len(), initial_groups);
+        assert!(matches!(w.pending, Some(Pending::AddApp { ref group, create: true, .. }) if group == "Renderers"));
+
+        // Canceling the menu leaves groups untouched.
+        w.event(Event::Menu { tag: MENU_PICK, choice: None }, &mut host);
+        assert_eq!(w.host.store.groups().len(), initial_groups);
+        assert!(w.open_group.is_none());
+
+        // Choosing "Type a name..." and submitting empty or canceling leaves groups untouched.
+        w.editing = Some(EditTarget::AddGroup);
+        w.event(Event::EditDone { tag: 0, commit: true, text: "Renderers".into() }, &mut host);
+        w.event(Event::Menu { tag: MENU_PICK, choice: Some(MENU_ID_TYPE) }, &mut host);
+        assert!(matches!(w.editing, Some(EditTarget::AddApp { ref group, create: true }) if group == "Renderers"));
+        w.event(Event::EditDone { tag: 0, commit: true, text: ".EXE".into() }, &mut host);
+        assert_eq!(w.host.store.groups().len(), initial_groups);
+
+        // Typing a valid process creates the group with stripped .exe and opens its card.
+        w.editing = Some(EditTarget::AddGroup);
+        w.event(Event::EditDone { tag: 0, commit: true, text: "Renderers".into() }, &mut host);
+        w.event(Event::Menu { tag: MENU_PICK, choice: Some(MENU_ID_TYPE) }, &mut host);
+        w.event(Event::EditDone { tag: 0, commit: true, text: "Blender.EXE".into() }, &mut host);
+        let g = w.host.store.groups().into_iter().find(|g| g.name == "Renderers").unwrap();
+        assert_eq!(g.processes, vec!["Blender".to_string()]);
+        assert_eq!(w.open_group.as_deref(), Some("Renderers"));
+
+        // Picking a running app from the menu also creates the group.
+        w.editing = Some(EditTarget::AddGroup);
+        w.event(Event::EditDone { tag: 0, commit: true, text: "Design".into() }, &mut host);
+        w.event(Event::Menu { tag: MENU_PICK, choice: Some(1) }, &mut host);
+        let g2 = w.host.store.groups().into_iter().find(|g| g.name == "Design").unwrap();
+        assert_eq!(g2.processes, vec!["Figma".to_string()]);
+        assert_eq!(w.open_group.as_deref(), Some("Design"));
+    }
+
+    #[test]
+    fn bug12_running_apps_snapshot_per_owner_chips_and_case_insensitive_exe_strip() {
+        use std::sync::{Arc, Mutex};
+        use crate::ui::settings_store::{FakeStore, GroupInfo, RunningApp};
+        use crate::ui::status_source::FakeStatus;
+
+        struct SharedStore(Arc<Mutex<FakeStore>>);
+        impl SettingsStore for SharedStore {
+            fn get(&self, path: &str) -> Option<crate::ui::settings_store::Setting> { self.0.lock().unwrap().get(path) }
+            fn set(&mut self, path: &str, value: Value) -> Result<(), String> { self.0.lock().unwrap().set(path, value) }
+            fn reset(&mut self, path: &str) -> Result<(), String> { self.0.lock().unwrap().reset(path) }
+            fn groups(&self) -> Vec<GroupInfo> { self.0.lock().unwrap().groups() }
+            fn add_group(&mut self, name: &str, processes: &[String]) -> Result<(), String> { self.0.lock().unwrap().add_group(name, processes) }
+            fn remove_group(&mut self, name: &str) -> Result<(), String> { self.0.lock().unwrap().remove_group(name) }
+            fn rename_group(&mut self, from: &str, to: &str) -> Result<(), String> { self.0.lock().unwrap().rename_group(from, to) }
+            fn set_group_enabled(&mut self, name: &str, enabled: bool) -> Result<(), String> { self.0.lock().unwrap().set_group_enabled(name, enabled) }
+            fn add_process(&mut self, group: &str, process: &str) -> Result<(), String> { self.0.lock().unwrap().add_process(group, process) }
+            fn remove_process(&mut self, group: &str, process: &str) -> Result<(), String> { self.0.lock().unwrap().remove_process(group, process) }
+            fn export_to(&self, path: &std::path::Path) -> Result<(), String> { self.0.lock().unwrap().export_to(path) }
+            fn import_from(&mut self, path: &std::path::Path) -> Result<(), String> { self.0.lock().unwrap().import_from(path) }
+            fn load_team_file(&mut self, path: &std::path::Path) -> Result<(), String> { self.0.lock().unwrap().load_team_file(path) }
+            fn remove_team_file(&mut self) -> Result<(), String> { self.0.lock().unwrap().remove_team_file() }
+            fn team_info(&self) -> Option<crate::ui::settings_store::TeamInfo> { self.0.lock().unwrap().team_info() }
+            fn reset_all(&mut self) -> Result<(), String> { self.0.lock().unwrap().reset_all() }
+            fn run_at_startup(&self) -> bool { self.0.lock().unwrap().run_at_startup() }
+            fn set_run_at_startup(&mut self, on: bool) -> Result<(), String> { self.0.lock().unwrap().set_run_at_startup(on) }
+            fn running_apps(&self) -> Vec<RunningApp> { self.0.lock().unwrap().running_apps() }
+            fn settings_file(&self) -> PathBuf { self.0.lock().unwrap().settings_file() }
+            fn revision(&self) -> u64 { self.0.lock().unwrap().revision() }
+        }
+
+        let shared = Arc::new(Mutex::new(FakeStore::mockup()));
+        let mut w = SettingsWindow::new(SettingsHost {
+            store: Box::new(SharedStore(Arc::clone(&shared))),
+            status: Box::new(FakeStatus::default()),
+            commands: Box::new(|_| {}),
+            app_version: "0.2.0".into(),
+            update_state: Box::new(|| UpdateState::Unknown),
+        });
+        painted(&mut w);
+        let mut host = Host::detached((900, 2400), Scale(1.0));
+
+        // Snapshot running_apps(): mutate live running list AFTER opening menu, BEFORE picking item 1 ("Figma").
+        w.add_app_menu("Browsers".into(), false, Pt::new(100, 100), &mut host);
+        {
+            let mut s = shared.lock().unwrap();
+            s.running.insert(0, RunningApp { name: "NewHugeApp".into(), processes: 2, ram_gb: 9.9 });
+        }
+        w.event(Event::Menu { tag: MENU_PICK, choice: Some(1) }, &mut host);
+        let browsers = shared.lock().unwrap().groups().into_iter().find(|g| g.name == "Browsers").unwrap();
+        assert!(browsers.processes.contains(&"Figma".to_string()));
+        assert!(!browsers.processes.contains(&"NewHugeApp".to_string()));
+
+        // Per-owner +N chip expansion: expanding Background's GroupApps does NOT expand ue.protect.
+        w.set_open_group(Some("Background"));
+        let mut c = painted(&mut w);
+        let bg_act = Act::Chips(ChipOwner::Group("Background".into()));
+        let bg_rect = w.item_with(&bg_act).unwrap().rect;
+        let bg_chips = match &w.item_with(&bg_act).unwrap().paint {
+            Paint::Chips(ch) => ch.clone(),
+            _ => panic!("expected Chips"),
+        };
+        // Narrow test width if needed so +N appears on Background or verify via direct +N on ue.protect vs GroupApps:
+        let _ = (bg_rect, bg_chips);
+        // Simulate clicking +N on Group("Background") vs List("ue.protect"):
+        w.expanded_chips.insert(ChipOwner::Group("Background".into()));
+        w.paint(&mut c);
+        assert!(w.expanded_chips.contains(&ChipOwner::Group("Background".into())));
+        assert!(!w.expanded_chips.contains(&ChipOwner::List("ue.protect".into())));
+        if let Paint::Chips(protect_ch) = &w.item_with(&Act::Chips(ChipOwner::List("ue.protect".into()))).unwrap().paint {
+            assert!(!protect_ch.expanded, "expanding a group must not expand ue.protect");
+        }
+
+        // Case-insensitive .exe strip on process lists, preserved on disk path lists.
+        w.editing = Some(EditTarget::AddChip("ue.protect".into()));
+        w.event(Event::EditDone { tag: 0, commit: true, text: "  MyTool.EXE  ".into() }, &mut host);
+        let prot = shared.lock().unwrap().get("ue.protect").unwrap().value.as_list().unwrap().to_vec();
+        assert!(prot.contains(&"MyTool".to_string()));
+
+        w.editing = Some(EditTarget::AddChip("doctor.keep".into()));
+        w.event(Event::EditDone { tag: 0, commit: true, text: "Spotify.Exe".into() }, &mut host);
+        let dkeep = shared.lock().unwrap().get("doctor.keep").unwrap().value.as_list().unwrap().to_vec();
+        assert_eq!(dkeep, vec!["Spotify".to_string()]);
+
+        w.editing = Some(EditTarget::AddChip("disk.keep".into()));
+        w.event(Event::EditDone { tag: 0, commit: true, text: r"C:\Tools\KeepMe.exe".into() }, &mut host);
+        let diskk = shared.lock().unwrap().get("disk.keep").unwrap().value.as_list().unwrap().to_vec();
+        assert_eq!(diskk, vec![r"C:\Tools\KeepMe.exe".to_string()]);
     }
 }

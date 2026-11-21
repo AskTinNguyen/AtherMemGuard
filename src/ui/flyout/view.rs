@@ -305,7 +305,25 @@ impl Target {
 
 /// What is under `p` (the targets don't overlap).
 pub fn hit(l: &Layout, p: Pt) -> Option<Target> {
-    tab_order(l).into_iter().find(|t| t.rect(l).contains(p))
+    for (i, r) in l.buttons.iter().enumerate() {
+        if r.contains(p) {
+            return Some(Target::Button(i));
+        }
+    }
+    if l.ue_band.contains(p) {
+        return Some(Target::Unreal);
+    }
+    for (i, r) in l.row_hits.iter().enumerate() {
+        if let Some(r) = r {
+            if r.contains(p) {
+                return Some(Target::Row(i));
+            }
+        }
+    }
+    if l.checkup.contains(p) {
+        return Some(Target::Checkup);
+    }
+    None
 }
 
 fn paint_bar(c: &mut Canvas, r: Rect, frac: f32, color: Rgb) {
@@ -352,6 +370,11 @@ fn paint_lines(c: &mut Canvas, r: Rect, lines: &[String], f: Font, color: Rgb) {
 /// Paint the flyout filling the canvas (sized `layout().width` x `layout().height`).
 pub fn paint(c: &mut Canvas, d: &FlyoutData, mouse: Option<Pt>, focus: Option<Target>) {
     let l = layout(c, d);
+    paint_with_layout(c, d, &l, mouse, focus);
+}
+
+/// Paint the flyout using a pre-computed `Layout`.
+pub fn paint_with_layout(c: &mut Canvas, d: &FlyoutData, l: &Layout, mouse: Option<Pt>, focus: Option<Target>) {
     c.fill_rect(c.bounds(), BG);
     c.spaced_text(l.eyebrow, &d.eyebrow, F_EYEBROW, MUTED, c.s(3.0), Align::Left);
     c.text(l.headline, &c.ellipsize(&d.headline, F_STATE, l.headline.w), F_STATE, d.headline_color, Align::Left);
@@ -365,7 +388,8 @@ pub fn paint(c: &mut Canvas, d: &FlyoutData, mouse: Option<Pt>, focus: Option<Ta
     c.text(l.ram_label, &d.ram_free, F_METER_VALUE, d.ram_free_color, Align::Right);
     paint_stack(c, l.ram_bar, &d.segments, d.ram_free_color == ERROR);
 
-    let hover = |t: Target| mouse.is_some_and(|m| hit(&l, m) == Some(t));
+    let hovered = mouse.and_then(|m| hit(l, m));
+    let hover = |t: Target| hovered == Some(t);
     c.fill_rect(l.ue_band, if hover(Target::Unreal) { RAISED } else { SURFACE });
     c.hline(0, l.ue_band.y, l.width, BORDER);
     c.hline(0, l.ue_band.bottom() - c.px1(1.0), l.width, BORDER);
@@ -460,12 +484,12 @@ pub fn paint(c: &mut Canvas, d: &FlyoutData, mouse: Option<Pt>, focus: Option<Ta
 }
 
 /// A canvas with the flyout painted on it and a hairline frame (snapshots).
+#[cfg(any(test, feature = "ui-snapshots"))]
 pub fn render(d: &FlyoutData, scale: Scale) -> Canvas {
-    let probe = Canvas::new(1, 1, scale);
-    let l = layout(&probe, d);
-    drop(probe);
-    let mut c = Canvas::new(l.width, l.height, scale);
-    paint(&mut c, d, None, None);
+    let mut c = Canvas::probe(scale);
+    let l = layout(&c, d);
+    c.resize(l.width, l.height);
+    paint_with_layout(&mut c, d, &l, None, None);
     let b = c.bounds();
     c.stroke_round_rect(b, 0, BORDER, c.px1(1.0));
     c
@@ -637,5 +661,40 @@ mod tests {
         let r = l.row_hits[link].unwrap();
         assert_eq!(hit(&l, Pt::new(r.cx(), r.cy())), Some(Target::Row(link)));
         assert_eq!(Target::Row(link).command(&data()), Some(Command::FreeWindowsCache));
+    }
+
+    #[test]
+    fn hit_matches_tab_order_and_paint_with_layout_matches_paint() {
+        for (_, d) in samples() {
+            for scale in [Scale(1.0), Scale(1.5)] {
+                let probe = Canvas::probe(scale);
+                let l = layout(&probe, &d);
+                let order = tab_order(&l);
+                for t in &order {
+                    let r = t.rect(&l);
+                    let p = Pt::new(r.cx(), r.cy());
+                    let expected = order.iter().copied().find(|cand| cand.rect(&l).contains(p));
+                    assert_eq!(hit(&l, p), expected);
+                }
+                for p in [Pt::new(0, 0), Pt::new(l.width - 1, l.height - 1), Pt::new(-5, -5)] {
+                    let expected = order.iter().copied().find(|cand| cand.rect(&l).contains(p));
+                    assert_eq!(hit(&l, p), expected);
+                }
+            }
+        }
+
+        let d = data();
+        let mut c1 = Canvas::new(1, 1, Scale(1.0));
+        let l = layout(&c1, &d);
+        c1.resize(l.width, l.height);
+        let mut c2 = Canvas::new(l.width, l.height, Scale(1.0));
+        let hover_pt = Pt::new(l.buttons[1].cx(), l.buttons[1].cy());
+        paint(&mut c1, &d, Some(hover_pt), Some(Target::Button(0)));
+        paint_with_layout(&mut c2, &d, &l, Some(hover_pt), Some(Target::Button(0)));
+        for y in (0..l.height).step_by(7) {
+            for x in (0..l.width).step_by(7) {
+                assert_eq!(c1.pixel(x, y), c2.pixel(x, y), "mismatch at ({x}, {y})");
+            }
+        }
     }
 }
