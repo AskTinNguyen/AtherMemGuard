@@ -1,9 +1,9 @@
 {
     "windows":  {
-                    "version":  "0.2.5",
-                    "url":  "https://github.com/AskTinNguyen/AtherMemGuard/releases/download/v0.2.5/AtherMemGuard-Setup-0.2.5.exe",
-                    "sha256":  "54734c209202311760049e99f9f8d60e17c83102a8e1a7b5144bf807b68f3d96",
-                    "size":  8422400,
-                    "notes":  "Separate Memory and Disk space tabs in the Checkup window, and the disk checkup no longer says \"frees 0\" for what it didn't count."
+                    "version":  "0.3.0",
+                    "url":  "https://github.com/AskTinNguyen/AtherMemGuard/releases/download/v0.3.0/AtherMemGuard-Setup-0.3.0.exe",
+                    "sha256":  "6d51f7eaef19e7aadfd3a1fcbc8e8cd6bde4522514a19cdd76a01b3033f046b8",
+                    "size":  3972096,
+                    "notes":  "Half the size (~4 MB), event-driven zero-poll tray, foreground-aware memory engine, faster ReFS/Git cleaner with git lfs prune \u0026 VHDX diagnostics, and Disk/Checkup settings."
                 }
 }
